@@ -1,0 +1,1418 @@
+---
+title: "Restoration priority areas: EC"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-cap-location: bottom
+    fig-width: 10
+    fig-height: 6
+    code-fold: true
+    code-tools: false
+    theme: cosmo
+    embed-resources: true
+execute:
+  echo: false
+  message: false
+  warning: false
+  fig-align: center
+---
+
+# Overview
+
+Grouping of ecosystem condition indicators reflecting potential restoration interventions and objectives
+
+![](workflow_dec.png){#fig-graphab width="80%"}
+
+```{r}
+#| label: set up
+source("setup.R")
+library(gridExtra)
+  # Required libraries
+  library(ggplot2)
+  library(terra)
+  library(sf)
+  library(viridis)
+  library(patchwork)
+  library(ggpubr)
+  library(grid)
+  library(tidyr)  # For combining plots
+  library(scales)
+  library(readxl)
+ec_data <- load_ec_data()
+
+ecosystem_types <- c("forest","agricultural","grassland")
+
+```
+
+```{r}
+#| label: Function to create plots per variable
+
+plot_ec_with_histogram <- function(raster_data, variable_name,long_name,
+                                   color_palette="viridis",
+                                   histogram_bins=25){
+
+
+}
+variable_info <- read_excel("V:/people/inicholson/Restoration costs/swiss_terrestrial_restoration_categorisation_starter.xlsx", sheet="Indicator_desc")
+# Function specifically for your EC variables with predefined settings
+plot_ec_variable <- function(ec_data_list, variable_code, ecosystem_mask = NULL) {
+  
+  # Variable name mapping (from your app)
+  variable_names <- c(
+    "smd" = "Soil Moisture Deficit",
+    "sbd" = "Soil Bulk Density", 
+    "soc" = "Soil Organic Carbon",
+    "tsd" = "Tree Species Diversity",
+    "uzl" = "UZL Species",
+    "cdi" = "Crop Diversity Index",
+    "swf_h" = "Small Woody Features (Hedgerows)",
+    "swf_t" = "Small Woody Features (Trees)",
+    "can" = "Canopy Height",
+    "lai" = "Leaf Area Index",
+    "ndvi" = "NDVI",
+    "snh" = "Semi-natural Habitat Density",
+    "frag" = "Forest Fragmentation",
+    "tcd" = "Tree Cover Density"
+  )
+  
+  # Get the raster data
+  if(!variable_code %in% names(ec_data_list)) {
+    stop(paste("Variable", variable_code, "not found in data"))
+  }
+  
+  raster_data <- ec_data_list[[variable_code]]
+  
+  # Apply ecosystem mask if provided
+  if(!is.null(ecosystem_mask)) {
+    raster_data <- mask(raster_data, ecosystem_mask)
+  }
+
+  var_row <- variable_info[variable_info$code==variable_code,]
+  long_name = var_row$Indicator
+
+  specific_rast <- raster_data[[variable_code]]
+  df <- as.data.frame(specific_rast, xy=TRUE)
+  names(df)[3] <- "value"
+  df <- df[!is.na(df$value),]
+
+
+  map <- ggplot(df, aes(x=x, y=y, fill=value)) +
+    geom_raster() +
+    scale_fill_viridis_c(option="viridis") +
+    guides(fill="none") +
+    coord_fixed()+
+    theme_void() +
+    labs(title=long_name)
+
+  hist <- ggplot(df, aes(x=value)) +
+    geom_histogram(aes(fill=after_stat(x)),
+                   bins=20,
+                   colour="white",
+                   linewidth=0.15) +
+    scale_fill_viridis_c(option="viridis") +
+    theme_minimal(base_size=9) +
+    coord_flip()+
+    labs(x="", y="")+
+    theme(legend.position="none", axis.text.y=element_blank(), axis.text.x=element_blank(), panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+  
+  combined_map_hist <- map + 
+    inset_element(hist, left = 0.70, bottom = 0.70, right = 0.98, top = 0.98)
+  return(combined_map_hist)
+
+}
+
+```
+
+```{r}
+
+variable_info <- read_excel("V:/people/inicholson/Restoration costs/swiss_terrestrial_restoration_categorisation_starter.xlsx", sheet="Indicator_desc")
+
+plot_ec_compact_table <- function(raster_data, variable_code){
+
+  var_row <- variable_info[variable_info$code==variable_code,]
+  stats <- global(raster_data[[variable_code]], c("min","max","mean"), na.rm=TRUE)
+  long_name = var_row$Indicator
+
+  out <- plot_ec_with_histogram(raster_data, variable_name=variable_code, long_name=long_name)
+  map  <- out$map
+  hist <- out$hist
+  combined_map_hist <- out$combined_map_hist
+
+  info_df <- data.frame(
+    Attribute = c("Category", "Units", "Range", "Mean", "Sp. coverage, res.", "Characteristic", "Instrumental Relevance", "Directionality"),
+    Value = c(
+      as.character(var_row$Class[1]),           # Ensure single value
+      as.character(var_row$Units[1]),           # Ensure single value  
+      as.character(paste(round(stats$min,2), "-", round(stats$max,2))),
+      as.character(round(stats$mean,2)),
+      as.character(var_row$`Sp. coverage, res.`[1]),      # Ensure single value
+      as.character(var_row$characteristic[1]),   # Ensure single value
+      as.character(var_row$instrumental_relevance[1]), # Ensure single value
+      as.character(var_row$Directionality[1])   # Ensure single value
+    )
+  )
+
+  table_panel <- wrap_elements(full = tableGrob(info_df, rows=NULL,
+    theme=ttheme_minimal(
+      base_size=9,
+      core=list(fg_params=list(hjust=0, x=0.01))
+    )
+  ))
+
+  final_plot <- (combined_map_hist | table_panel)#map | hist | table_panel)
+    plot_layout(widths = c(1.5,0.5,1)) 
+
+  final_plot
+}
+```
+
+# Variables {.tabset}
+
+::: panel-tabset
+## Forest
+
+```{r}
+#| label: forest vars
+# Set ecosystem to forest and get relevant variables
+ecosystem_forest <- "forest"
+vars_forest <- ec_categories[["EC variables"]][[ecosystem_forest]]
+codes_forest <- names(vars_forest)
+rasters_forest <- ec_data[codes_forest]
+rasters_forest <- rasters_forest[!sapply(rasters_forest, is.null)]
+r_forest <- rast(rasters_forest)
+r_masked_forest <- mask_by_ecosystem(r_forest, ecosystem_forest)
+
+# Plot forest variables
+smd <- plot_ec_variable(r_masked_forest, "smd")
+sbd <- plot_ec_variable(r_masked_forest, "sbd")
+soc <- plot_ec_variable(r_masked_forest, "soc")
+tsd <- plot_ec_variable(r_masked_forest, "tsd")
+can <- plot_ec_variable(r_masked_forest, "can")
+lai <- plot_ec_variable(r_masked_forest, "lai")
+frag <- plot_ec_variable(r_masked_forest, "frag")
+
+afor <- (smd | sbd | soc)
+bfor <- (tsd | can | lai)
+lfor <- (frag| plot_spacer() | plot_spacer())
+for_layout <- afor/bfor/lfor
+print(for_layout)
+```
+
+## Intensive Agriculture
+
+```{r}
+#| label: ag vars
+ecosystem_ag <- "agricultural"
+vars_ag <- ec_categories[["EC variables"]][[ecosystem_ag]]
+codes_ag <- names(vars_ag)
+rasters_ag <- ec_data[codes_ag]
+rasters_ag <- rasters_ag[!sapply(rasters_ag, is.null)]
+r_ag <- rast(rasters_ag)
+r_masked_ag <- mask_by_ecosystem(r_ag, ecosystem_ag)
+
+# Plot agricultural variables
+smd <- plot_ec_variable(r_masked_ag, "smd")
+sbd <- plot_ec_variable(r_masked_ag, "sbd")
+soc <- plot_ec_variable(r_masked_ag, "soc")
+uzl <- plot_ec_variable(r_masked_ag, "uzl")
+swf_h <- plot_ec_variable(r_masked_ag, "swf_h")
+swf_t <- plot_ec_variable(r_masked_ag, "swf_t")
+ndvi <- plot_ec_variable(r_masked_ag, "ndvi")
+snh <- plot_ec_variable(r_masked_ag, "snh")
+
+aag <- (smd | sbd | soc)
+bag <- (uzl | swf_h | swf_t | ndvi)
+lag <- (snh| plot_spacer() | plot_spacer())
+ag_layout <- aag/bag/lag
+print(ag_layout)
+
+```
+
+## Grasslands & Pastures
+
+```{r}
+#| label: grass vars
+ecosystem_grass <- "grassland"
+vars_grass <- ec_categories[["EC variables"]][[ecosystem_grass]]
+codes_grass <- names(vars_grass)
+rasters_grass <- ec_data[codes_grass]
+rasters_grass <- rasters_grass[!sapply(rasters_grass, is.null)]
+r_grass <- rast(rasters_grass)
+r_masked_grass <- mask_by_ecosystem(r_grass, ecosystem_grass)
+
+# Plot grassland variables
+smd <- plot_ec_variable(r_masked_grass, "smd")
+sbd <- plot_ec_variable(r_masked_grass, "sbd")
+soc <- plot_ec_variable(r_masked_grass, "soc")
+uzl <- plot_ec_variable(r_masked_grass, "uzl")
+swf_h <- plot_ec_variable(r_masked_grass, "swf_h")
+swf_t <- plot_ec_variable(r_masked_grass, "swf_t")
+ndvi <- plot_ec_variable(r_masked_grass, "ndvi")
+snh <- plot_ec_variable(r_masked_grass, "snh")
+
+agrass <- (smd | sbd | soc)
+bgrass <- (uzl | swf_h | swf_t | ndvi)
+lgrass <- (snh| plot_spacer() | plot_spacer())
+grass_layout <- agrass/bgrass/lgrass
+print(grass_layout)
+
+```
+:::
+
+# Condition index {.tabset}
+
+- Use condition index or mean anomaly across classes to define if pixels are in need of restoration.
+
+::: panel-tabset
+# Raw
+
+```{r}
+#| label: plot EC index
+
+for_EC <- r_masked_forest[["forest_index"]]
+ag_EC <- r_masked_ag[["agricultural_index"]]
+grass_EC <- r_masked_grass[["grass_index"]]
+for_EC_df <- as.data.frame(for_EC, xy=TRUE)
+ag_EC_df <- as.data.frame(ag_EC, xy=TRUE)
+grass_EC_df <- as.data.frame(grass_EC, xy=TRUE)
+
+all_df <- bind_rows(for_EC_df, ag_EC_df)
+all_df <- bind_rows(all_df, grass_EC_df)
+names(all_df)[3:5]<- c("Forest", "Agricultural", "Grassland")
+all_df <- all_df %>% mutate(out = coalesce(Forest, Agricultural, Grassland))
+#plot the three EC indices and a side plot with the values per ecosystem
+
+map <- ggplot(all_df, aes(x=x, y=y, fill=out)) +
+    geom_raster() +
+    scale_fill_viridis_c(option="viridis") +
+    guides(fill="none") +
+    theme_void()
+
+lng_df <- all_df %>% pivot_longer(cols=Forest:Grassland, names_to="ecosystem", values_to="Val")
+
+  hist <- ggplot(lng_df, aes(x=Val)) +
+    geom_histogram(aes(fill=after_stat(x)),
+                   bins=20, colour="white", linewidth=0.15) +
+    scale_fill_viridis_c(option="viridis") +
+    theme_minimal(base_size=9) +
+    facet_wrap(~ecosystem, ncol=1)+
+    labs(x="EC index", y="Frequency")+
+    theme(legend.position="none")
+
+map | hist
+```
+
+# Classified
+
+```{r}
+#Classified version
+library(classInt)
+
+vals <- values(for_EC, na.rm = TRUE)
+nb <- classInt::classIntervals(vals, n = 5, style = "fisher")$brks
+mat <- cbind(nb[-length(nb)], nb[-1], 1:(length(nb) - 1))
+fc <- classify(for_EC, mat)
+vals <- values(ag_EC, na.rm = TRUE)
+nb <- classInt::classIntervals(vals, n = 5, style = "fisher")$brks
+mat <- cbind(nb[-length(nb)], nb[-1], 1:(length(nb) - 1))
+ac <- classify(ag_EC, mat)
+vals <- values(grass_EC, na.rm = TRUE)
+nb <- classInt::classIntervals(vals, n = 5, style = "fisher")$brks
+mat <- cbind(nb[-length(nb)], nb[-1], 1:(length(nb) - 1))
+gc <- classify(grass_EC, mat)
+
+for_EC_df <- as.data.frame(fc, xy=TRUE)
+ag_EC_df <- as.data.frame(ac, xy=TRUE)
+grass_EC_df <- as.data.frame(gc, xy=TRUE)
+
+break_df <- bind_rows(for_EC_df, ag_EC_df)
+break_df <- bind_rows(break_df, grass_EC_df)
+names(break_df)[3:5]<- c("Forest", "Agricultural", "Grassland")
+break_df <- break_df %>% mutate(out = coalesce(Forest, Agricultural, Grassland))
+combined_ec_df <- break_df %>% select(x,y,out)
+combined_ec <- rast(combined_ec_df, type="xyz")
+
+map <- ggplot(break_df, aes(x=x, y=y, fill=out)) +
+    geom_raster() +
+    scale_fill_viridis_c(option="viridis") +
+    guides(fill="none") +
+    theme_void()
+
+lng_df <- break_df %>% pivot_longer(cols=Forest:Grassland, names_to="ecosystem", values_to="Val")
+lng_df$Val <- as.character(lng_df$Val)
+lng_df <- lng_df %>% filter(Val%in%c("1", "2", "3", "4", "5"))
+  hist <- ggplot(lng_df, aes(x=Val)) +
+    geom_bar(aes(fill = Val),
+           colour = "white", linewidth = 0.15) +
+    scale_fill_viridis_d(option="viridis") +
+    theme_minimal(base_size=9) +
+    facet_wrap(~ecosystem, ncol=1)+
+    labs(x="EC index", y="Frequency")+
+    theme(legend.position="none")
+
+map | hist
+```
+:::
+
+```{r}
+#| label: setup anomalies
+# Calculate anomalies by ecosystem type and combine into single raster
+
+# Function to calculate anomalies for an ecosystem
+calculate_ecosystem_anomalies <- function(ecosystem_name) {
+  # Get variables for this ecosystem
+  vars_eco <- ec_categories[["EC variables"]][[ecosystem_name]]
+  codes_eco <- names(vars_eco)
+  rasters_eco <- ec_data[codes_eco]
+  rasters_eco <- rasters_eco[!sapply(rasters_eco, is.null)]
+  r_eco <- rast(rasters_eco)
+  r_masked_eco <- mask_by_ecosystem(r_eco, ecosystem_name)
+  
+  # Calculate anomalies for each variable
+  anom_stack_eco <- rast()
+  for (var in codes_eco) {
+    if(var %in% names(r_masked_eco)) {
+      r_var <- r_masked_eco[[var]]
+      m_var  <- global(r_var, "mean", na.rm = TRUE)[[1]]
+      sd_var <- global(r_var, "sd", na.rm = TRUE)[[1]]
+      
+      if(!is.na(sd_var) && sd_var > 0) {
+        anom_var <- (r_var - m_var) / sd_var
+        names(anom_var) <- paste0(var, "_anom_", ecosystem_name)
+        anom_stack_eco <- c(anom_stack_eco, anom_var)
+      }
+    }
+  }
+  return(anom_stack_eco)
+}
+
+# Calculate anomalies for each ecosystem type
+ecosystems <- c("forest", "agricultural", "grassland")
+all_anom_stacks <- list()
+
+for(eco in ecosystems) {
+  all_anom_stacks[[eco]] <- calculate_ecosystem_anomalies(eco)
+}
+
+# Combine all anomaly stacks
+combined_anom_stack <- rast()
+for(eco in ecosystems) {
+  if(nlyr(all_anom_stacks[[eco]]) > 0) {
+    combined_anom_stack <- c(combined_anom_stack, all_anom_stacks[[eco]])
+  }
+}
+
+# Create master anomaly dataframe for visualization
+anom_df <- as.data.frame(combined_anom_stack, xy = TRUE, na.rm = FALSE)
+# Convert to long format and extract ecosystem information
+anom_long <- anom_df %>%
+  pivot_longer(cols = -c(x, y),
+               names_to = "variable",
+               values_to = "anomaly") %>%
+  filter(!is.na(anomaly)) %>%
+  mutate(
+    ecosystem = case_when(
+      grepl("_forest$", variable) ~ "Forest",
+      grepl("_agricultural$", variable) ~ "Agricultural", 
+      grepl("_grassland$", variable) ~ "Grassland",
+      TRUE ~ "Unknown"
+    ),
+    var_clean = gsub("_anom_(forest|agricultural|grassland)$", "", variable),
+    var_clean = gsub("_anom$", "", var_clean)
+  )
+
+theme_plots <- theme_bw()+
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          strip.text = element_text(size = 8))
+
+library(RColorBrewer)
+
+# Create combined anomaly plot showing all ecosystems together
+combined_anom_plot <- ggplot(anom_long, aes(x = x, y = y, fill = anomaly)) +
+    geom_raster() +
+    facet_grid(var_clean ~ ecosystem) +
+    scale_fill_viridis_c(option = "RdYlBu", direction = -1, name = "Z-score") +
+    theme_plots +
+    labs(title = "Anomalies by Variable and Ecosystem Type") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#print(combined_anom_plot)
+#anom_plots
+
+```
+
+```{r}
+#| label: mean ECT anomalies
+# derive and plot mean anomalies by ECT class
+
+# Create ECT categories based on clean variable names
+anom_long$ect <- ifelse(anom_long$var_clean %in% c("smd","sbd","soc"), "Abiotic",
+                        ifelse(anom_long$var_clean %in% c("uzl","tsd","can", "cdi","swf_h", "swf_t","lai", "ndvi"), "Biotic","Landscape")) 
+
+# Calculate mean anomalies by ECT class across ALL ecosystems
+class_mean_anoms <- anom_long %>%
+  group_by(ect, x, y) %>%
+  summarise(mean_anom = mean(anomaly, na.rm = TRUE), .groups = 'drop')
+
+mean_plt <- ggplot(class_mean_anoms, aes(x = x, y = y, fill = mean_anom))+
+    geom_raster()+
+    facet_wrap(~ect, ncol=3)+
+    scale_fill_viridis_c(option = "viridis", name = "Mean anomaly")+
+    theme_plots +
+    labs(title = "Mean Anomalies by ECT Category") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#print(mean_plt)
+
+eco_mean_anoms <- anom_long %>%
+  group_by(ect,ecosystem, x, y) %>%
+  summarise(mean_anom = mean(anomaly, na.rm = TRUE), .groups = 'drop')
+
+#test_plt <- ggplot(eco_mean_anoms, aes(x = x, y = y, fill = mean_anom))+
+#    geom_raster()+
+#    facet_wrap(~ect+ecosystem, ncol=3)+
+#    scale_fill_viridis_c(option = "viridis", name = "Mean anomaly")+
+#    theme_plots +
+#    labs(title = "Mean Anomalies by ECT Category") +
+#    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#print(test_plt)
+```
+
+```{r}
+#! label: calculate noise
+#r  <- rast("anom.tif")
+#lv <- focal(r, w = 3, fun = var, na.rm = TRUE)
+#global(lv, "mean", na.rm = TRUE)
+```
+
+```{r}
+#| label: clusters based on mean anomalies
+
+df_wide <- eco_mean_anoms %>%
+  ungroup() %>%
+  select(x, y, ect, ecosystem, mean_anom) %>%
+  pivot_wider(names_from = ect, values_from = mean_anom) %>%
+  rename(abiotic_mean = Abiotic, biotic_mean = Biotic, landscape_mean = Landscape) %>%
+  filter(!is.na(abiotic_mean) & !is.na(biotic_mean) & !is.na(landscape_mean))
+
+```
+
+```{r}
+#| label: 3d plot anomalies
+library(plotly)
+library(htmltools)
+
+plot_3d <- function(ecosystem_name){
+df_eco <- df_wide %>% filter(ecosystem == ecosystem_name)
+# overall anomaly magnitude for colour
+df_eco$amp <- sqrt(df_eco$abiotic_mean^2 + df_eco$biotic_mean^2 + df_eco$landscape_mean^2)
+
+# Get global ranges for consistent scaling across all plots
+xrange <- range(df_eco$abiotic_mean, na.rm = TRUE)
+yrange <- range(df_eco$biotic_mean, na.rm = TRUE)
+zrange <- range(df_eco$landscape_mean, na.rm = TRUE)
+amprange <- range(df_eco$amp, na.rm = TRUE)
+
+# Create scene settings for consistent scaling
+scene_planes <- list(
+  xaxis = list(range=xrange, zeroline=TRUE, zerolinewidth=2, title="Abiotic Mean"),
+  yaxis = list(range=yrange, zeroline=TRUE, zerolinewidth=2, title="Biotic Mean"),
+  zaxis = list(range=zrange, zeroline=TRUE, zerolinewidth=2, title="Landscape Mean")
+)
+
+plt_3d <- plot_ly(
+    df_eco,
+    x = ~abiotic_mean,
+    y = ~biotic_mean,
+    z = ~landscape_mean,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(
+      size = 4, 
+      color = ~amp, 
+      colorscale = "Viridis",
+      cmin = amprange[1],
+      cmax = amprange[2],
+      colorbar = list(title = "Anomaly Magnitude")
+    ),
+    name = ecosystem_name
+  ) %>%
+    layout(
+      scene = scene_planes,
+      title = list(text = paste("ECT Anomalies -", ecosystem_name), x = 0.5)
+    )
+plt_3d
+}
+
+#for_3d <- plot_3d("Forest")
+#ag_3d <- plot_3d("Agricultural")
+#gr_3d <- plot_3d("Grassland")
+```
+
+```{r}
+#| label: Clustering based on anomalies
+
+df_for <- df_wide %>% filter(ecosystem == "Forest")
+
+r <- rast(df_for, type = "xyz", crs = "EPSG:2056")
+
+r_agg <- aggregate(r, fact = 2, fun = mean, na.rm = TRUE)
+
+df_agg <- as.data.frame(r_agg, xy = TRUE)
+
+# 3. clustering on the three group means
+X <- scale(df_agg[, c("abiotic_mean", "biotic_mean", "landscape_mean")])
+
+#set.seed(1)
+km <- kmeans(X, centers = 3)
+
+df_agg$cluster <-km$cluster
+df_agg$cluster <- factor(df_agg$cluster)
+
+#cluster_plt <- ggplot()+
+#    geom_raster(data = df_agg,
+#                aes(x = x, y = y, fill = cluster))+
+#    scale_fill_brewer(palette = "Set1")+
+#    theme_plots
+
+#print(cluster_plt)
+
+#cluster_summary <- df_agg |>
+#  mutate(cluster = km$cluster) |>
+#  group_by(cluster) |>
+#  summarise(
+#    abiotic_mean   = mean(abiotic_mean,   na.rm=TRUE),
+#    biotic_mean    = mean(biotic_mean,    na.rm=TRUE),
+#    landscape_mean = mean(landscape_mean, na.rm=TRUE),
+#    n_points       = n()
+#  )
+
+#print(cluster_summary)
+
+```
+
+```{r}
+#| label: bivariate set-up
+labs <- c("1 - 1", "1 - 2", "1 - 3", "2 - 1", "2 - 2", "2 - 3", "3 - 1", "3 - 2", "3 - 3")
+
+cols_ab <- c("#d3d3d3", "#88cfcf", "#00c5c5", "#c881bb", "#817eb6", "#0079ae", "#b70092", "#76008f", "#000089")
+cols_bl <- c("#d3d3d3", "#e1e14d", "#e8e800", "#88cfcf", "#91dc4c", "#96e300", "#00c5c5", "#00d248", "#00d900")
+cols_al <- c("#d3d3d3", "#e1e14d", "#e8e800", "#c881bb", "#d58a44", "#dc8e00", "#b70092", "#c30036", "#c90000")
+
+legend_ab <- tibble(group = labs, fill = cols_ab)
+legend_bl <- tibble(group = labs, fill = cols_bl)
+legend_al <- tibble(group = labs, fill = cols_al)
+
+classify3_sd <- function(x){
+  cut(x,
+      breaks = c(-Inf, -sd(x), sd(x), Inf),
+      labels = c("3", "2", "1"))
+}
+
+df_class <- df_wide |>
+  group_by(ecosystem) |>
+  mutate(
+    abiotic_class    = classify3_sd(abiotic_mean),
+    biotic_class     = classify3_sd(biotic_mean),
+    landscape_class  = classify3_sd(landscape_mean),
+    ab = paste(abiotic_class, biotic_class, sep = " - "),
+    bl = paste(biotic_class, landscape_class, sep = " - "),
+    al = paste(abiotic_class, landscape_class, sep = " - "),
+  )
+
+df_ab <- left_join(df_class, legend_ab, by=c("ab"="group"))
+df_bl <- left_join(df_class, legend_bl, by=c("bl"="group"))
+df_al <- left_join(df_class, legend_al, by=c("al"="group"))
+
+break_df <- break_df %>% select(-Forest, -Agricultural, -Grassland)
+
+make_table_plot <- function(d) {
+  tableGrob(d, rows=NULL,
+    theme=ttheme_minimal(
+      base_size=9,
+      core=list(fg_params=list(hjust=0, x=0.01))
+    )
+  )
+}
+
+ind_list_df <- data.frame(Indicator = c("smd", "sbd", "soc",
+                                        "smd", "sbd", "soc",
+                                        "smd", "sbd", "soc",
+                          "tsd", "can", "lai",
+                           "uzl", "cdi", "swf_h","swf_t","ndvi", 
+                           "uzl","swf_h","swf_t","ndvi",
+                          "frag","snh","snh"),
+                          Class=c("Abiotic","Abiotic","Abiotic",
+                          "Abiotic","Abiotic","Abiotic",
+                          "Abiotic","Abiotic","Abiotic",
+                          "Biotic","Biotic","Biotic",
+                          "Biotic","Biotic","Biotic","Biotic","Biotic",
+                          "Biotic","Biotic","Biotic","Biotic",
+                          "Landscape", "Landscape", "Landscape"),
+                          Ecosystem= c("Forest", "Forest", "Forest", 
+                          "Agriculture","Agriculture","Agriculture",
+                          "Grassland","Grassland","Grassland",
+                           "Forest","Forest","Forest",
+                           "Agriculture","Agriculture","Agriculture","Agriculture","Agriculture",
+                           "Grassland","Grassland","Grassland","Grassland",
+                           "Forest", "Agriculture", "Grassland"))
+
+ind_list_df <- ind_list_df |> group_by(Ecosystem, Class) |>
+  mutate(id = row_number()) |>
+  pivot_wider(
+    names_from = Class,
+    values_from = Indicator
+  ) |>
+  select(-id)%>%
+  ungroup()
+
+```
+
+
+```{r}
+
+library(ggplot2)
+
+# Corner colours (0 to 255)
+C1 <- c(0,   197, 197)   # cyan
+C2 <- c(232, 232, 0)     # yellow
+C3 <- c(183, 0,   146)   # magenta
+
+# Build a barycentric grid inside an equilateral triangle
+make_tricolor_triangle <- function(n = 300) {
+  s <- seq(0, 1, length.out = n)
+  g <- expand.grid(w1 = s, w2 = s)
+  g <- g[g$w1 + g$w2 <= 1, ]
+  g$w3 <- 1 - g$w1 - g$w2
+
+  # Triangle vertices: V1 at (0,0), V2 at (1,0), V3 at (0.5, sqrt(3)/2)
+  h <- sqrt(3) / 2
+  g$x <- g$w2 + 0.5 * g$w3
+  g$y <- h * g$w3
+
+  # Mix colours in RGB space
+  rgb_mix <- cbind(
+    g$w1 * C1[1] + g$w2 * C2[1] + g$w3 * C3[1],
+    g$w1 * C1[2] + g$w2 * C2[2] + g$w3 * C3[2],
+    g$w1 * C1[3] + g$w2 * C2[3] + g$w3 * C3[3]
+  )
+  g$fill <- rgb(rgb_mix[,1], rgb_mix[,2], rgb_mix[,3], maxColorValue = 255)
+
+  g
+}
+
+df <- make_tricolor_triangle(n = 600)
+
+# Triangle outline
+h <- sqrt(3) / 2
+border <- data.frame(
+  x = c(0, 1, 0.5, 0),
+  y = c(0, 0, h,   0)
+)
+
+ggplot(df, aes(x, y)) +
+  geom_raster(aes(fill = fill), interpolate = TRUE) +
+  scale_fill_identity() +
+  geom_path(data = border, aes(x, y), inherit.aes = FALSE, linewidth = 0.6) +
+  coord_equal(expand = FALSE) +
+  theme_void()
+
+```
+
+# Ecosystem Condition anomalies by category {.tabset}
+
+-   Mean anomalies calculated per ECT category, per ecosystem type
+-   To use as potential objectives, i.e. restoring an individual area contributes differently to overall abiotic, biotic and landscape condition.
+
+::: panel-tabset
+# Filtered
+
+-   Only areas where overall condition index indicates restoration necessary
+-   Increasing colour strength indicating stronger negative anomaly
+
+```{r}
+#| label: ab filtered
+
+df_ab_filt <- df_ab |>
+  left_join(break_df, by = c("x", "y")) |>
+  mutate(fill2 = ifelse(out >= 3, "grey70", fill))
+
+p1 <- ggplot()+
+  geom_raster(data = df_ab_filt, aes( x=x,  y=y,  fill=fill2),
+    interpolate = TRUE  ) +
+  scale_fill_identity() +
+  labs( title = "Abiotic-Biotic anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_ab %>%
+  separate(group, into = c("Abiotic", "Biotic"), sep = " - ") %>%
+  mutate(Abiotic = as.integer(Abiotic),
+         Biotic = as.integer(Biotic)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Abiotic, y = Biotic, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Abiotic →",  y = "Biotic →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_ab <- p1 +
+  inset_element(   p2,    left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#ab_plot <- ggplot()+
+#    geom_point(data=df_ab_filt, aes(x=abiotic_mean, y=biotic_mean, color=fill2), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Abiotic anomaly", y="Biotic anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+
+#ab_df <- ind_list_df |> select(-Landscape) |> mutate(across(everything(), ~ ifelse(is.na(.), "", .)))
+
+#tbl_grob_for <- tableGrob(ab_df |> filter(Ecosystem=="Forest") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_ag <- tableGrob(ab_df |> filter(Ecosystem=="Agriculture") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_gr <- tableGrob(ab_df |> filter(Ecosystem=="Grassland") |> select(-Ecosystem), rows = NULL)
+#table_plot <- wrap_elements(full = tbl_grob)
+
+#p1 <- wrap_elements(full = tbl_grob_for)
+#p2 <- wrap_elements(full = tbl_grob_ag)
+#p3 <- wrap_elements(full = tbl_grob_gr)
+
+# place them in a row
+#table_col_ab <- p1 / p2 / p3
+
+#final_plot <- (p_inset | ab_plot | table_col_ab) +
+#  plot_layout(widths = c(1.5,1,0.5))
+#final_plot
+
+```
+
+```{r}
+#| label: bl filtered
+
+df_bl_filt <- df_bl |>
+  left_join(break_df, by = c("x", "y")) |>
+  mutate(fill2 = ifelse(out >= 3, "grey70", fill))
+
+p1 <- ggplot()+
+  geom_raster( data = df_bl_filt,  aes(    x=x,    y=y,    fill=fill2),
+    interpolate = TRUE) +
+  scale_fill_identity() +
+  labs(   title = "Biotic-Landscape anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_bl %>%
+  separate(group, into = c("Biotic", "Landscape"), sep = " - ") %>%
+  mutate(Biotic = as.integer(Biotic),
+         Landscape = as.integer(Landscape)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Biotic, y = Landscape, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Biotic →",
+       y = "Landscape →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_bl <- p1 +
+  inset_element(p2,   left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#bl_plot <- ggplot()+
+#    geom_point(data=df_bl_filt, aes(x=biotic_mean, y=landscape_mean, color=fill2), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Biotic anomaly", y="Landscape anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+#bl_df <- ind_list_df |> select(-Abiotic) |> mutate(across(everything(), ~ ifelse(is.na(.), "", .)))
+
+#tbl_grob_for <- tableGrob(bl_df |> filter(Ecosystem=="Forest") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_ag <- tableGrob(bl_df |> filter(Ecosystem=="Agriculture") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_gr <- tableGrob(bl_df |> filter(Ecosystem=="Grassland") |> select(-Ecosystem), rows = NULL)
+
+#p1 <- wrap_elements(full = tbl_grob_for)
+#p2 <- wrap_elements(full = tbl_grob_ag)
+#p3 <- wrap_elements(full = tbl_grob_gr)
+
+#table_col_bl <- p1 / p2 / p3
+
+#final_plot <- (p_inset | bl_plot | table_col_bl) +
+#  plot_layout(widths = c(1.5,1,0.5))
+#final_plot
+
+```
+
+```{r}
+#| label: al filtered
+df_al_filt <- df_al |>
+  left_join(break_df, by = c("x", "y")) |>
+  mutate(fill2 = ifelse(out >= 3, "grey70", fill))
+
+p1 <- ggplot()+
+  geom_raster(data = df_al_filt,  aes( x=x, y=y, fill=fill2),
+    interpolate = TRUE ) +
+  scale_fill_identity() +
+  labs(title = "Abiotic-Landscape anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_al %>%
+  separate(group, into = c("Abiotic", "Landscape"), sep = " - ") %>%
+  mutate(Abiotic = as.integer(Abiotic),
+         Landscape = as.integer(Landscape)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Abiotic, y = Landscape, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Abiotic →",
+       y = "Landscape →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_al <- p1 +
+  inset_element( p2,    left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#al_plot <- ggplot()+
+#    geom_point(data=df_al_filt, aes(x=abiotic_mean, y=landscape_mean, color=fill2), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Abiotic anomaly", y="Landscape anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+#al_df <- ind_list_df |> select(-Biotic) |> mutate(across(everything(), ~ ifelse(is.na(.), "", .)))
+
+#tbl_grob_for <- tableGrob(al_df |> filter(Ecosystem=="Forest") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_ag <- tableGrob(al_df |> filter(Ecosystem=="Agriculture") |> select(-Ecosystem), rows = NULL)
+#tbl_grob_gr <- tableGrob(al_df |> filter(Ecosystem=="Grassland") |> select(-Ecosystem), rows = NULL)
+
+#p1 <- wrap_elements(full = tbl_grob_for)
+#p2 <- wrap_elements(full = tbl_grob_ag)
+#p3 <- wrap_elements(full = tbl_grob_gr)
+
+#table_col_al <- p1 / p2 / p3
+
+#final_plot <- (p_inset | al_plot | table_col_al) +
+#  plot_layout(widths = c(1.5,1,0.5))
+#final_plot
+
+```
+
+
+
+```{r}
+#| label: plot_anoms
+row1 <-  (inset_ab | inset_bl)
+row2<- (inset_al | plot_spacer())
+p_all <- (row1 / row2)
+
+```
+
+# Not filtered
+
+-   All areas, including good condition areas
+-   Increasing colour strength indicating stronger negative anomaly
+
+```{r}
+#| label: ab
+#| eval: false
+p1 <- ggplot()+
+  geom_raster( data = df_ab, aes( x=x,  y=y,  fill=fill  ),
+    interpolate = TRUE  ) +
+  scale_fill_identity() +
+  labs( title = "Abiotic-Biotic anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_ab %>%
+  separate(group, into = c("Abiotic", "Biotic"), sep = " - ") %>%
+  mutate(Abiotic = as.integer(Abiotic),
+         Biotic = as.integer(Biotic)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Abiotic, y = Biotic, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Abiotic →",  y = "Biotic →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_ab <- p1 +
+  inset_element(   p2,    left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#ab_plot <- ggplot()+
+#    geom_point(data=df_ab, aes(x=abiotic_mean, y=biotic_mean, color=fill), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Abiotic anomaly", y="Biotic anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+#final_plot <- (p_inset | ab_plot)# | table_col_ab) +
+#  plot_layout(widths = c(1,1))
+#final_plot
+
+```
+
+```{r}
+#| label: bl
+#| eval: false
+p1 <- ggplot()+
+  geom_raster( data = df_bl,  aes(    x=x,    y=y,    fill=fill   ),
+    interpolate = TRUE) +
+  scale_fill_identity() +
+  labs(   title = "Biotic-Landscape anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_bl %>%
+  separate(group, into = c("Biotic", "Landscape"), sep = " - ") %>%
+  mutate(Biotic = as.integer(Biotic),
+         Landscape = as.integer(Landscape)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Biotic, y = Landscape, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Biotic →",
+       y = "Landscape →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_bl <- p1 +
+  inset_element(p2,   left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#bl_plot <- ggplot()+
+#    geom_point(data=df_bl, aes(x=biotic_mean, y=landscape_mean, color=fill), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Biotic anomaly", y="Landscape anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+#final_plot <- (p_inset | bl_plot)#| table_col_bl) +
+#  plot_layout(widths = c(1,1))
+#final_plot
+
+```
+
+```{r}
+#| label: al
+#| eval: false
+p1 <- ggplot()+
+  geom_raster(data = df_al,  aes( x=x, y=y,  fill=fill),
+    interpolate = TRUE ) +
+  scale_fill_identity() +
+  labs(title = "Abiotic-Landscape anomaly") +
+  theme_void() +
+  theme(legend.position = 'none')
+
+p2 <- legend_al %>%
+  separate(group, into = c("Abiotic", "Landscape"), sep = " - ") %>%
+  mutate(Abiotic = as.integer(Abiotic),
+         Landscape = as.integer(Landscape)) %>%
+  ggplot() +
+  geom_tile(mapping = aes(x = Abiotic, y = Landscape, fill = fill)) +
+  scale_fill_identity() +
+  scale_x_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  scale_y_discrete(breaks = 1:3, labels = c("-ve","Mid", "+ve")) +
+  labs(x = "Abiotic →",
+       y = "Landscape →") +
+  theme_void() +
+  theme(axis.title = element_text(size = 7),
+    axis.text = element_text(size=7),
+    axis.title.y = element_text(angle = 90)) +
+  coord_fixed()
+
+inset_al <- p1 +
+  inset_element( p2,    left   = 0.68, bottom = 0.68,  right  = 0.99,  top    = 0.99,
+    align_to = "panel")
+
+#al_plot <- ggplot()+
+#    geom_point(data=df_al, aes(x=abiotic_mean, y=landscape_mean, color=fill), alpha=0.5)+
+#    scale_colour_identity()+
+#    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+#    geom_vline(xintercept=0, linetype="dashed", color = "black")+
+#    labs(x="Abiotic anomaly", y="Landscape anomaly")+
+#    facet_wrap(~ecosystem, ncol=1)+
+#    theme_bw()
+
+#final_plot <- (p_inset | al_plot)#| table_col_al) +
+#  plot_layout(widths = c(1, 1))
+#final_plot
+
+
+```
+
+# With cost
+
+- Based on slope, soil suitability, distance from roads, land cost
+
+```{r}
+cost_dir <- "Y:/CH_Kanton_Bern/03_Workspaces/03_Habitat_condition/Restoration_potential/Implementation_cost_eva/Result/"
+ccost <- rast(paste0(cost_dir, "cropland_cost_w.tif"))
+gcost <- rast(paste0(cost_dir, "grassland_cost_w.tif"))
+fcost <- rast(paste0(cost_dir, "forest_cost_w.tif"))
+cdf <- as.data.frame(ccost, xy=TRUE)
+gdf <- as.data.frame(gcost, xy=TRUE)
+fdf <- as.data.frame(fcost, xy=TRUE)
+
+comb <- bind_rows(cdf, gdf, fdf)
+cost <- rast(comb, type="xyz")
+
+cost_df <- left_join(class_mean_anoms, comb, by=c("x"="x", "y"="y"))
+
+
+```
+
+:::
+
+# Optimisation logic
+
+Potential scenario elements:
+
+| Decision option | Parameter | Possible values |
+|-------|------|---------|
+|  Maximum area to restore |  % of eligible pixels  |    10, 20, 30   |
+|  Spatial clustering of areas to restore  |  Size of moving window used in smoothing |   None, 3, 15, 31   |
+|  Effect of restoration (pixel-level)  | Change assumed when area selected for restoration |  Condition improved to threshold (good condition), Condition improved by % value  |
+|  Quantification of optimal solutions  | Calculation of objective function |  Sum of change in objective variable per pixel, mean of change in objective variable per pixel, % of pixels above threshold (in good condition)
+
+# Decision variable{.tabset}
+
+::: panel-tabset
+
+# Maximum area to restore
+
+```{r}
+
+idx <- which(values(combined_ec) %in% c(1,2))
+
+make_DV <- function(ref, idx, p, smooth_radius, seed) {
+  set.seed(seed)
+
+  noise <- rast(ref)
+  values(noise) <- runif(ncell(noise))
+
+  smooth <- focal(noise, w = matrix(1, smooth_radius, smooth_radius), fun = mean, na.rm = TRUE)
+
+  v <- values(smooth)
+  thr <- quantile(v[idx], probs = 1 - p, na.rm = TRUE)
+
+  out <- rast(ref)
+  out_vals <- rep(NA, ncell(out))
+  out_vals[idx] <- as.integer(v[idx] >= thr)
+  values(out) <- out_vals
+
+  out
+}
+
+make_DV_rand <- function(ref, idx, p, smooth_radius, seed) {
+  set.seed(seed)
+
+  noise <- rast(ref)
+  values(noise) <- runif(ncell(noise))
+
+  v <- values(noise)
+  thr <- quantile(v[idx], probs = 1 - p, na.rm = TRUE)
+
+  out <- rast(ref)
+  out_vals <- rep(NA, ncell(out))
+  out_vals[idx] <- as.integer(v[idx] >= thr)
+  values(out) <- out_vals
+
+  out
+}
+
+seeds <- 1:100
+
+DV <- rast(
+  lapply(seeds, function(s)
+    make_DV(
+      combined_ec,
+      idx,
+      p = 0.2,
+      smooth_radius = 3,
+      seed = s
+    )
+  )
+)
+
+names(DV) <- paste0("dv", seeds)
+
+DVplt <- c(DV[[1]], DV[[2]], DV[[3]])
+
+DV10 <- make_DV(combined_ec, idx, p=0.1, smooth_radius = 3, seed=1106)
+DV20 <- make_DV(combined_ec, idx, p=0.2, smooth_radius = 3, seed=1106)
+DV30 <- make_DV(combined_ec, idx, p=0.3, smooth_radius = 3, seed=1106)
+
+names(DVplt)<- c("10%", "20%", "30%")
+DV_df <- as.data.frame(DVplt, xy=TRUE)
+DV_df <- pivot_longer(DV_df, cols=-c(x,y), names_to="variable", values_to="value")
+DV_df$value <- factor(DV_df$value)
+ggplot()+
+  geom_raster(data=DV_df, aes(x=x, y=y, fill=value))+
+  scale_fill_manual(values = c("0" = "grey80", "1" = "red"), name="To restore")+
+  coord_fixed()+
+  facet_wrap(~variable)+
+  theme_void()
+
+```
+
+# Spatial clustering
+
+```{r}
+
+idx <- which(values(combined_ec) %in% c(1, 2, 3, 4, 5))
+
+dv_no <- make_DV_rand(combined_ec, idx, p = 0.2, seed = 1106)
+dv_low <- make_DV(combined_ec, idx, p = 0.2, smooth_radius = 3, seed = 1106)
+dv_mid <- make_DV(combined_ec, idx, p = 0.2, smooth_radius = 15, seed = 1106)
+dv_hi <- make_DV(combined_ec, idx, p = 0.2, smooth_radius = 31, seed = 1106)
+
+DVs <- c(dv_no, dv_low, dv_mid, dv_hi)
+names(DVs)<- c("None","Low","Medium", "High")
+DVs_df <- as.data.frame(DVs, xy=TRUE)
+DVs_df <- pivot_longer(DVs_df, cols=-c(x,y), names_to="variable", values_to="value")
+DVs_df$value <- factor(DVs_df$value)
+ggplot()+
+  geom_raster(data=DVs_df, aes(x=x, y=y, fill=value))+
+  scale_fill_manual(values = c("0" = "grey80", "1" = "red"))+
+  coord_fixed()+
+  facet_wrap(~variable, nrow=1)+
+  theme_void()
+
+```
+:::
+
+# Optimisation {.tabset}
+
+- Forest areas, 100 iterations
+* Objectives
+  + 
+
+::: panel-tabset
+
+# All to good
+- restoration brings all negative anomalies to threshold - everything selected recieves maximum effort to become good condition
+- additive objective: the total change in condition anomaly
+
+```{r}
+
+forest_anoms <- eco_mean_anoms%>%filter(ecosystem=="Forest")
+forest_ab <- eco_mean_anoms%>%filter(ect=="Abiotic")%>%select(-ecosystem, -ect)%>%rast(type="xyz")
+forest_bi <- eco_mean_anoms%>%filter(ect=="Biotic")%>%select(-ecosystem, -ect)%>%rast(type="xyz")
+forest_ls <- eco_mean_anoms%>%filter(ect=="Landscape")%>%select(-ecosystem, -ect)%>%rast(type="xyz")
+forest_all <- c(forest_ab, forest_bi, forest_ls)
+
+base_sum <- global(forest_all, "sum", na.rm = TRUE)[, 1]
+
+result <- do.call(
+  rbind,
+  lapply(1:nlyr(DV), function(i) {
+
+    forest_masked <- ifel(DV[[i]] == 1, 0, forest_all)
+    masked_sum <- global(forest_masked, "sum", na.rm = TRUE)[, 1]
+    dv_name <- names(DV)[i]
+    data.frame(
+      dv = dv_name,
+      variable = c("ab", "bio", "ls"),
+      value = base_sum - masked_sum
+    )
+  })
+)
+
+result <- result %>% pivot_wider(names_from = variable, values_from=value)
+ggplot()+
+  geom_point(data=result, aes(x=ab, y=bio, size=ls))
+
+#so these objectives are all increasing together. 
+
+```
+
+# Proportion above threshold
+- restoration increases condition of pixel, increasing all anomaly values by 0.5% in positive direction
+- additive objective: the proportion of cells above threshold value
+```{r}
+
+base_prop <- global(forest_all > 0, "mean", na.rm = TRUE)[, 1]
+
+result_prop <- do.call(
+  rbind,
+  lapply(1:nlyr(DV), function(i) {
+    forest_modified <- ifel(
+      DV[[i]] == 0,
+      forest_all + 1.05 * abs(forest_all),
+      forest_all
+    )
+
+    mod_prop <- global(forest_modified > 0, "mean", na.rm = TRUE)[, 1]
+    dv_name <- names(DV)[i]
+    data.frame(
+      dv = dv_name,
+      variable = c("ab", "bio", "ls"),
+      #base = base_prop,
+      #modified = mod_prop,
+      value = mod_prop - base_prop
+    )
+  })
+)
+
+result_prop <- result_prop %>% pivot_wider(names_from = variable, values_from=value)
+ggplot()+
+  geom_point(data=result_prop, aes(x=ab, y=bio, size=ls))
+
+```
+
+# Landscape spillover
+- restoration increases condition of pixel, increasing abiotic and biotics anomaly values by 0.5% in positive direction. For landscape anomaly, the effect of restoration is observed on surrounding cells
+- additive objective: the proportion of cells above threshold value
+
+```{r}
+
+result_infl <- do.call(
+  rbind,
+  lapply(1:nlyr(DV), function(i) {
+    dv <- DV[[i]]
+
+    ## neighbourhood influence of selected cells
+    source <- as.numeric(dv == 0)
+    w <- focalMat(source, d = 300, type = "circle")
+
+    influence <- focal(
+      source,
+      w = w,
+      fun = "sum",
+      na.policy = "omit"
+    )
+
+    ## copy raster
+    forest_modified <- forest_all
+
+    ## apply spillover only to ls (3rd layer)
+    forest_modified[[3]] <-
+      forest_all[[3]] + 1.05 * influence * abs(forest_all[[3]])
+    forest_modified[[1]] <- ifel(
+      dv == 0,
+      forest_all[[1]] + 1.05 * abs(forest_all[[1]]),
+      forest_all[[1]]
+    )
+
+    forest_modified[[2]] <- ifel(
+      dv == 0,
+      forest_all[[2]] + 1.05 * abs(forest_all[[2]]),
+      forest_all[[2]]
+    )
+
+    ## recompute proportions
+    mod_prop <- global(forest_modified > 0, "mean", na.rm = TRUE)[, 1]
+    dv_name <- names(DV)[i]
+    data.frame(
+      dv = dv_name,
+      variable = c("ab", "bio", "ls"),
+      value = mod_prop - base_prop
+    )
+  })
+)
+
+result_infl <- result_infl %>% pivot_wider(names_from = variable, values_from=value)
+ggplot()+
+  geom_point(data=result_infl, aes(x=ab, y=bio, size=ls))
+
+
+```
+
+:::
+
+
+# Time series data
+
+```{r}
+#| label: time series table
+
+temp_df <- data.frame(
+    Class = as.character(variable_info$Class),
+    Ecosystems = as.character(variable_info$Ecosystems),
+    Indicator = as.character(variable_info$Indicator),
+    `Time series data` = as.character(variable_info$`Time series`),
+    `Time series coverage` = as.character(variable_info$Coverage) 
+    )
+
+table_panel <- tableGrob(temp_df, rows=NULL,
+    theme=ttheme_minimal(
+      base_size=9,
+      core=list(fg_params=list(hjust=0, x=0.01))
+    )
+  )
+
+# rows after which you want a separator
+split_after <- c(1, 5, 16)     # example positions
+
+for(r in split_after) {
+  table_panel <- gtable::gtable_add_rows(
+    table_panel,
+    heights = unit(1, "pt"),
+    pos = r
+  )
+  table_panel <- gtable::gtable_add_grob(
+    table_panel,
+    grobs = grid::linesGrob(y = unit(0.5, "npc")),
+    t = r + 1,
+    l = 1,
+    r = ncol(table_panel)
+  )
+}
+
+temp_tab <- wrap_elements(full=table_panel)
+temp_tab
+
+```
+
+Potential for EBVs to supplement B1?
+
+# Next steps
+
+-   Extend to Switzerland (re-process some indicators, stratify anomalies)
+-   Look at Geoembeddings dataset/methodology for trends
+-   Process available time series data (obtain and align datasets, calculate temporal anomalies)
+-   Extend costs to Switzerland (Eva, possible difficulty with BE datasets)
+-   Develop optimisation decision logic and run test
+-   (check EBV approach)
