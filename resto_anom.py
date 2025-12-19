@@ -45,7 +45,8 @@ def define_scenario_parameters():
     """
     scenario_parameters = {
         'max_restoration_fraction': [0.15, 0.25, 0.35, 0.50], # Proportion of study area to restore
-        'spatial_clustering': [0.0, 0.3, 0.6, 1.0] # Degree of spatial clustering (0=random, 1=highly clustered)
+        'spatial_clustering': [0.0, 0.3, 0.6, 1.0], # Degree of spatial clustering (0=random, 1=highly clustered)
+        'burden_sharing': ['no', 'yes'] # Equal sharing across admin regions (no/yes)
     }
     
     return scenario_parameters
@@ -91,6 +92,41 @@ def get_scenario_by_index(scenario_index):
 # =============================================================================
 # DATA PREPARATION SECTION
 # =============================================================================
+
+def load_admin_regions(workspace_dir):
+    """
+    Load administrative regions from shapefile for burden sharing.
+    
+    Args:
+        workspace_dir: Directory containing admin shapefile
+        
+    Returns:
+        dict: Admin regions data with region_map and region_counts
+    """
+    import geopandas as gpd
+    
+    admin_file = 'Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp'
+    
+    if not os.path.exists(admin_file):
+        print(f"Warning: Admin shapefile not found at {admin_file}")
+        return None
+    
+    try:
+        # Load admin shapefile
+        gdf = gpd.read_file(admin_file)
+        region_col = 'NAME'     
+        unique_regions = gdf[region_col].unique()
+        
+        return {
+            'gdf': gdf,
+            'region_column': region_col,
+            'unique_regions': unique_regions,
+            'n_regions': len(unique_regions)
+        }
+        
+    except Exception as e:
+        print(f"Error loading admin shapefile: {e}")
+        return None
 
 def load_initial_conditions(workspace_dir):
     """
@@ -146,6 +182,10 @@ def load_initial_conditions(workspace_dir):
     eligible_indices = np.where(eligible_mask.flatten())[0]
     initial_conditions['eligible_indices'] = eligible_indices
     initial_conditions['n_pixels'] = len(eligible_indices)
+    
+    # Load admin regions for burden sharing
+    admin_data = load_admin_regions(workspace_dir)
+    initial_conditions['admin_data'] = admin_data
     
     print(f"✓ Data preparation complete: {initial_conditions['n_pixels']} eligible pixels")
     
@@ -237,6 +277,85 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
 # =============================================================================
 # SPATIAL CLUSTERING FUNCTIONS
 # =============================================================================
+
+def apply_burden_sharing(decision_vars, initial_conditions):
+    """
+    Apply burden sharing to ensure equal restoration across admin regions.
+    
+    Args:
+        decision_vars: Binary array (0/1) for restoration decisions
+        initial_conditions: Dict with initial conditions including admin data
+        
+    Returns:
+        numpy.array: Modified decision variables with burden sharing applied
+    """
+    admin_data = initial_conditions.get('admin_data')
+    
+    if admin_data is None:
+        print("Warning: No admin data available for burden sharing")
+        return decision_vars.copy()
+    
+    shape = initial_conditions['shape']
+    eligible_indices = initial_conditions['eligible_indices']
+    total_restore = np.sum(decision_vars)
+    
+    if total_restore == 0:
+        return decision_vars.copy()
+    
+    # Create raster mask for each admin region
+    # This is a simplified implementation - you may need to adjust based on your shapefile
+    from rasterio.features import rasterize
+    
+    transform = initial_conditions['transform']
+    crs = initial_conditions['crs']
+    
+    # Convert eligible indices to 2D coordinates
+    rows, cols = np.divmod(eligible_indices, shape[1])
+    
+    # Create region assignment for eligible pixels
+    region_assignments = np.full(len(eligible_indices), -1, dtype=int)
+    
+    # For each region, determine which eligible pixels belong to it
+    for i, region in enumerate(admin_data['unique_regions']):
+        region_geom = admin_data['gdf'][admin_data['gdf'][admin_data['region_column']] == region]
+        
+        # Rasterize this region
+        region_mask = rasterize(
+            region_geom.geometry,
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            default_value=1
+        ).astype(bool)
+        
+        # Find eligible pixels in this region
+        eligible_in_region = region_mask.flatten()[eligible_indices]
+        region_assignments[eligible_in_region] = i
+    
+    # Calculate target restoration per region (equal sharing)
+    n_regions = admin_data['n_regions']
+    restore_per_region = total_restore // n_regions
+    extra_restores = total_restore % n_regions
+    
+    # Apply burden sharing
+    new_decision_vars = np.zeros_like(decision_vars)
+    
+    for region_id in range(n_regions):
+        region_pixels = np.where(region_assignments == region_id)[0]
+        
+        if len(region_pixels) == 0:
+            continue
+            
+        # Determine restoration target for this region
+        target = restore_per_region + (1 if region_id < extra_restores else 0)
+        target = min(target, len(region_pixels))  # Can't restore more pixels than available
+        
+        if target > 0:
+            # Select pixels to restore in this region (random selection for now)
+            selected_pixels = np.random.choice(region_pixels, target, replace=False)
+            new_decision_vars[selected_pixels] = 1
+    
+    return new_decision_vars
 
 def apply_spatial_clustering(decision_vars, initial_conditions, clustering_strength=0.0):
     """
@@ -412,12 +531,19 @@ class RestorationProblem(ElementwiseProblem):
             x: Decision variables (binary array)
             out: Output dictionary for objectives and constraints
         """
+        # Apply burden sharing if specified in scenario parameters
+        burden_sharing = self.scenario_params.get('burden_sharing', 'no')
+        if burden_sharing == 'yes':
+            x_processed = apply_burden_sharing(x, self.initial_conditions)
+        else:
+            x_processed = x
+        
         # Apply spatial clustering if specified in scenario parameters
         clustering_strength = self.scenario_params.get('spatial_clustering', 0.0)
         if clustering_strength > 0.0:
-            x_clustered = apply_spatial_clustering(x, self.initial_conditions, clustering_strength)
+            x_clustered = apply_spatial_clustering(x_processed, self.initial_conditions, clustering_strength)
         else:
-            x_clustered = x
+            x_clustered = x_processed
         
         # Apply restoration effects using clustered decision variables
         updated_conditions = restoration_effect(x_clustered, self.initial_conditions)
@@ -856,9 +982,9 @@ def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100,
 if __name__ == '__main__':
     # Example usage:
     
-    # Run all scenarios
+    # Run all scenarios (now includes burden sharing variants)
     results = main(
-        workspace_dir=".",          # Current directory - change to your data path
+        workspace_dir=".",          # Current directory - change to your data path  
         scenario='all',             # Run all scenarios ('all' or integer index for specific scenario)
         pop_size=30,               # Population size
         n_generations=50,          # Number of generations
@@ -867,6 +993,7 @@ if __name__ == '__main__':
     )
     
     # Or run a single scenario by index:
+    # For burden sharing scenarios, ensure admin.shp exists in workspace_dir
     # results = main(
     #     workspace_dir=".",
     #     scenario=0,               # Run scenario 0 (first scenario)

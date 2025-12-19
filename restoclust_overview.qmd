@@ -485,6 +485,12 @@ eco_mean_anoms <- anom_long %>%
 ```
 
 ```{r}
+
+class_mean_a <- class_mean_anoms %>%
+
+```
+
+```{r}
 #! label: calculate noise
 #r  <- rast("anom.tif")
 #lv <- focal(r, w = 3, fun = var, na.rm = TRUE)
