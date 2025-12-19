@@ -128,22 +128,40 @@ def load_admin_regions(workspace_dir):
         print(f"Error loading admin shapefile: {e}")
         return None
 
-def load_initial_conditions(workspace_dir):
+def load_initial_conditions(workspace_dir, objectives=None):
     """
     Args:
         workspace_dir: Directory containing input data files (.tif)
+        objectives: List of objectives to load (e.g., ['abiotic', 'biotic', 'landscape', 'cost'])
+                   If None, loads all available objectives
     Returns:
-        dict: Initial conditions for all objectives
+        dict: Initial conditions for specified objectives
     """
-    print("Loading initial objective conditions...")
-    
-    # Define file paths - modify these to match your data structure
-    data_files = {
-        'abiotic_anomaly': os.path.join(workspace_dir, 'abiotic_condition_anomaly.tif'),
-        'biotic_anomaly': os.path.join(workspace_dir, 'biotic_condition_anomaly.tif'),
-        'landscape_anomaly': os.path.join(workspace_dir, 'landscape_condition_anomaly.tif'),
-        'implementation_cost': os.path.join(workspace_dir, 'implementation_cost.tif')
+    # Define all possible objectives and their file mappings
+    all_objectives = {
+        'abiotic': 'abiotic_condition_anomaly.tif',
+        'biotic': 'biotic_condition_anomaly.tif', 
+        'landscape': 'landscape_condition_anomaly.tif',
+        'cost': 'implementation_cost.tif'
     }
+    
+    # Use all objectives if none specified
+    if objectives is None:
+        objectives = list(all_objectives.keys())
+    
+    print(f"Loading initial conditions for objectives: {objectives}")
+    
+    # Build file paths for selected objectives
+    data_files = {}
+    for obj in objectives:
+        if obj in all_objectives:
+            filename = all_objectives[obj]
+            if obj == 'cost':
+                data_files['implementation_cost'] = os.path.join(workspace_dir, filename)
+            else:
+                data_files[f'{obj}_anomaly'] = os.path.join(workspace_dir, filename)
+        else:
+            raise ValueError(f"Unknown objective: {obj}. Available: {list(all_objectives.keys())}")
     
     initial_conditions = {}
     
@@ -236,7 +254,11 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
     # Initialize updated conditions
     updated_conditions = {}
     
-    for objective in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+    # Process only objectives that are available in initial_conditions
+    available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly'] 
+                                   if obj in initial_conditions]
+    
+    for objective in available_anomaly_objectives:
         original_values = initial_conditions[objective].copy()
         updated_values = original_values.copy()
         
@@ -264,13 +286,13 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
         
         updated_conditions[objective] = updated_values
     
-    # Implementation cost (only for restored cells)
-    base_cost = initial_conditions['implementation_cost'].copy()
-    total_cost = 0
-    if np.any(restoration_mask_2d):
-        total_cost = np.sum(base_cost[restoration_mask_2d])
-    
-    updated_conditions['implementation_cost'] = total_cost
+    # Implementation cost (only if cost objective is being used)
+    if 'implementation_cost' in initial_conditions:
+        base_cost = initial_conditions['implementation_cost'].copy()
+        total_cost = 0
+        if np.any(restoration_mask_2d):
+            total_cost = np.sum(base_cost[restoration_mask_2d])
+        updated_conditions['implementation_cost'] = total_cost
     
     return updated_conditions
 
@@ -489,13 +511,13 @@ def create_parameter_illustration_maps(initial_conditions, save_path=None):
 
 class RestorationProblem(ElementwiseProblem):
     """
-    Four-objective restoration optimization problem.
+    Multi-objective restoration optimization problem.
     
-    Objectives (all to minimize):
-    1. Abiotic condition anomaly
-    2. Biotic condition anomaly
-    3. Landscape condition anomaly
-    4. Implementation cost
+    Objectives (all to minimize, depending on what's loaded):
+    - Abiotic condition anomaly
+    - Biotic condition anomaly
+    - Landscape condition anomaly  
+    - Implementation cost
     """
     
     def __init__(self, initial_conditions, scenario_params):
@@ -509,6 +531,21 @@ class RestorationProblem(ElementwiseProblem):
         self.initial_conditions = initial_conditions
         self.scenario_params = scenario_params
         
+        # Determine which objectives are available
+        self.objective_names = []
+        if 'abiotic_anomaly' in initial_conditions:
+            self.objective_names.append('abiotic_anomaly')
+        if 'biotic_anomaly' in initial_conditions:
+            self.objective_names.append('biotic_anomaly')
+        if 'landscape_anomaly' in initial_conditions:
+            self.objective_names.append('landscape_anomaly')
+        if 'implementation_cost' in initial_conditions:
+            self.objective_names.append('implementation_cost')
+        
+        n_objectives = len(self.objective_names)
+        if n_objectives == 0:
+            raise ValueError("No objectives found in initial_conditions")
+        
         n_pixels = initial_conditions['n_pixels']
         max_restoration_fraction = scenario_params['max_restoration_fraction']
         self.max_restored_pixels = int(max_restoration_fraction * n_pixels)
@@ -516,7 +553,7 @@ class RestorationProblem(ElementwiseProblem):
         # Binary decision variables: 0 = no restoration, 1 = restoration
         super().__init__(
             n_var=n_pixels,           # One decision per eligible pixel
-            n_obj=4,                  # Four objectives
+            n_obj=n_objectives,       # Variable number of objectives
             n_constr=1,              # Constraint on total restoration area
             xl=0,                    # Lower bound: no restoration
             xu=1,                    # Upper bound: restoration
@@ -548,24 +585,20 @@ class RestorationProblem(ElementwiseProblem):
         # Apply restoration effects using clustered decision variables
         updated_conditions = restoration_effect(x_clustered, self.initial_conditions)
         
-        # Calculate objective values (all to minimize)
+        # Calculate objective values (all to minimize) - only for available objectives
         objectives = []
         
-        # 1. Abiotic condition anomaly (sum of remaining anomalies)
-        abiotic_objective = np.sum(updated_conditions['abiotic_anomaly'])
-        objectives.append(abiotic_objective)
-        
-        # 2. Biotic condition anomaly (sum of remaining anomalies)
-        biotic_objective = np.sum(updated_conditions['biotic_anomaly'])
-        objectives.append(biotic_objective)
-        
-        # 3. Landscape condition anomaly (sum of remaining anomalies)
-        landscape_objective = np.sum(updated_conditions['landscape_anomaly'])
-        objectives.append(landscape_objective)
-        
-        # 4. Implementation cost (total cost)
-        cost_objective = updated_conditions['implementation_cost']
-        objectives.append(cost_objective)
+        for obj_name in self.objective_names:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+                # Anomaly objectives: sum of remaining anomalies
+                obj_value = np.sum(updated_conditions[obj_name])
+            elif obj_name == 'implementation_cost':
+                # Cost objective: total cost
+                obj_value = updated_conditions[obj_name]
+            else:
+                raise ValueError(f"Unknown objective: {obj_name}")
+            
+            objectives.append(obj_value)
         
         out["F"] = objectives
         
@@ -584,7 +617,7 @@ class RestorationProblem(ElementwiseProblem):
 def run_single_scenario_optimization(initial_conditions, scenario_params, pop_size=50, 
                                    n_generations=100, save_results=True, verbose=True):
     """
-    Run the four-objective restoration optimization for a single scenario.
+    Run the multi-objective restoration optimization for a single scenario.
     
     Args:
         initial_conditions: Initial objective conditions
@@ -604,6 +637,10 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         print(f"Generations: {n_generations}")
         print(f"Max restoration: {scenario_params['max_restoration_fraction']*100:.1f}% of eligible area")
         print(f"Eligible pixels: {initial_conditions['n_pixels']}")
+        
+        # Show which objectives are being used
+        problem_temp = RestorationProblem(initial_conditions, scenario_params)
+        print(f"Objectives: {problem_temp.objective_names} ({len(problem_temp.objective_names)} total)")
     
     # Create optimization problem
     problem = RestorationProblem(
@@ -800,36 +837,29 @@ def save_scenario_results(results, output_dir=".", verbose=True):
     summary_filename = os.path.join(output_dir, f"restoration_scenario_{scenario_str}_summary_{timestamp}.json")
     
     objectives = results['objectives']
+    
+    # Get objective names from the problem
+    problem_temp = RestorationProblem(results['initial_conditions'], results['scenario_params'])
+    objective_names = problem_temp.objective_names
+    
     summary = {
         'scenario_params': results['scenario_params'],
         'optimization_info': {
             'n_solutions': results['n_solutions'],
             'n_pixels': results['problem_info']['n_pixels'],
-            'timestamp': results['algorithm_info']['timestamp']
+            'timestamp': results['algorithm_info']['timestamp'],
+            'objectives_used': objective_names
         },
-        'objective_statistics': {
-            'abiotic_anomaly': {
-                'min': float(objectives[:, 0].min()),
-                'max': float(objectives[:, 0].max()),
-                'mean': float(objectives[:, 0].mean())
-            },
-            'biotic_anomaly': {
-                'min': float(objectives[:, 1].min()),
-                'max': float(objectives[:, 1].max()),
-                'mean': float(objectives[:, 1].mean())
-            },
-            'landscape_anomaly': {
-                'min': float(objectives[:, 2].min()),
-                'max': float(objectives[:, 2].max()),
-                'mean': float(objectives[:, 2].mean())
-            },
-            'implementation_cost': {
-                'min': float(objectives[:, 3].min()),
-                'max': float(objectives[:, 3].max()),
-                'mean': float(objectives[:, 3].mean())
-            }
-        }
+        'objective_statistics': {}
     }
+    
+    # Add statistics for each objective that was used
+    for i, obj_name in enumerate(objective_names):
+        summary['objective_statistics'][obj_name] = {
+            'min': float(objectives[:, i].min()),
+            'max': float(objectives[:, i].max()),
+            'mean': float(objectives[:, i].mean())
+        }
     
     with open(summary_filename, 'w') as f:
         json.dump(summary, f, indent=2)
@@ -875,15 +905,20 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     # Add summary for each scenario
     for scenario_id, scenario_results in combined_results['scenarios'].items():
         objectives = scenario_results['objectives']
+        
+        # Get objective names from this scenario
+        problem_temp = RestorationProblem(scenario_results['initial_conditions'], scenario_results['scenario_params'])
+        objective_names = problem_temp.objective_names
+        
+        objective_ranges = {}
+        for i, obj_name in enumerate(objective_names):
+            objective_ranges[obj_name] = [float(objectives[:, i].min()), float(objectives[:, i].max())]
+        
         summary['scenarios'][f'scenario_{scenario_id}'] = {
             'params': scenario_results['scenario_params'],
             'n_solutions': scenario_results['n_solutions'],
-            'objective_ranges': {
-                'abiotic_anomaly': [float(objectives[:, 0].min()), float(objectives[:, 0].max())],
-                'biotic_anomaly': [float(objectives[:, 1].min()), float(objectives[:, 1].max())],
-                'landscape_anomaly': [float(objectives[:, 2].min()), float(objectives[:, 2].max())],
-                'implementation_cost': [float(objectives[:, 3].min()), float(objectives[:, 3].max())]
-            }
+            'objectives_used': objective_names,
+            'objective_ranges': objective_ranges
         }
     
     with open(summary_filename, 'w') as f:
@@ -897,7 +932,7 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
 # MAIN EXECUTION FUNCTION
 # =============================================================================
 
-def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100, 
+def main(workspace_dir=".", scenario='all', objectives=None, pop_size=50, n_generations=100, 
          save_results=True, verbose=True):
     """
     Main execution function for restoration optimization.
@@ -905,6 +940,9 @@ def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100,
     Args:
         workspace_dir: Directory containing input data
         scenario: Scenario to run ('all' for all scenarios, or integer index for specific scenario)
+        objectives: List of objectives to use (e.g., ['abiotic', 'biotic', 'landscape'])
+                   Available: 'abiotic', 'biotic', 'landscape', 'cost'
+                   If None, uses all available objectives
         pop_size: Population size for optimization
         n_generations: Number of optimization generations
         save_results: Whether to save results
@@ -917,15 +955,17 @@ def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100,
     # Step 1: Load initial conditions
     if verbose:
         print("=== RESTORATION OPTIMIZATION WORKFLOW ===")
+        if objectives is not None:
+            print(f"Using objectives: {objectives}")
     
-    initial_conditions = load_initial_conditions(workspace_dir)
+    initial_conditions = load_initial_conditions(workspace_dir, objectives=objectives)
     
     # Step 2: Display available scenarios
     if verbose:
         scenario_combinations = get_scenario_combinations()
         print(f"\nAvailable scenarios ({len(scenario_combinations)} total):")
-        for i, params in enumerate(scenario_combinations):
-            print(f"  Scenario {i}: {params}")
+        #for i, params in enumerate(scenario_combinations):
+        #    print(f"  Scenario {i}: {params}")
     
     # Step 3: Run optimization based on scenario selection
     if scenario == 'all':
@@ -969,9 +1009,19 @@ def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100,
             
             objectives = results['objectives']
             print(f"\nObjective ranges:")
-            obj_names = ['Abiotic anomaly', 'Biotic anomaly', 'Landscape anomaly', 'Implementation cost']
-            for i, name in enumerate(obj_names):
-                print(f"  {name}: {objectives[:, i].min():.2f} - {objectives[:, i].max():.2f}")
+            
+            # Get objective names from the problem
+            problem_temp = RestorationProblem(results['initial_conditions'], results['scenario_params'])
+            obj_display_names = {
+                'abiotic_anomaly': 'Abiotic anomaly',
+                'biotic_anomaly': 'Biotic anomaly', 
+                'landscape_anomaly': 'Landscape anomaly',
+                'implementation_cost': 'Implementation cost'
+            }
+            
+            for i, obj_name in enumerate(problem_temp.objective_names):
+                display_name = obj_display_names.get(obj_name, obj_name)
+                print(f"  {display_name}: {objectives[:, i].min():.2f} - {objectives[:, i].max():.2f}")
     
     return results
 
@@ -981,27 +1031,20 @@ def main(workspace_dir=".", scenario='all', pop_size=50, n_generations=100,
 
 if __name__ == '__main__':
     # Example usage:
+
     
-    # Run all scenarios (now includes burden sharing variants)
+    # Or run with specific objectives only:
     results = main(
-        workspace_dir=".",          # Current directory - change to your data path  
-        scenario='all',             # Run all scenarios ('all' or integer index for specific scenario)
-        pop_size=30,               # Population size
-        n_generations=50,          # Number of generations
-        save_results=True,         # Save results to files
-        verbose=True               # Print progress
-    )
+         workspace_dir=".",
+         scenario=0,
+         objectives=['abiotic', 'biotic', 'landscape'],
+         pop_size=50,
+         n_generations=100,
+         save_results=True,
+         verbose=True
+     )
     
-    # Or run a single scenario by index:
-    # For burden sharing scenarios, ensure admin.shp exists in workspace_dir
-    # results = main(
-    #     workspace_dir=".",
-    #     scenario=0,               # Run scenario 0 (first scenario)
-    #     pop_size=30,
-    #     n_generations=50,
-    #     save_results=True,
-    #     verbose=True
-    # )
+
     
     if results is not None:
         print("\n✓ Optimization completed successfully!")
