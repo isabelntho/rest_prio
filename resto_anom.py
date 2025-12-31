@@ -26,6 +26,8 @@ import json
 from datetime import datetime
 
 from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.sampling import Sampling
+from pymoo.core.repair import Repair
 from pymoo.optimize import minimize
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.termination import get_termination
@@ -45,7 +47,7 @@ def define_scenario_parameters():
     """
     scenario_parameters = {
         'max_restoration_fraction': [0.15, 0.25, 0.35, 0.50], # Proportion of study area to restore
-        'spatial_clustering': [0.0, 0.3, 0.6, 1.0], # Degree of spatial clustering (0=random, 1=highly clustered)
+        'spatial_clustering': [0.6, 1.0], # Degree of spatial clustering (0=random, 1=highly clustered) (could add in 0.3)
         'burden_sharing': ['no', 'yes'] # Equal sharing across admin regions (no/yes)
     }
     
@@ -90,15 +92,18 @@ def get_scenario_by_index(scenario_index):
         raise ValueError(f"Scenario index {scenario_index} out of range. Available: 0-{len(combinations)-1}")
 
 # =============================================================================
-# DATA PREPARATION SECTION
+# DATA PREPARATION
 # =============================================================================
 
-def load_admin_regions(workspace_dir):
+def load_admin_regions(workspace_dir, region='Bern'):
     """
     Load administrative regions from shapefile for burden sharing.
     
     Args:
         workspace_dir: Directory containing admin shapefile
+        region: Region to optimize for ('Bern' or 'CH')
+                - 'Bern': Filters to Bern canton, uses district-level admin regions
+                - 'CH': Uses all cantons for burden sharing
         
     Returns:
         dict: Admin regions data with region_map and region_counts
@@ -106,34 +111,74 @@ def load_admin_regions(workspace_dir):
     import geopandas as gpd
     
     admin_file = 'Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp'
-    
-    if not os.path.exists(admin_file):
-        print(f"Warning: Admin shapefile not found at {admin_file}")
+    kanton_file = 'Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_KANTONSGEBIET.shp'
+
+    if not os.path.exists(kanton_file):
+        print(f"Warning: Kanton shapefile not found at {kanton_file}")
         return None
     
     try:
-        # Load admin shapefile
-        gdf = gpd.read_file(admin_file)
-        region_col = 'NAME'     
-        unique_regions = gdf[region_col].unique()
-        
-        return {
-            'gdf': gdf,
-            'region_column': region_col,
-            'unique_regions': unique_regions,
-            'n_regions': len(unique_regions)
-        }
+        if region == 'CH':
+            # Use cantons for burden sharing across Switzerland
+            gdf = gpd.read_file(kanton_file)
+            region_col = 'NAME'
+            unique_regions = gdf[region_col].unique()
+            
+            print(f"✓ Loaded {len(unique_regions)} cantons for CH-wide optimization")
+            
+            return {
+                'gdf': gdf,
+                'region_column': region_col,
+                'unique_regions': unique_regions,
+                'n_regions': len(unique_regions)
+            }
+            
+        elif region == 'Bern':
+            # Filter to Bern canton and use district-level admin regions
+            if not os.path.exists(admin_file):
+                print(f"Warning: Admin shapefile not found at {admin_file}")
+                return None
+            
+            # Load kanton shapefile and filter to Bern
+            kanton_gdf = gpd.read_file(kanton_file)
+            bern_gdf = kanton_gdf[kanton_gdf['NAME'] == 'Bern'].copy()
+            
+            if len(bern_gdf) == 0:
+                print(f"Warning: No canton named 'Bern' found in {kanton_file}")
+                return None
+            
+            print(f"✓ Filtered to Bern canton")
+            
+            # Load admin shapefile and crop/mask to Bern
+            gdf = gpd.read_file(admin_file)
+            gdf_bern = gpd.clip(gdf, bern_gdf)
+            
+            region_col = 'NAME'     
+            unique_regions = gdf_bern[region_col].unique()
+            
+            print(f"✓ Cropped admin regions to Bern: {len(unique_regions)} regions")
+            
+            return {
+                'gdf': gdf_bern,
+                'region_column': region_col,
+                'unique_regions': unique_regions,
+                'n_regions': len(unique_regions)
+            }
+        else:
+            print(f"Warning: Unknown region '{region}'. Use 'Bern' or 'CH'")
+            return None
         
     except Exception as e:
         print(f"Error loading admin shapefile: {e}")
         return None
 
-def load_initial_conditions(workspace_dir, objectives=None):
+def load_initial_conditions(workspace_dir, objectives=None, region='Bern'):
     """
     Args:
         workspace_dir: Directory containing input data files (.tif)
         objectives: List of objectives to load (e.g., ['abiotic', 'biotic', 'landscape', 'cost'])
                    If None, loads all available objectives
+        region: Region to optimize for ('Bern' or 'CH'), passed to load_admin_regions
     Returns:
         dict: Initial conditions for specified objectives
     """
@@ -142,7 +187,8 @@ def load_initial_conditions(workspace_dir, objectives=None):
         'abiotic': 'abiotic_condition_anomaly.tif',
         'biotic': 'biotic_condition_anomaly.tif', 
         'landscape': 'landscape_condition_anomaly.tif',
-        'cost': 'implementation_cost.tif'
+        'cost': 'implementation_cost.tif',
+        'population_proximity': 'population_proximity.tif'
     }
     
     # Use all objectives if none specified
@@ -176,22 +222,43 @@ def load_initial_conditions(workspace_dir, objectives=None):
         print(f"  {workspace_dir}")
         raise FileNotFoundError(f"Missing {len(missing_files)} required data file(s).")
     
-    # Load all data files
+    # Load all data files and track NaN locations
+    nan_masks = {}  # Store NaN locations before replacement
+    
     for objective, file_path in data_files.items():
         with rio.open(file_path) as src:
             data = src.read(1)
-            # Get spatial reference for later use
-            if objective == 'abiotic_anomaly':  # Use first file for reference
+            if 'crs' not in initial_conditions:  # First file loaded
                 initial_conditions['crs'] = src.crs
                 initial_conditions['transform'] = src.transform
                 initial_conditions['shape'] = data.shape
+        
+            # Track NaN locations BEFORE replacement
+            nan_mask = np.isnan(data)
+            nan_masks[objective] = nan_mask
+            nan_count = np.sum(nan_mask)
+            total_pixels = data.size
+            
+            if nan_count > 0:
+                print(f"✓ Loaded {objective}: {data.shape} ({nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}% NaN)")
+                # Replace NaN with 0 so np.sum() works correctly in objective calculations
+                data = np.nan_to_num(data, nan=0.0)
+                print(f"  → Replaced NaN with 0 (pixels excluded via eligible_mask)")
+            else:
+                print(f"✓ Loaded {objective}: {data.shape}")
+                
             initial_conditions[objective] = data
-            print(f"✓ Loaded {objective}: {data.shape}")
     
-    # Create eligibility mask
+    # Create eligibility mask - exclude pixels that were NaN in ANY objective
     shape = initial_conditions['shape']
-    eligible_mask = np.ones(shape, dtype=bool)  # All cells eligible for now
+    eligible_mask = np.ones(shape, dtype=bool)
     
+    for obj_name, nan_mask in nan_masks.items():
+        if np.any(nan_mask):
+            eligible_mask = eligible_mask & ~nan_mask
+            nan_excluded = np.sum(nan_mask)
+            print(f"  Masking {nan_excluded} NaN pixels from {obj_name}")
+
     # You might want to exclude certain areas, e.g.:
     # eligible_mask = (initial_conditions['implementation_cost'] < 8000) & \
     #                 (initial_conditions['abiotic_anomaly'] > 0.1)
@@ -201,8 +268,11 @@ def load_initial_conditions(workspace_dir, objectives=None):
     initial_conditions['eligible_indices'] = eligible_indices
     initial_conditions['n_pixels'] = len(eligible_indices)
     
+    total_pixels = shape[0] * shape[1]
+    print(f"✓ Eligibility mask created: {initial_conditions['n_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_pixels']/total_pixels:.1f}% of raster)")
+    
     # Load admin regions for burden sharing
-    admin_data = load_admin_regions(workspace_dir)
+    admin_data = load_admin_regions(workspace_dir, region=region)
     initial_conditions['admin_data'] = admin_data
     
     print(f"✓ Data preparation complete: {initial_conditions['n_pixels']} eligible pixels")
@@ -218,9 +288,6 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
     Define what happens when restoration is selected (decision_var = 1).
     This function calculates the effect of restoration on neighboring cells.
     
-    To customize restoration effects, modify the effect_params values below or 
-    pass a custom effect_params dictionary when calling this function.
-    
     Args:
         decision_vars: Binary array (0/1) for restoration decisions
         initial_conditions: Dict with initial objective values
@@ -232,9 +299,9 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
     if effect_params is None:
         # Modify these values to customize restoration effects
         effect_params = {
-            'abiotic_improvement': 0.3,      # Reduction in abiotic anomaly
-            'biotic_improvement': 0.4,       # Reduction in biotic anomaly  
-            'landscape_improvement': 0.5,    # Reduction in landscape anomaly
+            'abiotic_improvement': 0.01,      # Reduction in abiotic anomaly
+            'biotic_improvement': 0.01,       # Reduction in biotic anomaly  
+            'landscape_improvement': 0.01,    # Reduction in landscape anomaly
             'neighbor_radius': 1,            # Effect radius in cells
             'neighbor_effect_decay': 0.5     # Effect strength for neighbors
         }
@@ -265,8 +332,11 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
         if np.any(restoration_mask_2d):
             # Direct effect on restored cells
             improvement = effect_params[f'{objective.split("_")[0]}_improvement']
-            updated_values[restoration_mask_2d] = np.maximum(0, 
-                original_values[restoration_mask_2d] - improvement)
+            
+            # Apply improvement:
+            updated_values[restoration_mask_2d] = (
+                original_values[restoration_mask_2d] + improvement
+            )
             
             # Neighbor effects
             if effect_params['neighbor_radius'] > 0:
@@ -281,8 +351,18 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
                 
                 # Apply reduced improvement to neighbors
                 neighbor_improvement = improvement * effect_params['neighbor_effect_decay']
-                updated_values[neighbor_mask] = np.maximum(0,
-                    original_values[neighbor_mask] - neighbor_improvement)
+                updated_values[neighbor_mask] = (
+                    original_values[neighbor_mask] + neighbor_improvement
+                )
+        
+        # Only apply changes to eligible pixels; restore original values elsewhere
+        # This prevents affecting NaN→0 pixels outside the study area
+        updated_values = np.where(eligible_mask, updated_values, original_values)
+        
+        # Safety check: ensure no NaN or inf values
+        if np.any(np.isnan(updated_values)) or np.any(np.isinf(updated_values)):
+            print(f"WARNING: {objective} contains NaN or inf values after restoration effect!")
+            updated_values = np.nan_to_num(updated_values, nan=0.0, posinf=0.0, neginf=0.0)
         
         updated_conditions[objective] = updated_values
     
@@ -294,19 +374,29 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
             total_cost = np.sum(base_cost[restoration_mask_2d])
         updated_conditions['implementation_cost'] = total_cost
     
+    # Population proximity (only if proximity objective is being used)
+    # Proximity is a fixed spatial property - no restoration improvement effect
+    if 'population_proximity' in initial_conditions:
+        proximity_map = initial_conditions['population_proximity'].copy()
+        avg_distance = 0.0
+        if np.any(restoration_mask_2d):
+            avg_distance = np.mean(proximity_map[restoration_mask_2d])
+        updated_conditions['population_proximity'] = avg_distance
+    
     return updated_conditions
 
 # =============================================================================
 # SPATIAL CLUSTERING FUNCTIONS
 # =============================================================================
 
-def apply_burden_sharing(decision_vars, initial_conditions):
+def apply_burden_sharing(decision_vars, initial_conditions, seed=None):
     """
     Apply burden sharing to ensure equal restoration across admin regions.
     
     Args:
         decision_vars: Binary array (0/1) for restoration decisions
         initial_conditions: Dict with initial conditions including admin data
+        seed: Random seed for reproducibility (default: None)
         
     Returns:
         numpy.array: Modified decision variables with burden sharing applied
@@ -362,6 +452,10 @@ def apply_burden_sharing(decision_vars, initial_conditions):
     # Apply burden sharing
     new_decision_vars = np.zeros_like(decision_vars)
     
+    # Set random seed for reproducibility
+    if seed is not None:
+        np.random.seed(seed)
+    
     for region_id in range(n_regions):
         region_pixels = np.where(region_assignments == region_id)[0]
         
@@ -373,7 +467,7 @@ def apply_burden_sharing(decision_vars, initial_conditions):
         target = min(target, len(region_pixels))  # Can't restore more pixels than available
         
         if target > 0:
-            # Select pixels to restore in this region (random selection for now)
+            # Select pixels to restore in this region (deterministic if seed provided)
             selected_pixels = np.random.choice(region_pixels, target, replace=False)
             new_decision_vars[selected_pixels] = 1
     
@@ -430,6 +524,200 @@ def apply_spatial_clustering(decision_vars, initial_conditions, clustering_stren
         new_decision_vars = decision_vars.copy()
     
     return new_decision_vars
+
+# =============================================================================
+# CUSTOM SAMPLING AND REPAIR OPERATORS
+# =============================================================================
+
+class ClusteredSampling(Sampling):
+    """
+    Custom sampling that generates spatially clustered restoration patterns.
+    """
+    
+    def __init__(self, initial_conditions, max_restored_pixels, clustering_strength=0.5):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = max_restored_pixels
+        self.clustering_strength = clustering_strength
+    
+    def _do(self, problem, n_samples, **kwargs):
+        n_pixels = problem.n_var
+        X = np.zeros((n_samples, n_pixels), dtype=int)
+        
+        for i in range(n_samples):
+            # Generate a random solution with target number of pixels
+            x = np.zeros(n_pixels, dtype=int)
+            
+            # Randomly select target number of pixels
+            n_restore = np.random.randint(0, self.max_restored_pixels + 1)
+            if n_restore > 0:
+                restore_indices = np.random.choice(n_pixels, n_restore, replace=False)
+                x[restore_indices] = 1
+                
+                # Apply spatial clustering to generate clustered pattern
+                if self.clustering_strength > 0:
+                    x = apply_spatial_clustering(
+                        x, 
+                        self.initial_conditions, 
+                        self.clustering_strength
+                    )
+            
+            X[i] = x
+        
+        return X
+
+
+class BurdenSharingSampling(Sampling):
+    """
+    Custom sampling that generates solutions with equal restoration across regions.
+    """
+    
+    def __init__(self, initial_conditions, max_restored_pixels):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = max_restored_pixels
+    
+    def _do(self, problem, n_samples, **kwargs):
+        n_pixels = problem.n_var
+        X = np.zeros((n_samples, n_pixels), dtype=int)
+        
+        for i in range(n_samples):
+            # Generate a random solution with target number of pixels
+            x = np.zeros(n_pixels, dtype=int)
+            
+            n_restore = np.random.randint(0, self.max_restored_pixels + 1)
+            if n_restore > 0:
+                restore_indices = np.random.choice(n_pixels, n_restore, replace=False)
+                x[restore_indices] = 1
+                
+                # Apply burden sharing to distribute equally across regions
+                seed = np.random.randint(0, 2**32)
+                x = apply_burden_sharing(x, self.initial_conditions, seed=seed)
+            
+            X[i] = x
+        
+        return X
+
+
+class CombinedSampling(Sampling):
+    """
+    Custom sampling that combines burden sharing and spatial clustering.
+    """
+    
+    def __init__(self, initial_conditions, max_restored_pixels, clustering_strength=0.5):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = max_restored_pixels
+        self.clustering_strength = clustering_strength
+    
+    def _do(self, problem, n_samples, **kwargs):
+        n_pixels = problem.n_var
+        X = np.zeros((n_samples, n_pixels), dtype=int)
+        
+        for i in range(n_samples):
+            x = np.zeros(n_pixels, dtype=int)
+            
+            n_restore = np.random.randint(0, self.max_restored_pixels + 1)
+            if n_restore > 0:
+                restore_indices = np.random.choice(n_pixels, n_restore, replace=False)
+                x[restore_indices] = 1
+                
+                # Apply burden sharing first
+                seed = np.random.randint(0, 2**32)
+                x = apply_burden_sharing(x, self.initial_conditions, seed=seed)
+                
+                # Then apply spatial clustering
+                if self.clustering_strength > 0:
+                    x = apply_spatial_clustering(
+                        x, 
+                        self.initial_conditions, 
+                        self.clustering_strength
+                    )
+            
+            X[i] = x
+        
+        return X
+
+
+class ClusteringRepair(Repair):
+    """
+    Repair operator that maintains spatial clustering after crossover/mutation.
+    """
+    
+    def __init__(self, initial_conditions, clustering_strength=0.5):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.clustering_strength = clustering_strength
+    
+    def _do(self, problem, X, **kwargs):
+        X_repaired = np.zeros_like(X)
+        
+        for i in range(len(X)):
+            x = X[i]
+            if np.sum(x) > 0 and self.clustering_strength > 0:
+                x = apply_spatial_clustering(
+                    x, 
+                    self.initial_conditions, 
+                    self.clustering_strength
+                )
+            X_repaired[i] = x
+        
+        return X_repaired
+
+
+class BurdenSharingRepair(Repair):
+    """
+    Repair operator that maintains burden sharing after crossover/mutation.
+    """
+    
+    def __init__(self, initial_conditions):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+    
+    def _do(self, problem, X, **kwargs):
+        X_repaired = np.zeros_like(X)
+        
+        for i in range(len(X)):
+            x = X[i]
+            if np.sum(x) > 0:
+                seed = hash(tuple(x)) % (2**32)
+                x = apply_burden_sharing(x, self.initial_conditions, seed=seed)
+            X_repaired[i] = x
+        
+        return X_repaired
+
+
+class CombinedRepair(Repair):
+    """
+    Repair operator that maintains both burden sharing and clustering.
+    """
+    
+    def __init__(self, initial_conditions, clustering_strength=0.5):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.clustering_strength = clustering_strength
+    
+    def _do(self, problem, X, **kwargs):
+        X_repaired = np.zeros_like(X)
+        
+        for i in range(len(X)):
+            x = X[i]
+            if np.sum(x) > 0:
+                # Apply burden sharing
+                seed = hash(tuple(x)) % (2**32)
+                x = apply_burden_sharing(x, self.initial_conditions, seed=seed)
+                
+                # Apply clustering
+                if self.clustering_strength > 0:
+                    x = apply_spatial_clustering(
+                        x, 
+                        self.initial_conditions, 
+                        self.clustering_strength
+                    )
+            X_repaired[i] = x
+        
+        return X_repaired
+
 
 def create_parameter_illustration_maps(initial_conditions, save_path=None):
     """
@@ -505,6 +793,205 @@ def create_parameter_illustration_maps(initial_conditions, save_path=None):
     plt.show()
     return fig
 
+# Add this function before the RestorationProblem class (around line 750)
+
+def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10):
+    """
+    Diagnose why optimization might not find solutions.
+    
+    Args:
+        initial_conditions: Dict with initial conditions
+        scenario_params: Dict with scenario parameters
+        n_samples: Number of sample solutions to test
+    """
+    print("\n" + "="*70)
+    print("OPTIMIZATION DIAGNOSTICS")
+    print("="*70)
+    
+    # Create problem instance
+    problem = RestorationProblem(initial_conditions, scenario_params)
+    
+    print(f"\nPROBLEM SETUP:")
+    print(f"   - Decision variables: {problem.n_var} (eligible pixels)")
+    print(f"   - Objectives: {problem.n_obj} ({problem.objective_names})")
+    print(f"   - Constraints: {problem.n_constr}")
+    print(f"   - Max restored pixels: {problem.max_restored_pixels}")
+    print(f"   - Restoration fraction: {scenario_params['max_restoration_fraction']*100:.1f}%")
+    
+    # Check baseline objectives
+    print(f"\nBASELINE OBJECTIVES (no restoration):")
+    x_none = np.zeros(problem.n_var, dtype=int)
+    out_none = {}
+    problem._evaluate(x_none, out_none)
+    
+    for i, obj_name in enumerate(problem.objective_names):
+        if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+            # Display actual anomaly sum (reverse the negative)
+            actual_sum = -out_none['F'][i]
+            print(f"   - {obj_name}: sum={actual_sum:.4e} (objective={out_none['F'][i]:.4e})")
+        else:
+            print(f"   - {obj_name}: {out_none['F'][i]:.4e}")
+    print(f"   - Constraint violation: {out_none['G'][0]:.4e} (should be ≤ 0)")
+    
+    # Test sample solutions
+    #print(f"\n3. SAMPLE SOLUTIONS (random restoration patterns):")
+    
+    feasible_count = 0
+    infeasible_count = 0
+    
+    for i in range(n_samples):
+        # Generate random solution at max allowed restoration
+        x = np.zeros(problem.n_var, dtype=int)
+        n_restore = problem.max_restored_pixels
+        if n_restore > 0 and n_restore <= problem.n_var:
+            restore_indices = np.random.choice(problem.n_var, n_restore, replace=False)
+            x[restore_indices] = 1
+        
+        # Evaluate
+        out = {}
+        problem._evaluate(x, out)
+        
+        constraint_violation = out['G'][0]
+        is_feasible = constraint_violation <= 0
+        
+        if is_feasible:
+            feasible_count += 1
+        else:
+            infeasible_count += 1
+        
+        if i < 3:  # Print first 3 samples in detail
+            for j, obj_name in enumerate(problem.objective_names):
+                # For anomaly objectives, we minimize negative sum, so lower objective = higher anomaly sum (better)
+                if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+                    # Reverse sign for display: show actual anomaly sums
+                    baseline_sum = -out_none['F'][j]
+                    restored_sum = -out['F'][j]
+                    improvement = ((restored_sum - baseline_sum) / abs(baseline_sum) * 100) if baseline_sum != 0 else 0
+                    #print(f"       {obj_name}: sum={restored_sum:.4e} (baseline={baseline_sum:.4e}, Δ {improvement:+.2f}%)")
+                else:
+                    improvement = ((out_none['F'][j] - out['F'][j]) / out_none['F'][j] * 100) if out_none['F'][j] != 0 else 0
+                    #print(f"       {obj_name}: {out['F'][j]:.4e} (Δ {improvement:+.2f}%)")
+    
+    print(f"\n   Summary: {feasible_count}/{n_samples} feasible, {infeasible_count}/{n_samples} infeasible")
+    
+    # Check if objectives can improve
+    #print(f"\n4. OBJECTIVE IMPROVEMENT POTENTIAL:")
+    
+    if feasible_count > 0:
+        print(f"   ✓ Feasible solutions exist")
+        print(f"   ✓ Objectives show improvement with restoration")
+    else:
+        print(f"   ✗ WARNING: No feasible solutions found in {n_samples} samples!")
+        print(f"   → Check if max_restored_pixels constraint is too restrictive")
+    
+    # Check for common issues
+    #print(f"\n5. POTENTIAL ISSUES:")
+    issues = []
+    
+    if problem.max_restored_pixels == 0:
+        issues.append("   ✗ Max restored pixels is 0 - no restoration possible!")
+    
+    if problem.max_restored_pixels > problem.n_var:
+        issues.append(f"   ✗ Max restored pixels ({problem.max_restored_pixels}) > available pixels ({problem.n_var})")
+    
+    # Check if objectives are all zero or constant
+    if out_none['F'][0] == 0:
+        issues.append("   ✗ Baseline objective is zero - may indicate data loading issue")
+    
+    if np.any(np.isnan(out_none['F'])):
+        issues.append("   ✗ NaN detected in objectives - data contains unmasked NaN values")
+    
+    if not issues:
+        print("   ✓ No obvious setup issues detected")
+    else:
+        for issue in issues:
+            print(issue)
+    
+    # Test with different restoration amounts
+    print(f"\n OBJECTIVE SENSITIVITY TO RESTORATION AMOUNT:")
+    test_fractions = [0.05, 0.10, 0.15, 0.20]
+    
+    for frac in test_fractions:
+        n_restore = int(frac * problem.n_var)
+        if n_restore > 0 and n_restore <= problem.n_var:
+            x = np.zeros(problem.n_var, dtype=int)
+            restore_indices = np.random.choice(problem.n_var, n_restore, replace=False)
+            x[restore_indices] = 1
+            
+            out = {}
+            problem._evaluate(x, out)
+            
+            # Calculate total improvement across all objectives
+            total_improvement = 0
+            for j in range(len(out['F'])):
+                if out_none['F'][j] != 0:
+                    improvement = (out_none['F'][j] - out['F'][j]) / out_none['F'][j]
+                    total_improvement += improvement
+            
+            print(f"   {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {total_improvement/len(out['F'])*100:>6.2f}%")
+    
+    print(f"\nINITIAL DATA SPATIAL CORRELATIONS:")
+    anomaly_objs = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly'] 
+                if obj in initial_conditions]
+    for i in range(len(anomaly_objs)):
+        for j in range(i+1, len(anomaly_objs)):
+        # Correlation of pixel values (only eligible pixels)
+            mask = initial_conditions['eligible_mask']
+            data1 = initial_conditions[anomaly_objs[i]][mask]
+            data2 = initial_conditions[anomaly_objs[j]][mask]
+            corr = np.corrcoef(data1, data2)[0, 1]
+            print(f"   {anomaly_objs[i]} vs {anomaly_objs[j]}: {corr:.4f}")
+
+    # Add this section in diagnose_optimization_setup() after line 897 (after spatial correlations, before "END DIAGNOSTICS")
+    
+        # Check if improvement pushes values above threshold
+        print(f"\nANOMALY VALUE DISTRIBUTIONS (threshold diagnostic):")
+        print(f"   Testing with {problem.max_restored_pixels} restored pixels...")
+        
+        # Test with max restoration
+        x_test = np.zeros(problem.n_var, dtype=int)
+        if problem.max_restored_pixels > 0:
+            restore_indices = np.random.choice(problem.n_var, problem.max_restored_pixels, replace=False)
+            x_test[restore_indices] = 1
+        
+        # Get updated conditions after restoration
+        updated = restoration_effect(x_test, initial_conditions)
+        
+        eligible_mask = initial_conditions['eligible_mask']
+        
+        for obj_name in anomaly_objs:
+            before = initial_conditions[obj_name][eligible_mask]
+            after = updated[obj_name][eligible_mask]
+            
+            # For restored pixels only
+            restored_2d = np.zeros(initial_conditions['shape'], dtype=bool)
+            rows, cols = np.divmod(initial_conditions['eligible_indices'][x_test == 1], initial_conditions['shape'][1])
+            restored_2d[rows, cols] = True
+            restored_mask = restored_2d[eligible_mask]
+            
+            before_restored = before[restored_mask]
+            after_restored = after[restored_mask]
+            
+            threshold = 0.0
+            
+            print(f"\n   {obj_name}:")
+            print(f"      ALL eligible pixels:")
+            print(f"         Before: min={np.min(before):.3f}, max={np.max(before):.3f}, mean={np.mean(before):.3f}")
+            print(f"         % above threshold ({threshold}): {100*np.sum(before > threshold)/len(before):.1f}%")
+            
+            print(f"      RESTORED pixels only (n={len(before_restored)}):")
+            print(f"         Before: min={np.min(before_restored):.3f}, max={np.max(before_restored):.3f}, mean={np.mean(before_restored):.3f}")
+            print(f"         After:  min={np.min(after_restored):.3f}, max={np.max(after_restored):.3f}, mean={np.mean(after_restored):.3f}")
+            print(f"         % above threshold BEFORE: {100*np.sum(before_restored > threshold)/len(before_restored):.1f}%")
+            print(f"         % above threshold AFTER:  {100*np.sum(after_restored > threshold)/len(after_restored):.1f}%")
+            print(f"         → Improvement adds {np.mean(after_restored - before_restored):.3f} on average")    
+
+    print("\n" + "="*70)
+    print("END DIAGNOSTICS")
+    print("="*70 + "\n")
+    
+    return problem
+
 # =============================================================================
 # OPTIMIZATION PROBLEM DEFINITION
 # =============================================================================
@@ -518,6 +1005,7 @@ class RestorationProblem(ElementwiseProblem):
     - Biotic condition anomaly
     - Landscape condition anomaly  
     - Implementation cost
+    - Population proximity (average distance to population centers)
     """
     
     def __init__(self, initial_conditions, scenario_params):
@@ -541,6 +1029,8 @@ class RestorationProblem(ElementwiseProblem):
             self.objective_names.append('landscape_anomaly')
         if 'implementation_cost' in initial_conditions:
             self.objective_names.append('implementation_cost')
+        if 'population_proximity' in initial_conditions:
+            self.objective_names.append('population_proximity')
         
         n_objectives = len(self.objective_names)
         if n_objectives == 0:
@@ -565,35 +1055,32 @@ class RestorationProblem(ElementwiseProblem):
         Evaluate a solution (restoration plan).
         
         Args:
-            x: Decision variables (binary array)
+            x: Decision variables (binary array) - already clustered/burden-shared by sampling/repair
             out: Output dictionary for objectives and constraints
         """
-        # Apply burden sharing if specified in scenario parameters
-        burden_sharing = self.scenario_params.get('burden_sharing', 'no')
-        if burden_sharing == 'yes':
-            x_processed = apply_burden_sharing(x, self.initial_conditions)
-        else:
-            x_processed = x
+        # Solution x is already properly structured from custom sampling/repair operators
+        # No post-processing needed - just evaluate as-is
+        n_restored = np.sum(x)
         
-        # Apply spatial clustering if specified in scenario parameters
-        clustering_strength = self.scenario_params.get('spatial_clustering', 0.0)
-        if clustering_strength > 0.0:
-            x_clustered = apply_spatial_clustering(x_processed, self.initial_conditions, clustering_strength)
-        else:
-            x_clustered = x_processed
-        
-        # Apply restoration effects using clustered decision variables
-        updated_conditions = restoration_effect(x_clustered, self.initial_conditions)
+        # Apply restoration effects directly to decision variables
+        updated_conditions = restoration_effect(x, self.initial_conditions)
         
         # Calculate objective values (all to minimize) - only for available objectives
         objectives = []
         
         for obj_name in self.objective_names:
             if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
-                # Anomaly objectives: sum of remaining anomalies
-                obj_value = np.sum(updated_conditions[obj_name])
+                # Anomaly objectives: MINIMIZE negative sum (equivalent to MAXIMIZE sum)
+                # Higher anomalies are better, so we want to maximize the sum
+                # NSGA-II minimizes, so we minimize the negative
+                threshold = 0.0  # or different per objective
+                pixels_above = np.sum(updated_conditions[obj_name] > threshold)
+                obj_value = -pixels_above  # Maximize count above threshold
             elif obj_name == 'implementation_cost':
-                # Cost objective: total cost
+                # Cost objective: minimize total cost (lower is better)
+                obj_value = updated_conditions[obj_name]
+            elif obj_name == 'population_proximity':
+                # Proximity objective: minimize average distance to population centers
                 obj_value = updated_conditions[obj_name]
             else:
                 raise ValueError(f"Unknown objective: {obj_name}")
@@ -602,12 +1089,7 @@ class RestorationProblem(ElementwiseProblem):
         
         out["F"] = objectives
         
-        # Constraint: limit total restoration area (use clustered variables for constraint)
-        clustering_strength = self.scenario_params.get('spatial_clustering', 0.0)
-        if clustering_strength > 0.0:
-            n_restored = np.sum(x_clustered)
-        else:
-            n_restored = np.sum(x)
+        # Constraint: limit total restoration area
         out["G"] = [n_restored - self.max_restored_pixels]  # Violation if positive
 
 # =============================================================================
@@ -648,12 +1130,66 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         scenario_params=scenario_params
     )
     
+    # Print additional diagnostic information
+    if verbose:
+        print(f"\nOptimization setup details:")
+        print(f"  Max restored pixels allowed: {problem.max_restored_pixels}")
+        print(f"  Number of objectives: {len(problem.objective_names)}")
+        
+        # Sample objective values without restoration
+        sample_obj_str = "  Baseline objectives (no restoration): "
+        for obj_name in problem.objective_names:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+                val = np.sum(initial_conditions[obj_name])
+                sample_obj_str += f"{obj_name}={val:.2e}, "
+        print(sample_obj_str.rstrip(", "))
+        
+        if problem.max_restored_pixels == 0:
+            print("  WARNING: max_restored_pixels is 0! No restoration possible.")
+        print("\nRunning diagnostics to check optimization setup...")
+        diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10)
+    
+    # Create custom sampling and repair operators based on scenario parameters
+    burden_sharing = scenario_params.get('burden_sharing', 'no')
+    clustering_strength = scenario_params.get('spatial_clustering', 0.0)
+    
+    # Select appropriate sampling strategy
+    if burden_sharing == 'yes' and clustering_strength > 0.0:
+        sampling = CombinedSampling(
+            initial_conditions, 
+            problem.max_restored_pixels, 
+            clustering_strength
+        )
+        repair = CombinedRepair(initial_conditions, clustering_strength)
+        if verbose:
+            print(f"  Using combined burden-sharing + clustering (strength={clustering_strength})")
+    elif burden_sharing == 'yes':
+        sampling = BurdenSharingSampling(initial_conditions, problem.max_restored_pixels)
+        repair = BurdenSharingRepair(initial_conditions)
+        if verbose:
+            print(f"  Using burden-sharing sampling/repair")
+    elif clustering_strength > 0.0:
+        sampling = ClusteredSampling(
+            initial_conditions, 
+            problem.max_restored_pixels, 
+            clustering_strength
+        )
+        repair = ClusteringRepair(initial_conditions, clustering_strength)
+        if verbose:
+            print(f"  Using clustered sampling/repair (strength={clustering_strength})")
+    else:
+        sampling = BinaryRandomSampling()
+        repair = None
+        if verbose:
+            print(f"  Using standard binary random sampling")
+    
     # Create optimization algorithm
     algorithm = NSGA2(
         pop_size=pop_size,
-        sampling=BinaryRandomSampling(),  # Binary sampling for 0/1 variables
+        sampling=sampling,                # Custom or standard sampling
         crossover=HUX(),                  # Half-uniform crossover
-        mutation=BitflipMutation()        # Bit-flip mutation
+        mutation=BitflipMutation(),       # Bit-flip mutation
+        repair=repair                     # Custom repair to maintain properties
     )
     
     # Set termination criteria
@@ -694,7 +1230,52 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             callback=callback
         )
         
-        if result is not None and hasattr(result, 'F') and result.F is not None:
+        # Debug: Check what's in the result
+        if verbose:
+            print(f"\nDEBUG - Result object:")
+            print(f"  result is None: {result is None}")
+            if result is not None:
+                print(f"  hasattr(result, 'F'): {hasattr(result, 'F')}")
+                print(f"  hasattr(result, 'X'): {hasattr(result, 'X')}")
+                print(f"  hasattr(result, 'pop'): {hasattr(result, 'pop')}")
+                
+                # Check final population
+                if hasattr(result, 'pop') and result.pop is not None:
+                    print(f"\n  Final population size: {len(result.pop)}")
+                    if len(result.pop) > 0:
+                        pop_F = result.pop.get("F")
+                        if pop_F is not None:
+                            print(f"  Population objectives shape: {pop_F.shape}")
+                            print(f"  Sample objectives (first 5 solutions):")
+                            for i in range(min(5, len(pop_F))):
+                                print(f"    Sol {i}: {pop_F[i]}")
+                            
+                            # Check for diversity
+                            print(f"\n  Objective statistics across population:")
+                            for j, obj_name in enumerate(problem.objective_names):
+                                obj_vals = pop_F[:, j]
+                                print(f"    {obj_name}: min={np.min(obj_vals):.4e}, max={np.max(obj_vals):.4e}, std={np.std(obj_vals):.4e}")
+                            
+                            # Check correlation between objectives
+                            if pop_F.shape[1] > 1:
+                                print(f"\n  Objective correlations (high correlation = no trade-offs):")
+                                for i in range(pop_F.shape[1]):
+                                    for j in range(i+1, pop_F.shape[1]):
+                                        corr = np.corrcoef(pop_F[:, i], pop_F[:, j])[0, 1]
+                                        print(f"    {problem.objective_names[i]} vs {problem.objective_names[j]}: {corr:.4f}")
+                
+                if hasattr(result, 'F'):
+                    print(f"\n  result.F (Pareto front):")
+                    print(f"    is None: {result.F is None}")
+                    if result.F is not None:
+                        print(f"    shape: {result.F.shape}")
+                        print(f"    length: {len(result.F)}")
+                if hasattr(result, 'X'):
+                    print(f"  result.X is None: {result.X is None}")
+                    if result.X is not None:
+                        print(f"    shape: {result.X.shape}")
+        
+        if result is not None and hasattr(result, 'F') and result.F is not None and len(result.F) > 0:
             if verbose:
                 print(f"✓ Optimization completed: {len(result.F)} Pareto-optimal solutions found")
             
@@ -829,12 +1410,12 @@ def save_scenario_results(results, output_dir=".", verbose=True):
     scenario_str = '_'.join([f"{k}{v}" for k, v in results['scenario_params'].items()])
     
     # Save complete results (pickle format)
-    results_filename = os.path.join(output_dir, f"restoration_scenario_{scenario_str}_{timestamp}.pkl")
+    results_filename = os.path.join(output_dir, f"results_{timestamp}.pkl")
     with open(results_filename, 'wb') as f:
         pickle.dump(results, f)
     
     # Save summary (JSON format)
-    summary_filename = os.path.join(output_dir, f"restoration_scenario_{scenario_str}_summary_{timestamp}.json")
+    summary_filename = os.path.join(output_dir, f"summary_{timestamp}.json")
     
     objectives = results['objectives']
     
