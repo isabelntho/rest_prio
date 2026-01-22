@@ -35,6 +35,203 @@ from pymoo.operators.sampling.rnd import BinaryRandomSampling
 from pymoo.operators.crossover.hux import HUX
 from pymoo.operators.mutation.bitflip import BitflipMutation
 
+# Import spatial operations from separate module
+from spatial_operations import apply_burden_sharing, apply_spatial_clustering, _enforce_exact_pixel_count
+from spatial_operations import ClusteringRepair, BurdenSharingRepair, CombinedRepair
+
+# =============================================================================
+# ECOSYSTEM DEFINITIONS AND LULC HANDLING
+# =============================================================================
+
+# Define ecosystem types and their corresponding LULC codes
+ECOSYSTEM_TYPES = {
+    'forest': [12, 13],
+    'agricultural': [15], 
+    'grassland': [16, 17]
+}
+#focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+#    52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
+
+def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH', 
+                     target_bounds=None, target_shape=None, target_transform=None, target_crs=None):
+    """
+    Load LULC raster for ecosystem masking.
+    
+    Args:
+        workspace_dir: Directory to look for LULC file (optional)
+        lulc_path: Explicit path to LULC file (optional)
+        region: Region to crop LULC to ('Bern', 'CH', etc.). 'CH' loads full extent.
+        target_bounds: Target bounds to crop/resample LULC to match reference data
+        target_shape: Target shape to resample LULC to
+        target_transform: Target transform for the output LULC
+        target_crs: Target CRS for the output LULC
+        
+    Returns:
+        numpy.ndarray: LULC raster data (processed to match target specifications)
+        dict: Rasterio metadata (crs, transform, etc.)
+    """
+    # Default LULC paths to try
+    default_paths = [
+        "W:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif",
+        "LULC_2018_agg.tif"  # Local file in workspace
+    ]
+    
+    if lulc_path:
+        paths_to_try = [lulc_path]
+    elif workspace_dir:
+        paths_to_try = [os.path.join(workspace_dir, "LULC_2018_agg.tif")] + default_paths
+    else:
+        paths_to_try = default_paths
+    
+    # Load the LULC raster
+    lulc_data = None
+    lulc_meta = None
+    original_path = None
+    
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with rio.open(path) as src:
+                    lulc_data = src.read(1)
+                    lulc_meta = {
+                        'crs': src.crs,
+                        'transform': src.transform,
+                        'shape': lulc_data.shape,
+                        'bounds': src.bounds
+                    }
+                    original_path = path
+                print(f"✓ Loaded LULC raster: {path}")
+                print(f"  Original shape: {lulc_data.shape}, unique values: {len(np.unique(lulc_data[~np.isnan(lulc_data)]))}")
+                break
+            except Exception as e:
+                print(f"✗ Error loading LULC from {path}: {e}")
+                continue
+    
+    if lulc_data is None:
+        raise FileNotFoundError(f"LULC raster not found. Tried: {paths_to_try}")
+    
+    # If target parameters are provided, crop/resample LULC to match reference data
+    if target_bounds is not None and target_shape is not None:
+        try:
+            from rasterio.warp import reproject, Resampling
+            from rasterio.windows import from_bounds
+            import rasterio.mask
+            
+            print(f"🔄 Processing LULC to match reference data extent...")
+            
+            with rio.open(original_path) as src:
+                # Check if we need to reproject
+                if target_crs and src.crs != target_crs:
+                    print(f"  Reprojecting from {src.crs} to {target_crs}")
+                    
+                    # Create output array with target specifications
+                    processed_data = np.empty(target_shape, dtype=src.dtypes[0])
+                    
+                    # Reproject to match target
+                    reproject(
+                        source=rio.band(src, 1),
+                        destination=processed_data,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=target_transform,
+                        dst_crs=target_crs,
+                        resampling=Resampling.nearest  # Use nearest neighbor for categorical data
+                    )
+                    
+                else:
+                    # Same CRS - just crop to bounds
+                    try:
+                        # Calculate window for the target bounds
+                        window = from_bounds(*target_bounds, src.transform)
+                        
+                        # Read the windowed data
+                        processed_data = src.read(1, window=window)
+                        
+                        # If the windowed data doesn't match target shape, resample
+                        if processed_data.shape != target_shape:
+                            print(f"  Resampling from {processed_data.shape} to {target_shape}")
+                            
+                            # Create temporary in-memory dataset for resampling
+                            temp_transform = rio.windows.transform(window, src.transform)
+                            temp_data = np.empty(target_shape, dtype=src.dtypes[0])
+                            
+                            reproject(
+                                source=processed_data,
+                                destination=temp_data,
+                                src_transform=temp_transform,
+                                src_crs=src.crs,
+                                dst_transform=target_transform,
+                                dst_crs=target_crs or src.crs,
+                                resampling=Resampling.nearest
+                            )
+                            
+                            processed_data = temp_data
+                            
+                    except Exception as window_error:
+                        print(f"  Window-based cropping failed: {window_error}")
+                        print(f"  Falling back to full reprojection...")
+                        
+                        # Fallback: reproject the entire raster
+                        processed_data = np.empty(target_shape, dtype=src.dtypes[0])
+                        
+                        reproject(
+                            source=rio.band(src, 1),
+                            destination=processed_data,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=target_transform,
+                            dst_crs=target_crs or src.crs,
+                            resampling=Resampling.nearest
+                        )
+            
+            # Update metadata to match target
+            lulc_meta.update({
+                'crs': target_crs or lulc_meta['crs'],
+                'transform': target_transform,
+                'shape': processed_data.shape,
+                'bounds': target_bounds
+            })
+            
+            print(f"✓ Processed LULC to match reference: {processed_data.shape}")
+            print(f"  Processed unique values: {len(np.unique(processed_data[~np.isnan(processed_data)]))}")
+            
+            return processed_data, lulc_meta
+            
+        except Exception as e:
+            print(f"Warning: Failed to process LULC to match reference data: {e}")
+            print("Using original LULC - ecosystem masking may not work correctly")
+            return lulc_data, lulc_meta
+    
+    else:
+        print(f"✓ Using original LULC extent (no target specified)")
+        return lulc_data, lulc_meta
+
+def create_ecosystem_mask(lulc_data, ecosystem_type):
+    """
+    Create a boolean mask for a specific ecosystem type.
+    
+    Args:
+        lulc_data: LULC raster data
+        ecosystem_type: Type of ecosystem ('forest', 'agricultural', 'grassland', or 'all')
+        
+    Returns:
+        numpy.ndarray: Boolean mask (True for pixels belonging to the ecosystem)
+    """
+    if ecosystem_type == 'all':
+        # Include all defined ecosystem types
+        all_codes = []
+        for codes in ECOSYSTEM_TYPES.values():
+            all_codes.extend(codes)
+        mask = np.isin(lulc_data, all_codes)
+    elif ecosystem_type in ECOSYSTEM_TYPES:
+        lulc_codes = ECOSYSTEM_TYPES[ecosystem_type]
+        mask = np.isin(lulc_data, lulc_codes)
+    else:
+        raise ValueError(f"Unknown ecosystem type: {ecosystem_type}. Available: {list(ECOSYSTEM_TYPES.keys()) + ['all']}")
+    
+    print(f"✓ Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
+    return mask
+
 # =============================================================================
 # WEIGHTING FUNCTIONS
 # =============================================================================
@@ -115,8 +312,8 @@ def define_scenario_parameters():
               or lists for categorical parameters
     """
     scenario_parameters = {
-        'max_restoration_fraction': [0.3],#(0.10, 0.50), # Proportion of study area to restore (min, max)
-        'spatial_clustering': [0],#(0.3, 1.0), # Degree of spatial clustering (0=random, 1=highly clustered)
+        'max_restoration_fraction': [0.1, 0.3],#(0.10, 0.50), # Proportion of study area to restore (min, max)
+        'spatial_clustering': [0, 0.3],#, 1.0), # Degree of spatial clustering (0=random, 1=highly clustered)
         'burden_sharing': ['no'], # Equal sharing across admin regions (categorical)
         # Separate improvement parameters for each anomaly type
         'abiotic_effect': (0.005, 0.02), # Reduction in abiotic anomaly (min, max)
@@ -204,6 +401,41 @@ def get_scenario_by_index(scenario_index, n_samples_per_param=3, random_seed=42)
 # DATA PREPARATION
 # =============================================================================
 
+def get_region_reference(region='Bern'):
+    """
+    Get the reference raster information for a specific region.
+    This defines the expected CRS, transform, shape, and bounds for data validation.
+    
+    Args:
+        region: Region name ('Bern' or 'CH')
+        
+    Returns:
+        dict: Reference raster information or None to use first loaded raster
+    """
+    # Define region-specific reference information
+    # These should match your expected data specifications for each region
+    
+    if region == 'Bern':
+        # Bern canton extent and projection
+        # Update these values based on your actual Bern data specifications
+        return {
+            'crs': 'EPSG:2056',  # Swiss coordinate system LV95
+            'expected_bounds': (2556200, 1130600, 2677700, 1243700),  # Approximate Bern extent
+            'expected_shape': None,  # Will be determined from first raster if None
+            'description': 'Bern canton reference'
+        }
+    elif region == 'CH':
+        # Switzerland-wide extent and projection  
+        return {
+            'crs': 'EPSG:2056',  # Swiss coordinate system LV95
+            'expected_bounds': (2480000, 1070000, 2834000, 1300000),  # Approximate CH extent
+            'expected_shape': (2300, 3600),  # Will be determined from first raster if None
+            'description': 'Switzerland reference'
+        }
+    else:
+        # Unknown region - use first loaded raster as reference
+        return None
+
 def load_admin_regions(workspace_dir, region='Bern'):
     """
     Load administrative regions from shapefile for burden sharing.
@@ -282,18 +514,22 @@ def load_admin_regions(workspace_dir, region='Bern'):
         print(f"Error loading admin shapefile: {e}")
         return None
 
-def load_initial_conditions(workspace_dir, objectives=None, region='Bern', sample_fraction=None, sample_seed=42):
+def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosystem='all', 
+                            sample_fraction=None, sample_seed=42, lulc_path=None):
     """
     Args:
         workspace_dir: Directory containing input data files (.tif)
         objectives: List of objectives to load (e.g., ['abiotic', 'biotic', 'landscape', 'cost'])
                    If None, loads all available objectives
         region: Region to optimize for ('Bern' or 'CH'), passed to load_admin_regions
+        ecosystem: Ecosystem type to focus on ('forest', 'agricultural', 'grassland', or 'all')
+                  Data will be masked to only include pixels from this ecosystem type
         sample_fraction: Fraction of eligible pixels to use (e.g., 0.25 for 25% sample)
                         If None, uses all eligible pixels
         sample_seed: Random seed for reproducible sampling (default: 42)
+        lulc_path: Path to LULC raster file. If None, uses default paths
     Returns:
-        dict: Initial conditions for specified objectives
+        dict: Initial conditions for specified objectives and ecosystem
     """
     # Define all possible objectives and their file mappings
     all_objectives = {
@@ -335,23 +571,51 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', sampl
         print(f"  {workspace_dir}")
         raise FileNotFoundError(f"Missing {len(missing_files)} required data file(s).")
     
+    # Get region-specific reference information
+    region_ref = get_region_reference(region)
+    
     # Load all data files and track NaN locations
     nan_masks = {}  # Store NaN locations before replacement
     ref = None
+    first_raster = True
+    
     for objective, file_path in data_files.items():
         with rio.open(file_path) as src:
             data = src.read(1)
-            # Initialise reference on first raster, validate subsequent rasters against it
-            if ref is None:
+            
+            if first_raster:
+                # Initialize reference on first raster
                 ref = {
                     'crs': src.crs,
                     'transform': src.transform,
                     'shape': data.shape,
                     'bounds': src.bounds,
                 }
+                
+                # Apply region-specific validation if available
+                if region_ref is not None:
+                    # Check if the loaded data matches region expectations
+                    if str(src.crs) != region_ref['crs']:
+                        print(f"Warning: Raster CRS {src.crs} doesn't match expected {region_ref['crs']} for region {region}")
+                    
+                    if region_ref['expected_bounds'] is not None:
+                        expected = region_ref['expected_bounds']
+                        actual = src.bounds
+                        if not (abs(actual.left - expected[0]) < 1000 and 
+                                abs(actual.bottom - expected[1]) < 1000 and
+                                abs(actual.right - expected[2]) < 1000 and
+                                abs(actual.top - expected[3]) < 1000):
+                            print(f"Warning: Raster bounds {actual} significantly differ from expected {expected} for region {region}")
+                    
+                    print(f"✓ Using {region_ref['description']} as validation reference")
+                else:
+                    print(f"✓ Using first raster as validation reference for region {region}")
+                
                 initial_conditions['crs'] = ref['crs']
                 initial_conditions['transform'] = ref['transform']
                 initial_conditions['shape'] = ref['shape']
+                initial_conditions['region'] = region
+                first_raster = False
             else:
                 if src.crs != ref['crs']:
                     raise ValueError(
@@ -389,6 +653,40 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', sampl
                 
             initial_conditions[objective] = data
     
+    # Load LULC raster and create ecosystem mask
+    print(f"\\n--- Loading LULC data for ecosystem: {ecosystem} ---")
+    try:
+        # Load LULC and crop/resample to match the reference data
+        lulc_data, lulc_meta = load_lulc_raster(workspace_dir, lulc_path, region, 
+                                               target_bounds=ref['bounds'], 
+                                               target_shape=ref['shape'],
+                                               target_transform=ref['transform'],
+                                               target_crs=ref['crs'])
+        
+        # Validate LULC raster compatibility with reference
+        if lulc_data.shape != ref['shape']:
+            raise ValueError(
+                f"LULC shape mismatch after processing. Expected {ref['shape']}, got {lulc_data.shape}"
+            )
+        
+        # Create ecosystem mask
+        ecosystem_mask = create_ecosystem_mask(lulc_data, ecosystem)
+        
+        # Store LULC info
+        initial_conditions['lulc_data'] = lulc_data
+        initial_conditions['lulc_meta'] = lulc_meta
+        initial_conditions['ecosystem'] = ecosystem
+        initial_conditions['ecosystem_mask'] = ecosystem_mask
+        
+    except Exception as e:
+        print(f"✗ Error loading LULC data: {e}")
+        if ecosystem != 'all':
+            print("Falling back to 'all' ecosystem (no masking)")
+            ecosystem = 'all'
+            ecosystem_mask = np.ones(ref['shape'], dtype=bool)
+        else:
+            raise e
+
     # Create eligibility mask - exclude pixels that were NaN in ANY objective
     shape = initial_conditions['shape']
     eligible_mask = np.ones(shape, dtype=bool)
@@ -399,8 +697,17 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', sampl
             nan_excluded = np.sum(nan_mask)
             print(f"  Masking {nan_excluded} NaN pixels from {obj_name}")
 
+    # Apply ecosystem mask to eligible pixels
+    if 'ecosystem_mask' in initial_conditions:
+        pre_ecosystem_count = np.sum(eligible_mask)
+        eligible_mask = eligible_mask & initial_conditions['ecosystem_mask']
+        post_ecosystem_count = np.sum(eligible_mask)
+        ecosystem_excluded = pre_ecosystem_count - post_ecosystem_count
+        print(f"  Ecosystem masking excluded {ecosystem_excluded} pixels")
+        print(f"  Final eligible pixels for {ecosystem}: {post_ecosystem_count}")
+
     # You might want to exclude certain areas, e.g.:
-    # eligible_mask = (initial_conditions['implementation_cost'] < 8000) & \
+    # eligible_mask = (initial_conditions['implementation_cost'] < 8000) & \\
     #                 (initial_conditions['abiotic_anomaly'] > 0.1)
     
     initial_conditions['eligible_mask'] = eligible_mask
@@ -626,218 +933,6 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
     return updated_conditions
 
 # =============================================================================
-# SPATIAL CLUSTERING FUNCTIONS
-# =============================================================================
-
-def apply_burden_sharing(decision_vars, initial_conditions, seed=None, exact_count=None):
-    """
-    Apply burden sharing to ensure equal restoration across admin regions.
-    
-    Args:
-        decision_vars: Binary array (0/1) for restoration decisions
-        initial_conditions: Dict with initial conditions including admin data
-        seed: Random seed for reproducibility (default: None)
-        exact_count: If provided, enforces exact total count after burden sharing
-        
-    Returns:
-        numpy.array: Modified decision variables with burden sharing applied
-    """
-    admin_data = initial_conditions.get('admin_data')
-    
-    if admin_data is None:
-        result = decision_vars.copy()
-        if exact_count is not None:
-            result = _enforce_exact_pixel_count(result, exact_count)
-        return result
-    
-    total_restore = exact_count if exact_count is not None else np.sum(decision_vars)
-    
-    if total_restore == 0:
-        return decision_vars.copy()
-    
-    # Check if we already have cached region assignments
-    if '_region_assignments_cache' not in initial_conditions:
-        print("DEBUG: Building region assignments cache (first time only)...")
-        shape = initial_conditions['shape']
-        eligible_indices = initial_conditions['eligible_indices']
-        
-        # Create raster mask for each admin region
-        from rasterio.features import rasterize
-        
-        transform = initial_conditions['transform']
-        crs = initial_conditions['crs']
-        
-        # Create region assignment for eligible pixels
-        region_assignments = np.full(len(eligible_indices), -1, dtype=int)
-        
-        # For each region, determine which eligible pixels belong to it
-        for i, region in enumerate(admin_data['unique_regions']):
-            region_geom = admin_data['gdf'][admin_data['gdf'][admin_data['region_column']] == region]
-            
-            # Rasterize this region
-            region_mask = rasterize(
-                region_geom.geometry,
-                out_shape=shape,
-                transform=transform,
-                fill=0,
-                default_value=1
-            ).astype(bool)
-            
-            # Find eligible pixels in this region
-            eligible_in_region = region_mask.flatten()[eligible_indices]
-            region_assignments[eligible_in_region] = i
-        
-        # Cache the assignments and create a list of non-empty regions
-        non_empty_regions = []
-        for region_id in range(admin_data['n_regions']):
-            region_pixels = np.where(region_assignments == region_id)[0]
-            if len(region_pixels) > 0:
-                non_empty_regions.append((region_id, region_pixels))
-        
-        initial_conditions['_region_assignments_cache'] = region_assignments
-        initial_conditions['_non_empty_regions_cache'] = non_empty_regions
-        print(f"DEBUG: Cached {len(non_empty_regions)} non-empty regions out of {admin_data['n_regions']} total")
-    else:
-        # Use cached data
-        region_assignments = initial_conditions['_region_assignments_cache']
-        non_empty_regions = initial_conditions['_non_empty_regions_cache']
-    
-    # Calculate target restoration per region (equal sharing)
-    n_regions = admin_data['n_regions']
-    restore_per_region = total_restore // n_regions
-    extra_restores = total_restore % n_regions
-    
-    # Apply burden sharing
-    new_decision_vars = np.zeros_like(decision_vars)
-    
-    # Set random seed for reproducibility
-    if seed is not None:
-        np.random.seed(seed)
-    
-    # Only process non-empty regions
-    for region_id, region_pixels in non_empty_regions:
-        # Determine restoration target for this region
-        target = restore_per_region + (1 if region_id < extra_restores else 0)
-        target = min(target, len(region_pixels))  # Can't restore more pixels than available
-        
-        if target > 0:
-            # Select pixels to restore in this region - use permutation to avoid int32 overflow
-            if target == len(region_pixels):
-                selected_pixels = region_pixels
-            else:
-                # Use permutation instead of choice to avoid int32 overflow
-                shuffled = np.random.permutation(len(region_pixels))[:target]
-                selected_pixels = region_pixels[shuffled]
-            new_decision_vars[selected_pixels] = 1
-    
-    # Enforce exact count if specified
-    if exact_count is not None:
-        new_decision_vars = _enforce_exact_pixel_count(new_decision_vars, exact_count)
-    
-    return new_decision_vars
-
-def apply_spatial_clustering(decision_vars, initial_conditions, clustering_strength=0.0, exact_count=None):
-    """
-    Apply spatial clustering to decision variables to promote spatially coherent restoration.
-    
-    Args:
-        decision_vars: Binary array (0/1) for restoration decisions
-        initial_conditions: Dict with initial conditions including shape and eligible indices
-        clustering_strength: Degree of clustering (0.0=no change, 1.0=maximum clustering)
-        exact_count: If provided, enforces exact total count after clustering
-        
-    Returns:
-        numpy.array: Modified decision variables with spatial clustering applied
-    """
-    if clustering_strength <= 0.0 or not np.any(decision_vars):
-        result = decision_vars.copy()
-        if exact_count is not None:
-            result = _enforce_exact_pixel_count(result, exact_count)
-        return result
-    
-    from scipy import ndimage
-    
-    shape = initial_conditions['shape']
-    eligible_indices = initial_conditions['eligible_indices']
-    target_count = np.sum(decision_vars)
-    
-    # Convert 1D to 2D
-    restoration_2d = np.zeros(shape, dtype=bool)
-    restore_indices = eligible_indices[decision_vars == 1]
-    rows, cols = np.divmod(restore_indices, shape[1])
-    restoration_2d[rows, cols] = True
-    
-    # Apply morphological closing with kernel size based on clustering strength
-    kernel_size = int(1 + clustering_strength * 3)
-    kernel = ndimage.generate_binary_structure(2, 1)  # Simple cross kernel
-    for _ in range(kernel_size):
-        kernel = ndimage.binary_dilation(kernel, structure=ndimage.generate_binary_structure(2, 1))
-    
-    # Close gaps and smooth with Gaussian
-    clustered_2d = ndimage.binary_closing(restoration_2d, structure=kernel)
-    
-    # Convert to probability map and smooth
-    prob_map = clustered_2d.astype(float)
-    sigma = clustering_strength * 1.5
-    prob_map = ndimage.gaussian_filter(prob_map, sigma=sigma)
-    
-    # Select top probabilities from eligible pixels only
-    eligible_probs = prob_map.flatten()[eligible_indices]
-    if target_count > 0 and len(eligible_indices) >= target_count:
-        top_indices = np.argpartition(eligible_probs, -target_count)[-target_count:]
-        new_decision_vars = np.zeros_like(decision_vars)
-        new_decision_vars[top_indices] = 1
-    else:
-        new_decision_vars = decision_vars.copy()
-    
-    # Enforce exact count if specified
-    if exact_count is not None:
-        new_decision_vars = _enforce_exact_pixel_count(new_decision_vars, exact_count)
-    
-    return new_decision_vars
-
-
-def _enforce_exact_pixel_count(decision_vars, target_count, seed=None):
-    """
-    Helper function to enforce exact pixel count constraint.
-    
-    Args:
-        decision_vars: Binary array (0/1) for restoration decisions
-        target_count: Exact number of pixels to restore
-        seed: Random seed for reproducibility
-        
-    Returns:
-        numpy.array: Modified decision variables with exact count
-    """
-    if seed is not None:
-        np.random.seed(seed)
-    
-    current_count = np.sum(decision_vars)
-    result = decision_vars.copy()
-    
-    if current_count == target_count:
-        return result
-    
-    if current_count < target_count:
-        # Need to add pixels
-        available_indices = np.where(result == 0)[0]
-        n_to_add = target_count - current_count
-        if len(available_indices) >= n_to_add:
-            selected = np.random.choice(available_indices, n_to_add, replace=False)
-            result[selected] = 1
-    else:
-        # Need to remove pixels
-        active_indices = np.where(result == 1)[0]
-        n_to_remove = current_count - target_count
-        if len(active_indices) >= n_to_remove:
-            selected = np.random.choice(active_indices, n_to_remove, replace=False)
-            result[selected] = 0
-    
-    return result
-
-
-
-# =============================================================================
 # CUSTOM SAMPLING AND REPAIR OPERATORS
 # =============================================================================
 
@@ -973,10 +1068,6 @@ class CombinedSampling(Sampling):
         
         return X
 
-# PATCH 2 (add near your ExactCountRepair class definition, same file)
-
-from pymoo.core.repair import Repair
-
 class ScoreCountRepair(Repair):
     """
     Enforces EXACT number of restored pixels, but chooses which pixels to add or remove
@@ -1051,101 +1142,6 @@ class ExactCountRepair(Repair):
             #n_changed = np.sum(x != X[i])
             #print("repair changed bits:", int(n_changed), "count before after:", int(current_count), int(self.max_restored_pixels))
 
-            X_repaired[i] = x
-        
-        return X_repaired
-
-
-class ClusteringRepair(Repair):
-    """
-    Repair operator that maintains spatial clustering after crossover/mutation.
-    """
-    
-    def __init__(self, initial_conditions, clustering_strength=0.5, max_restored_pixels=None):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.clustering_strength = clustering_strength
-        self.max_restored_pixels = max_restored_pixels
-    
-    def _do(self, problem, X, **kwargs):
-        X_repaired = np.zeros_like(X)
-        
-        for i in range(len(X)):
-            x = X[i]
-            if np.sum(x) > 0 and self.clustering_strength > 0:
-                x = apply_spatial_clustering(
-                    x, 
-                    self.initial_conditions, 
-                    self.clustering_strength,
-                    exact_count=self.max_restored_pixels
-                )
-                # Additional enforcement if needed
-                if self.max_restored_pixels is not None:
-                    x = _enforce_exact_pixel_count(x, self.max_restored_pixels)
-            X_repaired[i] = x
-        
-        return X_repaired
-
-
-class BurdenSharingRepair(Repair):
-    """
-    Repair operator that maintains burden sharing after crossover/mutation.
-    """
-    
-    def __init__(self, initial_conditions, max_restored_pixels=None):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.max_restored_pixels = max_restored_pixels
-    
-    def _do(self, problem, X, **kwargs):
-        X_repaired = np.zeros_like(X)
-        
-        for i in range(len(X)):
-            x = X[i]
-            if np.sum(x) > 0:
-                seed = hash(tuple(x)) % (2**31 - 1)  # Use int32 safe range
-                x = apply_burden_sharing(x, self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
-                # Additional enforcement if needed
-                if self.max_restored_pixels is not None:
-                    x = _enforce_exact_pixel_count(x, self.max_restored_pixels)
-            X_repaired[i] = x
-        
-        return X_repaired
-
-
-class CombinedRepair(Repair):
-    """
-    Repair operator that maintains both burden sharing and clustering with exact count.
-    """
-    
-    def __init__(self, initial_conditions, clustering_strength=0.5, max_restored_pixels=None):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.clustering_strength = clustering_strength
-        self.max_restored_pixels = max_restored_pixels
-    
-    def _do(self, problem, X, **kwargs):
-        X_repaired = np.zeros_like(X)
-        
-        for i in range(len(X)):
-            x = X[i]
-            if np.sum(x) > 0:
-                # Apply burden sharing
-                seed = hash(tuple(x)) % (2**31 - 1)  # Use int32 safe range
-                x = apply_burden_sharing(x, self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
-                
-                # Apply clustering
-                if self.clustering_strength > 0:
-                    x = apply_spatial_clustering(
-                        x, 
-                        self.initial_conditions, 
-                        self.clustering_strength,
-                        exact_count=self.max_restored_pixels
-                    )
-                
-                # Final enforcement if needed
-                if self.max_restored_pixels is not None:
-                    x = _enforce_exact_pixel_count(x, self.max_restored_pixels)
             X_repaired[i] = x
         
         return X_repaired
@@ -1523,16 +1519,16 @@ class RestorationProblem(ElementwiseProblem):
                 # Higher anomalies are better, so we want to maximize the sum
                 # NSGA-II minimizes, so we minimize the negative
                 threshold = 0.0  # or different per objective
-                #pixels_above = np.sum(updated_conditions[obj_name] > threshold)
-                #obj_value = -pixels_above  # Maximize count above threshold
-                vals = updated_conditions[obj_name][self.initial_conditions["eligible_mask"]]
-                pixels_above = np.sum(vals > 0.0)
+                pixels_above = np.sum(updated_conditions[obj_name] > threshold)
+                obj_value = -pixels_above  # Maximize count above threshold
+                #vals = updated_conditions[obj_name][self.initial_conditions["eligible_mask"]]
+                #pixels_above = np.sum(vals > 0.0)
 
                 # smooth tie breaker, only counts how far above 0 you are
-                margin = np.sum(np.maximum(0.0, vals))
+                #margin = np.sum(np.maximum(0.0, vals))
 
                 # small weight so the count still dominates
-                obj_value = -pixels_above - 1e-6 * margin
+                #obj_value = -pixels_above - 1e-6 * margin
 
             elif obj_name == 'implementation_cost':
                 # Cost objective: minimize total cost (lower is better)
@@ -1972,12 +1968,16 @@ def save_scenario_results(results, output_dir=".", verbose=True):
     
     timestamp = datetime.now().strftime('%d%m')
     
+    # Get ecosystem information for filename
+    ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
+    
     # Save complete results (pickle format)
     x = 1
     while True:
         results_filename = os.path.join(
             output_dir,
-            f"results_{timestamp}_{x}.pkl"
+            f"results{ecosystem_suffix}_{timestamp}_{x}.pkl"
         )
         if not os.path.exists(results_filename):
             break
@@ -1987,7 +1987,7 @@ def save_scenario_results(results, output_dir=".", verbose=True):
         pickle.dump(results, f)
     
     # Save summary (JSON format)
-    summary_filename = os.path.join(output_dir, f"summary_{timestamp}.json")
+    summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}.json")
     
     objectives = results['objectives']
     
@@ -1996,6 +1996,7 @@ def save_scenario_results(results, output_dir=".", verbose=True):
     objective_names = problem_temp.objective_names
     
     summary = {
+        'ecosystem': ecosystem,
         'scenario_params': results['scenario_params'],
         'optimization_info': {
             'n_solutions': results['n_solutions'],
@@ -2037,6 +2038,11 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     
     timestamp = datetime.now().strftime('%d%m')
     
+    # Get ecosystem information from first scenario (should be same for all)
+    first_scenario_results = next(iter(combined_results['scenarios'].values()))
+    ecosystem = first_scenario_results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
+    
     x = 1
     while True:
         results_filename = os.path.join(output_dir, f"results_{timestamp}_{x}.pkl")
@@ -2058,6 +2064,7 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
             json_param_ranges[param_name] = {'type': 'categorical', 'values': param_range}
     
     summary = {
+        'ecosystem': ecosystem,
         'combined_info': {
             'n_scenarios_run': combined_results['n_scenarios_run'],
             'n_scenarios_total': combined_results['n_scenarios_total'],
@@ -2103,7 +2110,7 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
 
 def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param=3, 
          pop_size=50, n_generations=100, save_results=True, verbose=True, random_seed=42,
-         sample_fraction=None, sample_seed=42):
+         sample_fraction=None, sample_seed=42, ecosystem='all', lulc_path=None):
     """
     Main execution function for restoration optimization.
     
@@ -2131,7 +2138,8 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
         # Run all scenarios
         return run_all_scenarios_optimization(
             initial_conditions=load_initial_conditions(workspace_dir, objectives=objectives, 
-                                                     sample_fraction=sample_fraction, sample_seed=sample_seed),
+                                                     region='Bern', ecosystem=ecosystem, sample_fraction=sample_fraction, 
+                                                     sample_seed=sample_seed, lulc_path=lulc_path),
             n_samples_per_param=n_samples_per_param,
             pop_size=pop_size,
             n_generations=n_generations,
@@ -2148,7 +2156,8 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
             print(f"Running scenario {scenario}")
         
         initial_conditions = load_initial_conditions(workspace_dir, objectives=objectives,
-                                                   sample_fraction=sample_fraction, sample_seed=sample_seed)
+                                                   region='Bern', ecosystem=ecosystem, sample_fraction=sample_fraction, 
+                                                   sample_seed=sample_seed, lulc_path=lulc_path)
         
         try:
             scenario_combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
@@ -2176,23 +2185,39 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
 # =============================================================================
 
 if __name__ == '__main__':
+    # Available ecosystem types: 'all', 'forest', 'agricultural', 'grassland'
+    # Choose which ecosystem to optimize for:
+    ECOSYSTEM_TO_RUN = "grassland" #'all'  # Change this to 'forest', 'agricultural', 'grassland', or 'all'
+    
+    # Available regions: 'Bern', 'CH'
+    # This affects the reference raster used for data validation
+    REGION = 'Bern'  # Change to 'CH' for Switzerland-wide optimization
+    
+    print(f"\\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM ===")
+    print(f"Available ecosystem types: {list(ECOSYSTEM_TYPES.keys())} or 'all'")
+    print(f"Using region: {REGION} (affects data validation reference)")
+    
     # =========================================================================
     # IMPLEMENTATION 1: CUSTOM PARAMETERS
     # =========================================================================
     # Define your own parameter values and run optimization
     
     custom_scenario_params = {
-         'max_restoration_fraction': 0.30,  # Restore 30% of eligible area
+         'max_restoration_fraction': 0.05,  # Restore 30% of eligible area
          'spatial_clustering': 0,         # High spatial clustering
          'burden_sharing': 'no',           # Equal sharing across regions
-         'abiotic_improvement': 0.01,      # Effect on abiotic anomaly
-         'biotic_improvement': 0.01,       # Effect on biotic anomaly
-         'landscape_improvement': 0.01,    # Effect on landscape anomaly
+         'abiotic_effect': 0.01,      # Effect on abiotic anomaly
+         'biotic_effect': 0.01,       # Effect on biotic anomaly
+         'landscape_effect': 0.01,    # Effect on landscape anomaly
     }
-    # 
+    
+    # Load data for selected ecosystem
     initial_conditions = load_initial_conditions(".", objectives=['abiotic', 'biotic', 'landscape', 'cost'], 
-                                                 sample_fraction=0.10, sample_seed=42)
-    # 
+                                                 region=REGION,  # Defines validation reference
+                                                 ecosystem=ECOSYSTEM_TO_RUN,  # This applies LULC masking
+                                                 sample_fraction=None, sample_seed=42)
+    
+    # Run optimization
     results = run_single_scenario_optimization(
         initial_conditions=initial_conditions,
         scenario_params=custom_scenario_params,
