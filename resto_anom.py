@@ -37,7 +37,7 @@ from pymoo.operators.mutation.bitflip import BitflipMutation
 
 # Import spatial operations from separate module
 from spatial_operations import apply_burden_sharing, apply_spatial_clustering, _enforce_exact_pixel_count
-from spatial_operations import ClusteringRepair, BurdenSharingRepair, CombinedRepair
+from spatial_operations import ClusteringRepair, BurdenSharingRepair, CombinedRepair, compute_sn_dens
 
 # =============================================================================
 # ECOSYSTEM DEFINITIONS AND LULC HANDLING
@@ -49,8 +49,8 @@ ECOSYSTEM_TYPES = {
     'agricultural': [15], 
     'grassland': [16, 17]
 }
-#focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
-#    52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
+focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
 
 def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH', 
                      target_bounds=None, target_shape=None, target_transform=None, target_crs=None):
@@ -195,16 +195,16 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
             print(f"✓ Processed LULC to match reference: {processed_data.shape}")
             print(f"  Processed unique values: {len(np.unique(processed_data[~np.isnan(processed_data)]))}")
             
-            return processed_data, lulc_meta
+            return processed_data, lulc_meta, original_path
             
         except Exception as e:
             print(f"Warning: Failed to process LULC to match reference data: {e}")
             print("Using original LULC - ecosystem masking may not work correctly")
-            return lulc_data, lulc_meta
+            return lulc_data, lulc_meta, original_path
     
     else:
         print(f"✓ Using original LULC extent (no target specified)")
-        return lulc_data, lulc_meta
+        return lulc_data, lulc_meta, original_path
 
 def create_ecosystem_mask(lulc_data, ecosystem_type):
     """
@@ -546,15 +546,18 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     
     print(f"Loading initial conditions for objectives: {objectives}")
     
-    # Build file paths for selected objectives
+    # Build file paths for selected objectives (exclude landscape - will be calculated)
     data_files = {}
     for obj in objectives:
-        if obj in all_objectives:
+        if obj in all_objectives and obj != 'landscape':  # Skip landscape - will be calculated
             filename = all_objectives[obj]
             if obj == 'cost':
                 data_files['implementation_cost'] = os.path.join(workspace_dir, filename)
             else:
                 data_files[f'{obj}_anomaly'] = os.path.join(workspace_dir, filename)
+        elif obj == 'landscape':
+            # Landscape will be calculated using compute_sn_dens, not loaded from file
+            print(f"Note: landscape_anomaly will be calculated from LULC data")
         else:
             raise ValueError(f"Unknown objective: {obj}. Available: {list(all_objectives.keys())}")
     
@@ -657,11 +660,11 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     print(f"\\n--- Loading LULC data for ecosystem: {ecosystem} ---")
     try:
         # Load LULC and crop/resample to match the reference data
-        lulc_data, lulc_meta = load_lulc_raster(workspace_dir, lulc_path, region, 
-                                               target_bounds=ref['bounds'], 
-                                               target_shape=ref['shape'],
-                                               target_transform=ref['transform'],
-                                               target_crs=ref['crs'])
+        lulc_data, lulc_meta, lulc_original_path = load_lulc_raster(workspace_dir, lulc_path, region, 
+                                                                   target_bounds=ref['bounds'], 
+                                                                   target_shape=ref['shape'],
+                                                                   target_transform=ref['transform'],
+                                                                   target_crs=ref['crs'])
         
         # Validate LULC raster compatibility with reference
         if lulc_data.shape != ref['shape']:
@@ -677,6 +680,31 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         initial_conditions['lulc_meta'] = lulc_meta
         initial_conditions['ecosystem'] = ecosystem
         initial_conditions['ecosystem_mask'] = ecosystem_mask
+        
+        # Calculate landscape anomaly if requested in objectives
+        if 'landscape' in objectives:
+            print(f"Calculating landscape anomaly from LULC data...")
+
+            # Use the original LULC file path directly
+            landscape_density, _ = compute_sn_dens(lulc_original_path, focal_classes, radius_m=300)
+            
+            # Convert density to anomaly (higher density = lower anomaly)
+            # Normalize to roughly match other anomaly ranges
+            landscape_anomaly = 1.0 - landscape_density  # Invert so high density = low anomaly
+            
+            # Handle NaN values
+            nan_mask_landscape = np.isnan(landscape_anomaly)
+            landscape_anomaly = np.nan_to_num(landscape_anomaly, nan=0.0)
+            
+            # Store in initial conditions
+            initial_conditions['landscape_anomaly'] = landscape_anomaly
+            nan_masks['landscape_anomaly'] = nan_mask_landscape
+            
+            nan_count = np.sum(nan_mask_landscape)
+            total_pixels = landscape_anomaly.size
+            print(f"✓ Calculated landscape_anomaly: {landscape_anomaly.shape} ({nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}% NaN)")
+            if nan_count > 0:
+                print(f"  → Replaced NaN with 0 (pixels excluded via eligible_mask)")
         
     except Exception as e:
         print(f"✗ Error loading LULC data: {e}")
