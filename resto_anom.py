@@ -789,13 +789,14 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
 # RESTORATION EFFECT FUNCTION
 # =============================================================================
 
-def restoration_effect(decision_vars, initial_conditions, effect_params=None):
+def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_params=None):
     """
-    Define what happens when restoration is selected (decision_var = 1).
-    This function calculates the effect of restoration on neighboring cells.
+    Define what happens when restoration or conversion is selected.
+    This function calculates the effect of different actions on neighboring cells.
     
     Args:
-        decision_vars: Binary array (0/1) for restoration decisions
+        restore_vars: Binary array (0/1) for restoration decisions
+        convert_vars: Binary array (0/1) for conversion decisions  
         initial_conditions: Dict with initial objective values
         effect_params: Parameters controlling restoration effects (dict)
         
@@ -834,13 +835,21 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
     eligible_mask = initial_conditions['eligible_mask']
     eligible_indices = initial_conditions['eligible_indices']
     
-    # Create 2D restoration mask from 1D decision variables
+    # Create 2D masks from 1D decision variables
     restoration_mask_2d = np.zeros(shape, dtype=bool)
-    if np.any(decision_vars):
+    conversion_mask_2d = np.zeros(shape, dtype=bool)
+    
+    if np.any(restore_vars):
         # Convert eligible indices with restoration back to 2D coordinates
-        restoration_eligible_indices = eligible_indices[decision_vars == 1]
+        restoration_eligible_indices = eligible_indices[restore_vars == 1]
         rows, cols = np.divmod(restoration_eligible_indices, shape[1])
         restoration_mask_2d[rows, cols] = True
+    
+    if np.any(convert_vars):
+        # Convert eligible indices with conversion back to 2D coordinates
+        conversion_eligible_indices = eligible_indices[convert_vars == 1]
+        rows, cols = np.divmod(conversion_eligible_indices, shape[1])
+        conversion_mask_2d[rows, cols] = True
     
     # Initialize updated conditions
     updated_conditions = {}
@@ -853,16 +862,30 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
         original_values = initial_conditions[objective].copy()
         updated_values = original_values.copy()
         
-        if np.any(restoration_mask_2d):
-            # Direct effect on restored cells
-            improvement = effect_params[f'{objective.split("_")[0]}_improvement']
+        # Determine which action type affects this objective
+        if objective in ['abiotic_anomaly', 'biotic_anomaly']:
+            # Restoration affects abiotic and biotic anomalies
+            action_mask = restoration_mask_2d
+            improvement_key = f'{objective.split("_")[0]}_improvement'
+        elif objective == 'landscape_anomaly':
+            # Conversion affects landscape anomaly
+            action_mask = conversion_mask_2d
+            improvement_key = f'{objective.split("_")[0]}_improvement'
+        else:
+            # Skip unknown objectives
+            updated_conditions[objective] = updated_values
+            continue
+        
+        if np.any(action_mask):
+            # Direct effect on action cells
+            improvement = effect_params[improvement_key]
             
             # Calculate anomaly-dependent improvement weights
             weight_shape = effect_params.get('anomaly_weight_shape', 'exponential')
             weight_scale = effect_params.get('anomaly_weight_scale', 1.0)
             
-            # Get weights for restored pixels based on their baseline anomaly
-            baseline_anomalies = original_values[restoration_mask_2d]
+            # Get weights for action pixels based on their baseline anomaly
+            baseline_anomalies = original_values[action_mask]
             improvement_weights = anomaly_improvement_weight(
                 baseline_anomalies, shape=weight_shape, scale=weight_scale
             )
@@ -871,8 +894,8 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
             weighted_improvements = improvement * improvement_weights
             
             # Apply improvement:
-            updated_values[restoration_mask_2d] = (
-                original_values[restoration_mask_2d] + weighted_improvements
+            updated_values[action_mask] = (
+                original_values[action_mask] + weighted_improvements
             )
 
             # Neighbor effects
@@ -883,8 +906,8 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
                 kernel = (x*x + y*y) <= radius*radius
                 
                 # Apply dilation to find neighbor cells
-                neighbor_mask = ndimage.binary_dilation(restoration_mask_2d, structure=kernel)
-                neighbor_mask = neighbor_mask & ~restoration_mask_2d  # Exclude direct restoration cells
+                neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
+                neighbor_mask = neighbor_mask & ~action_mask  # Exclude direct action cells
                 
                 # Apply reduced improvement to neighbors with anomaly weighting
                 neighbor_improvement = improvement * effect_params['neighbor_effect_decay']
@@ -918,16 +941,25 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
         base_cost = initial_conditions['implementation_cost'].copy()
         total_cost = 0
         if np.any(restoration_mask_2d):
-            total_cost = np.sum(base_cost[restoration_mask_2d])
+            total_cost += np.sum(base_cost[restoration_mask_2d])
+        if np.any(conversion_mask_2d):
+            # Could have different cost structure for conversion in future
+            total_cost += np.sum(base_cost[conversion_mask_2d])
         updated_conditions['implementation_cost'] = total_cost
     
     # Population proximity (only if proximity objective is being used)
     # Proximity is a fixed spatial property - no restoration improvement effect
     if 'population_proximity' in initial_conditions:
         proximity_map = initial_conditions['population_proximity'].copy()
-        avg_distance = 0.0
+        total_distance = 0.0
+        total_pixels = 0
         if np.any(restoration_mask_2d):
-            avg_distance = np.mean(proximity_map[restoration_mask_2d])
+            total_distance += np.sum(proximity_map[restoration_mask_2d])
+            total_pixels += np.sum(restoration_mask_2d)
+        if np.any(conversion_mask_2d):
+            total_distance += np.sum(proximity_map[conversion_mask_2d])
+            total_pixels += np.sum(conversion_mask_2d)
+        avg_distance = total_distance / total_pixels if total_pixels > 0 else 0.0
         updated_conditions['population_proximity'] = avg_distance
     
     return updated_conditions
@@ -935,6 +967,36 @@ def restoration_effect(decision_vars, initial_conditions, effect_params=None):
 # =============================================================================
 # CUSTOM SAMPLING AND REPAIR OPERATORS
 # =============================================================================
+
+class CustomBinaryRandomSampling(Sampling):
+    """
+    Custom binary random sampling that properly handles our expanded decision vector.
+    Only generates restoration decisions, leaves conversion decisions as zeros.
+    """
+    
+    def __init__(self, initial_conditions, max_restored_pixels):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = max_restored_pixels
+    
+    def _do(self, problem, n_samples, **kwargs):
+        n_decision_vars = problem.n_var  # 2*n_pixels (restore + convert)
+        n_pixels = problem.n_pixels      # actual number of eligible pixels
+        X = np.zeros((n_samples, n_decision_vars), dtype=int)
+        
+        for i in range(n_samples):
+            x = np.zeros(n_decision_vars, dtype=int)
+            
+            # Only work with restoration decisions (first n_pixels elements)
+            n_restore = self.max_restored_pixels
+            if n_restore > 0:
+                # Use permutation to avoid int32 overflow with large pixel indices
+                restore_indices = np.random.permutation(n_pixels)[:n_restore]
+                x[restore_indices] = 1
+            
+            X[i] = x
+        
+        return X
 
 class ClusteredSampling(Sampling):
     """
@@ -948,14 +1010,15 @@ class ClusteredSampling(Sampling):
         self.clustering_strength = clustering_strength
     
     def _do(self, problem, n_samples, **kwargs):
-        n_pixels = problem.n_var
-        X = np.zeros((n_samples, n_pixels), dtype=int)
+        n_decision_vars = problem.n_var  # 2*n_pixels (restore + convert)
+        n_pixels = problem.n_pixels      # actual number of eligible pixels
+        X = np.zeros((n_samples, n_decision_vars), dtype=int)
         
         for i in range(n_samples):
             # Generate a random solution with target number of pixels
-            x = np.zeros(n_pixels, dtype=int)
+            x = np.zeros(n_decision_vars, dtype=int)
             
-            # Randomly select target number of pixels
+            # Only work with restoration decisions (first n_pixels elements)
             n_restore = self.max_restored_pixels
             if n_restore > 0:
                 # Use permutation to avoid int32 overflow with large pixel indices
@@ -964,12 +1027,14 @@ class ClusteredSampling(Sampling):
                 
                 # Apply spatial clustering to generate clustered pattern
                 if self.clustering_strength > 0:
-                    x = apply_spatial_clustering(
-                        x, 
+                    # Apply clustering only to restoration decisions
+                    x_restore = apply_spatial_clustering(
+                        x[:n_pixels], 
                         self.initial_conditions, 
                         self.clustering_strength,
                         exact_count=self.max_restored_pixels
                     )
+                    x[:n_pixels] = x_restore
             
             X[i] = x
         
@@ -988,13 +1053,14 @@ class BurdenSharingSampling(Sampling):
     
     def _do(self, problem, n_samples, **kwargs):
         print(f"DEBUG: BurdenSharingSampling._do called with n_samples={n_samples}, n_var={problem.n_var}, max_restored_pixels={self.max_restored_pixels}")
-        n_pixels = problem.n_var
-        X = np.zeros((n_samples, n_pixels), dtype=int)
+        n_decision_vars = problem.n_var  # 2*n_pixels (restore + convert)
+        n_pixels = problem.n_pixels      # actual number of eligible pixels
+        X = np.zeros((n_samples, n_decision_vars), dtype=int)
         
         for i in range(n_samples):
             print(f"DEBUG: BurdenSharingSampling sample {i}/{n_samples}")
             # Generate a random solution with target number of pixels
-            x = np.zeros(n_pixels, dtype=int)
+            x = np.zeros(n_decision_vars, dtype=int)
             
             try:
                 print(f"DEBUG: Generating random restore count (max={self.max_restored_pixels})")
@@ -1006,12 +1072,14 @@ class BurdenSharingSampling(Sampling):
                     # Use permutation to avoid int32 overflow with large pixel indices
                     restore_indices = np.random.permutation(n_pixels)[:n_restore]
                     print(f"DEBUG: Generated restore_indices, setting pixels")
-                    x[restore_indices] = 1
+                    # Only set restoration decisions (first n_pixels elements)
+                    x[:n_pixels][restore_indices] = 1
                     print(f"DEBUG: Set pixels, calling apply_burden_sharing")
                     
-                    # Apply burden sharing to distribute equally across regions
+                    # Apply burden sharing to distribute equally across regions (only to restoration part)
                     seed = np.random.randint(0, 2**31 - 1)  # Use int32 safe range
-                    x = apply_burden_sharing(x, self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
+                    x_restore = apply_burden_sharing(x[:n_pixels], self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
+                    x[:n_pixels] = x_restore  # Update restoration part of decision vector
                     print(f"DEBUG: apply_burden_sharing completed")
                 
             except Exception as e:
@@ -1019,7 +1087,7 @@ class BurdenSharingSampling(Sampling):
                 import traceback
                 traceback.print_exc()
                 # Return zeros for this sample if there's an error
-                x = np.zeros(n_pixels, dtype=int)
+                x = np.zeros(n_decision_vars, dtype=int)
             
             X[i] = x
         
@@ -1039,30 +1107,36 @@ class CombinedSampling(Sampling):
         self.clustering_strength = clustering_strength
     
     def _do(self, problem, n_samples, **kwargs):
-        n_pixels = problem.n_var
-        X = np.zeros((n_samples, n_pixels), dtype=int)
+        n_decision_vars = problem.n_var  # 2*n_pixels (restore + convert)
+        n_pixels = problem.n_pixels      # actual number of eligible pixels
+        X = np.zeros((n_samples, n_decision_vars), dtype=int)
         
         for i in range(n_samples):
-            x = np.zeros(n_pixels, dtype=int)
+            x = np.zeros(n_decision_vars, dtype=int)
+            
+            # Only work with restoration decisions (first n_pixels elements)
+            x_restore = x[:n_pixels]
             
             n_restore = self.max_restored_pixels  # Use exact count for initial sampling
             if n_restore > 0:
                 # Use permutation to avoid int32 overflow with large pixel indices
                 restore_indices = np.random.permutation(n_pixels)[:n_restore]
-                x[restore_indices] = 1
+                x_restore[restore_indices] = 1
                 
-                # Apply burden sharing first
+                # Apply burden sharing first (only to restoration decisions)
                 seed = np.random.randint(0, 2**31 - 1)  # Use int32 safe range
-                x = apply_burden_sharing(x, self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
+                x_restore = apply_burden_sharing(x_restore, self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
+                x[:n_pixels] = x_restore  # Update the full decision vector
                 
                 # Then apply spatial clustering
                 if self.clustering_strength > 0:
-                    x = apply_spatial_clustering(
-                        x, 
+                    x_restore_clustered = apply_spatial_clustering(
+                        x[:n_pixels], 
                         self.initial_conditions, 
                         self.clustering_strength,
                         exact_count=self.max_restored_pixels
                     )
+                    x[:n_pixels] = x_restore_clustered
             
             X[i] = x
         
@@ -1083,25 +1157,38 @@ class ScoreCountRepair(Repair):
 
         for i in range(len(X)):
             x = X[i].copy()
-            cur = int(np.sum(x))
+            # Work with both restoration and conversion decisions
+            n_pixels = problem.n_pixels
+            x_restore = x[:n_pixels]
+            x_convert = x[n_pixels:]
+            
+            # Count total actions (restore + convert)
+            cur_restore = int(np.sum(x_restore))
+            cur_convert = int(np.sum(x_convert))
+            cur_total = cur_restore + cur_convert
             k = self.max_restored_pixels
 
-            if cur < k:
-                need = k - cur
-                zeros = np.where(x == 0)[0]
-                if zeros.size > 0 and need > 0:
-                    # add best available zeros
-                    add = zeros[np.argsort(-self.scores[zeros])][:need]
-                    x[add] = 1
+            if cur_total < k:
+                need = k - cur_total
+                # Prioritize restoration actions for now (since convert is forced to 0)
+                zeros_restore = np.where(x_restore == 0)[0]
+                if zeros_restore.size > 0 and need > 0:
+                    # add best available restoration zeros
+                    add = zeros_restore[np.argsort(-self.scores[zeros_restore])][:need]
+                    x_restore[add] = 1
 
-            elif cur > k:
-                drop = cur - k
-                ones = np.where(x == 1)[0]
-                if ones.size > 0 and drop > 0:
-                    # remove worst available ones
-                    rem = ones[np.argsort(self.scores[ones])][:drop]
-                    x[rem] = 0
+            elif cur_total > k:
+                drop = cur_total - k
+                # Remove from restoration actions first (since convert should be 0)
+                ones_restore = np.where(x_restore == 1)[0]
+                if ones_restore.size > 0 and drop > 0:
+                    # remove worst available restoration ones
+                    rem = ones_restore[np.argsort(self.scores[ones_restore])][:drop]
+                    x_restore[rem] = 0
 
+            # Update both restoration and conversion parts of the decision vector
+            x[:n_pixels] = x_restore
+            x[n_pixels:] = x_convert
             Xr[i] = x
 
         return Xr
@@ -1121,26 +1208,48 @@ class ExactCountRepair(Repair):
         
         for i in range(len(X)):
             x = X[i].copy()
-            current_count = np.sum(x)
+            # Work with both restoration and conversion decisions  
+            n_pixels = problem.n_pixels
+            x_restore = x[:n_pixels]
+            x_convert = x[n_pixels:]
             
-            if current_count != self.max_restored_pixels:
-                if current_count < self.max_restored_pixels:
-                    # Need to add pixels
-                    available_indices = np.where(x == 0)[0]
-                    n_to_add = self.max_restored_pixels - current_count
-                    if len(available_indices) >= n_to_add:
-                        selected = self.rng.choice(available_indices, n_to_add, replace=False)
-                        x[selected] = 1
+            # Count total actions (restore + convert)
+            current_restore = np.sum(x_restore)
+            current_convert = np.sum(x_convert)
+            current_total = current_restore + current_convert
+            
+            if current_total != self.max_restored_pixels:
+                if current_total < self.max_restored_pixels:
+                    # Need to add actions - prioritize restoration for now
+                    available_restore = np.where(x_restore == 0)[0]
+                    n_to_add = self.max_restored_pixels - current_total
+                    if len(available_restore) >= n_to_add:
+                        selected = self.rng.choice(available_restore, n_to_add, replace=False)
+                        x_restore[selected] = 1
+                    else:
+                        # Add all available restoration pixels
+                        if len(available_restore) > 0:
+                            x_restore[available_restore] = 1
+                        # Could add conversion pixels here in future
                 else:
-                    # Need to remove pixels
-                    active_indices = np.where(x == 1)[0]
-                    n_to_remove = current_count - self.max_restored_pixels
-                    if len(active_indices) >= n_to_remove:
-                        selected = self.rng.choice(active_indices, n_to_remove, replace=False)
-                        x[selected] = 0
+                    # Need to remove actions - prioritize removing restoration for now  
+                    active_restore = np.where(x_restore == 1)[0]
+                    n_to_remove = current_total - self.max_restored_pixels
+                    if len(active_restore) >= n_to_remove:
+                        selected = self.rng.choice(active_restore, n_to_remove, replace=False)
+                        x_restore[selected] = 0
+                    else:
+                        # Remove all restoration pixels
+                        if len(active_restore) > 0:
+                            x_restore[active_restore] = 0
+                        # Could remove conversion pixels here in future
+            
+            # Update both restoration and conversion parts of the decision vector
+            x[:n_pixels] = x_restore
+            x[n_pixels:] = x_convert
             
             #n_changed = np.sum(x != X[i])
-            #print("repair changed bits:", int(n_changed), "count before after:", int(current_count), int(self.max_restored_pixels))
+            #print("repair changed bits:", int(n_changed), "count before after:", int(current_total), int(self.max_restored_pixels))
 
             X_repaired[i] = x
         
@@ -1240,7 +1349,7 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     problem = RestorationProblem(initial_conditions, scenario_params)
     
     #print(f"\nPROBLEM SETUP:")
-    #print(f"   - Decision variables: {problem.n_var} (eligible pixels)")
+    #print(f"   - Decision variables: {problem.n_var} total ({problem.n_pixels} restore + {problem.n_pixels} convert)")
     #print(f"   - Objectives: {problem.n_obj} ({problem.objective_names})")
     #print(f"   - Constraints: {problem.n_constr}")
     #print(f"   - Max restored pixels: {problem.max_restored_pixels}")
@@ -1276,8 +1385,9 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         # Generate random solution at max allowed restoration
         x = np.zeros(problem.n_var, dtype=int)
         n_restore = problem.max_restored_pixels
-        if n_restore > 0 and n_restore <= problem.n_var:
-            restore_indices = np.random.permutation(problem.n_var)[:n_restore]
+        if n_restore > 0 and n_restore <= problem.n_pixels:
+            # Only select from restoration decisions (first half of decision vector)
+            restore_indices = np.random.permutation(problem.n_pixels)[:n_restore]
             x[restore_indices] = 1
         
         # Evaluate
@@ -1323,8 +1433,8 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     if problem.max_restored_pixels == 0:
         issues.append("   ✗ Max restored pixels is 0 - no restoration possible!")
     
-    if problem.max_restored_pixels > problem.n_var:
-        issues.append(f"   ✗ Max restored pixels ({problem.max_restored_pixels}) > available pixels ({problem.n_var})")
+    if problem.max_restored_pixels > problem.n_pixels:
+        issues.append(f"   ✗ Max restored pixels ({problem.max_restored_pixels}) > available pixels ({problem.n_pixels})")
     
     # Check if objectives are all zero or constant
     if out_none['F'][0] == 0:
@@ -1344,10 +1454,11 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     test_fractions = [0.05, 0.10, 0.15, 0.20]
     
     for frac in test_fractions:
-        n_restore = int(frac * problem.n_var)
-        if n_restore > 0 and n_restore <= problem.n_var:
+        n_restore = int(frac * problem.n_pixels)  # Use n_pixels, not n_var
+        if n_restore > 0 and n_restore <= problem.n_pixels:
             x = np.zeros(problem.n_var, dtype=int)
-            restore_indices = np.random.permutation(problem.n_var)[:n_restore]
+            # Only select from restoration decisions (first half)
+            restore_indices = np.random.permutation(problem.n_pixels)[:n_restore]
             x[restore_indices] = 1
             
             out = {}
@@ -1381,11 +1492,14 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     # Test with max restoration
     x_test = np.zeros(problem.n_var, dtype=int)
     if problem.max_restored_pixels > 0:
-        restore_indices = np.random.permutation(problem.n_var)[:problem.max_restored_pixels]
+        # Only select from restoration decisions (first half of decision vector)
+        restore_indices = np.random.permutation(problem.n_pixels)[:problem.max_restored_pixels]
         x_test[restore_indices] = 1
     
-    # Get updated conditions after restoration
-    updated = restoration_effect(x_test, initial_conditions)
+    # Get updated conditions after restoration (pass both restoration and conversion decisions)
+    x_test_restore = x_test[:problem.n_pixels]
+    x_test_convert = x_test[problem.n_pixels:]
+    updated = restoration_effect(x_test_restore, x_test_convert, initial_conditions)
     
     eligible_mask = initial_conditions['eligible_mask']
     
@@ -1395,7 +1509,8 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         
         # For restored pixels only
         restored_2d = np.zeros(initial_conditions['shape'], dtype=bool)
-        rows, cols = np.divmod(initial_conditions['eligible_indices'][x_test == 1], initial_conditions['shape'][1])
+        # Use only restoration decisions from the test vector
+        rows, cols = np.divmod(initial_conditions['eligible_indices'][x_test_restore == 1], initial_conditions['shape'][1])
         restored_2d[rows, cols] = True
         restored_mask = restored_2d[eligible_mask]
         
@@ -1484,14 +1599,17 @@ class RestorationProblem(ElementwiseProblem):
         n_pixels = initial_conditions['n_pixels']
         max_restoration_fraction = scenario_params['max_restoration_fraction']
         self.max_restored_pixels = int(max_restoration_fraction * n_pixels)
+        self.n_pixels = n_pixels  # Store for splitting decision vector
         
-        # Binary decision variables: 0 = no restoration, 1 = restoration
+        # Binary decision variables: 0 = no action, 1 = action
+        # First n_pixels elements = restoration decisions
+        # Second n_pixels elements = conversion decisions (forced to 0 for now)
         super().__init__(
-            n_var=n_pixels,           # One decision per eligible pixel
-            n_obj=n_objectives,       # Variable number of objectives
+            n_var=2*n_pixels,        # Two decisions per eligible pixel: restore and convert
+            n_obj=n_objectives,      # Variable number of objectives
             n_constr=1,              # Constraint on total restoration area
-            xl=0,                    # Lower bound: no restoration
-            xu=1,                    # Upper bound: restoration
+            xl=0,                    # Lower bound: no action
+            xu=1,                    # Upper bound: action
             type_var=int             # Integer (binary) variables
         )
     
@@ -1501,14 +1619,24 @@ class RestorationProblem(ElementwiseProblem):
         
         Args:
             x: Decision variables (binary array) - already clustered/burden-shared by sampling/repair
+                First n_pixels elements: restoration decisions
+                Second n_pixels elements: conversion decisions
             out: Output dictionary for objectives and constraints
         """
-        # Solution x is already properly structured from custom sampling/repair operators
-        # No post-processing needed - just evaluate as-is
-        n_restored = np.sum(x)
+        # Split decision vector into restore and convert actions
+        x_restore = x[:self.n_pixels]
+        x_convert = x[self.n_pixels:] 
         
-        # Apply restoration effects directly to decision variables
-        updated_conditions = restoration_effect(x, self.initial_conditions, self.effect_params)
+        # Force convert actions to zero for now (future development)
+        x_convert[:] = 0
+        
+        # Use only restoration decisions for current logic
+        n_restored = np.sum(x_restore)
+        n_converted = np.sum(x_convert)
+        n_total_actions = n_restored + n_converted
+        
+        # Apply restoration effects to both restoration and conversion decisions
+        updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
         
         # Calculate objective values (all to minimize) - only for available objectives
         objectives = []
@@ -1543,8 +1671,8 @@ class RestorationProblem(ElementwiseProblem):
         
         out["F"] = objectives
         
-        # Constraint: number of pixels restored (should be satisfied by repair operators)
-        out["G"] = [abs(n_restored - self.max_restored_pixels)]  # Should be 0 due to exact count enforcement
+        # Constraint: total number of pixels with actions (restore + convert)
+        out["G"] = [abs(n_total_actions - self.max_restored_pixels)]  # Should be 0 due to exact count enforcement
 
 # =============================================================================
 # OPTIMIZATION EXECUTION
@@ -1636,12 +1764,12 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         if verbose:
             print(f"  Using clustered sampling/repair (strength={clustering_strength})")
     else:
-        sampling = BinaryRandomSampling()
+        sampling = CustomBinaryRandomSampling(initial_conditions, problem.max_restored_pixels)
         #repair = ExactCountRepair(problem.max_restored_pixels)
         scores = build_repair_scores(initial_conditions, scenario_params)
         repair = ScoreCountRepair(problem.max_restored_pixels, scores)
         if verbose:
-            print(f"  Using standard binary random sampling")
+            print(f"  Using custom binary random sampling with score-based repair")
     
     # Create optimization algorithm
     algorithm = NSGA2(
