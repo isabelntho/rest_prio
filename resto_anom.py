@@ -24,8 +24,9 @@ from scipy import ndimage
 import pickle
 import json
 from datetime import datetime
+from multiprocessing import Pool
 
-from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.problem import ElementwiseProblem, StarmapParallelization
 from pymoo.core.sampling import Sampling
 from pymoo.core.repair import Repair
 from pymoo.optimize import minimize
@@ -34,6 +35,8 @@ from pymoo.termination import get_termination
 from pymoo.operators.sampling.rnd import BinaryRandomSampling
 from pymoo.operators.crossover.hux import HUX
 from pymoo.operators.mutation.bitflip import BitflipMutation
+from pymoo.indicators.hv import HV
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 # Import spatial operations from separate module
 from spatial_operations import apply_burden_sharing, apply_spatial_clustering, _enforce_exact_pixel_count
@@ -43,7 +46,7 @@ from spatial_operations import ClusteringRepair, BurdenSharingRepair, CombinedRe
 from data_loader import load_initial_conditions, ECOSYSTEM_TYPES, FOCAL_CLASSES, load_admin_regions, load_lulc_raster,create_ecosystem_mask, get_region_reference
 
 # =============================================================================
-# WEIGHTING FUNCTIONS
+# WEIGHTING FUNCTION
 # =============================================================================
 
 def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
@@ -76,8 +79,6 @@ def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
     weights = np.clip(weights, 0.0, 1.0)
     
     return weights
-
-# PATCH 1 (add near your other helpers, e.g. close to anomaly_improvement_weight)
 
 def build_repair_scores(initial_conditions, scenario_params):
     """
@@ -1035,7 +1036,7 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     print("="*70)
     
     # Create problem instance
-    problem = RestorationProblem(initial_conditions, scenario_params)
+    problem = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for diagnostics
     
     #print(f"\nPROBLEM SETUP:")
     #print(f"   - Decision variables: {problem.n_var} total ({problem.n_pixels} restore + {problem.n_pixels} convert)")
@@ -1252,13 +1253,14 @@ class RestorationProblem(ElementwiseProblem):
     - Population proximity (average distance to population centers)
     """
     
-    def __init__(self, initial_conditions, scenario_params):
+    def __init__(self, initial_conditions, scenario_params, n_jobs=None):
         """
         Initialize the optimization problem.
         
         Args:
             initial_conditions: Dict with initial objective states
             scenario_params: Dict with scenario parameters (e.g., max_restoration_fraction, effect_params)
+            n_jobs: Number of parallel jobs to use (None for automatic, 1 for serial, -1 for all cores)
         """
         self.initial_conditions = initial_conditions
         self.scenario_params = scenario_params
@@ -1312,14 +1314,50 @@ class RestorationProblem(ElementwiseProblem):
         # Next n_conversion_pixels elements = conversion decisions
         total_decision_vars = n_restoration_pixels + n_conversion_pixels
         
-        super().__init__(
-            n_var=total_decision_vars,  # Restoration decisions + conversion decisions
-            n_obj=n_objectives,         # Variable number of objectives
-            n_constr=1,                 # Constraint on total restoration area
-            xl=0,                       # Lower bound: no action
-            xu=1,                       # Upper bound: action
-            type_var=int                # Integer (binary) variables
-        )
+        # Setup parallelization
+        elementwise_runner = None
+        if n_jobs is None or n_jobs != 1:
+            try:
+                # Create process pool for parallel evaluation
+                if n_jobs == -1:
+                    # Use all available cores
+                    pool = Pool()
+                elif n_jobs is None:
+                    # Use automatic number of cores (typically CPU count)
+                    pool = Pool()
+                else:
+                    # Use specified number of cores
+                    pool = Pool(processes=n_jobs)
+                
+                elementwise_runner = StarmapParallelization(pool.starmap)
+                print(f"Parallelization enabled with {pool._processes if hasattr(pool, '_processes') else 'auto'} processes")
+            except Exception as e:
+                print(f"Warning: Could not setup parallelization: {e}")
+                print("Falling back to sequential evaluation")
+                elementwise_runner = None
+        
+        # Initialize the problem
+        if elementwise_runner is not None:
+            super().__init__(
+                n_var=total_decision_vars,  # Restoration decisions + conversion decisions
+                n_obj=n_objectives,         # Variable number of objectives
+                n_constr=1,                 # Constraint on total restoration area
+                xl=0,                       # Lower bound: no action
+                xu=1,                       # Upper bound: action
+                type_var=int,                # Integer (binary) variables
+                elementwise=True,
+                elementwise_runner=elementwise_runner
+            )
+        else:
+            super().__init__(
+                n_var=total_decision_vars,  # Restoration decisions + conversion decisions
+                n_obj=n_objectives,         # Variable number of objectives
+                n_constr=1,                 # Constraint on total restoration area
+                xl=0,                       # Lower bound: no action
+                xu=1,                       # Upper bound: action
+                type_var=int,                # Integer (binary) variables
+                elementwise=True
+            )
     
     def _evaluate(self, x, out, *args, **kwargs):
         """
@@ -1388,8 +1426,80 @@ class RestorationProblem(ElementwiseProblem):
 # OPTIMIZATION EXECUTION
 # =============================================================================
 
+class HVCallback:
+    """
+    Hypervolume-based early stopping callback.
+    Monitors hypervolume improvement and stops optimization if no significant improvement 
+    is observed for a specified number of generations.
+    """
+    
+    def __init__(self, patience=15, min_improvement=1e-6, verbose=True):
+        """
+        Initialize hypervolume callback.
+        
+        Args:
+            patience: Number of generations to wait for improvement before stopping
+            min_improvement: Minimum relative hypervolume improvement threshold
+            verbose: Print convergence information
+        """
+        self.patience = patience
+        self.min_improvement = min_improvement
+        self.verbose = verbose
+        self.hv_history = []
+        self.best_hv = 0.0
+        self.no_improvement_count = 0
+        self.converged = False
+    
+    def __call__(self, algorithm):
+        """
+        Called at each generation to check for convergence.
+        
+        Args:
+            algorithm: The optimization algorithm object
+        """
+        # Get current population objectives
+        if hasattr(algorithm, 'pop') and algorithm.pop is not None:
+            F = algorithm.pop.get("F")
+            if F is not None and len(F) > 0:
+                # Calculate hypervolume
+                try:
+                    # Create reference point (worst case for each objective)
+                    ref_point = np.max(F, axis=0) + 1.0
+                    
+                    # Calculate hypervolume using pymoo's HV indicator
+                    hv_indicator = HV(ref_point=ref_point)
+                    current_hv = hv_indicator(F)
+                    
+                    self.hv_history.append(current_hv)
+                    
+                    # Check for improvement
+                    if current_hv > self.best_hv:
+                        relative_improvement = (current_hv - self.best_hv) / (self.best_hv + 1e-10)
+                        if relative_improvement >= self.min_improvement:
+                            self.best_hv = current_hv
+                            self.no_improvement_count = 0
+                            if self.verbose and algorithm.n_gen % 10 == 0:
+                                print(f"   HV improved: {current_hv:.6f} (+{relative_improvement*100:.4f}%)")
+                        else:
+                            self.no_improvement_count += 1
+                    else:
+                        self.no_improvement_count += 1
+                    
+                    # Check for convergence
+                    if self.no_improvement_count >= self.patience:
+                        self.converged = True
+                        if self.verbose:
+                            print(f"   Early stopping: No HV improvement for {self.patience} generations")
+                    
+                except Exception as e:
+                    # If hypervolume calculation fails, just continue
+                    if self.verbose and algorithm.n_gen == 1:
+                        print(f"   Warning: Hypervolume calculation failed: {e}")
+                    self.hv_history.append(0.0)
+
 def run_single_scenario_optimization(initial_conditions, scenario_params, pop_size=50, 
-                                   n_generations=100, save_results=True, verbose=True, skip_diagnostics=False):
+                                   n_generations=100, save_results=True, verbose=True, skip_diagnostics=False,
+                                   hv_patience=15, hv_min_improvement=1e-6, n_jobs=None):
     """
     Run the multi-objective restoration optimization for a single scenario.
     
@@ -1401,26 +1511,30 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         save_results: Whether to save results to files
         verbose: Print progress information
         skip_diagnostics: Skip diagnostic output (useful for multi-scenario runs)
+        hv_patience: Generations to wait for hypervolume improvement before stopping
+        hv_min_improvement: Minimum relative hypervolume improvement threshold
+        n_jobs: Number of parallel jobs to use (None for automatic, 1 for serial, -1 for all cores)
         
     Returns:
         dict: Optimization results
     """
     if verbose:
-        print(f"\n=== SINGLE SCENARIO OPTIMIZATION ===")
+        print(f"\n=== SINGLE SCENARIO OPTIMIZATION ===") 
         print(f"Scenario parameters: {scenario_params}")
         print(f"Population size: {pop_size}")
-        print(f"Generations: {n_generations}")
+        print(f"Generations: {n_generations} (with HV early stopping: patience={hv_patience})")
         #print(f"Max restoration: {scenario_params['max_restoration_fraction']*100:.1f}% of eligible area")
         print(f"Eligible pixels: {initial_conditions['n_pixels']}")
         
         # Show which objectives are being used
-        problem_temp = RestorationProblem(initial_conditions, scenario_params)
+        problem_temp = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for setup
         print(f"Objectives: {problem_temp.objective_names} ({len(problem_temp.objective_names)} total)")
     
     # Create optimization problem
     problem = RestorationProblem(
         initial_conditions=initial_conditions,
-        scenario_params=scenario_params
+        scenario_params=scenario_params,
+        n_jobs=n_jobs
     )
     
     # Print additional diagnostic information
@@ -1490,7 +1604,7 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         repair=repair                     # Custom repair to maintain properties
     )
     
-    # Set termination criteria
+    # Set up termination (use standard generation-based termination)
     termination = get_termination("n_gen", n_generations)
     
     # Progress callback
@@ -1498,20 +1612,27 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         def __init__(self, verbose=True):
             self.verbose = verbose
             self.start_time = None
+            self.hv_callback = HVCallback(patience=hv_patience, min_improvement=hv_min_improvement, verbose=verbose)
             
         def __call__(self, algorithm):
             if self.start_time is None:
                 self.start_time = datetime.now()
             
+            # Call hypervolume callback for early stopping check
+            self.hv_callback(algorithm)
+            
             gen = algorithm.n_gen
-            max_gen = algorithm.termination.n_max_gen
             elapsed = (datetime.now() - self.start_time).total_seconds()
             
             if self.verbose and gen % 10 == 0:
-                progress = (gen / max_gen) * 100
-                eta = (elapsed / gen) * (max_gen - gen) if gen > 0 else 0
-                print(f"   Generation {gen}/{max_gen} ({progress:.1f}%) - "
+                progress = (gen / n_generations) * 100
+                eta = (elapsed / gen) * (n_generations - gen) if gen > 0 else 0
+                print(f"   Generation {gen}/{n_generations} ({progress:.1f}%) - "
                       f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min")
+            
+            # Stop optimization if hypervolume has converged
+            if self.hv_callback.converged:
+                algorithm.termination.force_termination = True
     
     # Run optimization
     if verbose:
@@ -1575,7 +1696,12 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         
         if result is not None and hasattr(result, 'F') and result.F is not None and len(result.F) > 0:
             if verbose:
-                print(f"✓ Optimization completed: {len(result.F)} Pareto-optimal solutions found")
+                convergence_reason = "hypervolume plateau" if callback.hv_callback.converged else "generation limit"
+                final_gen = len(callback.hv_callback.hv_history)
+                print(f"✓ Optimization completed after {final_gen} generations ({convergence_reason})")
+                if callback.hv_callback.hv_history:
+                    print(f"   Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
+                print(f"   Found {len(result.F)} Pareto-optimal solutions")
             
             # Prepare results
             # Create a copy of initial_conditions without the geodataframe to avoid large pickle files
@@ -1599,6 +1725,11 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 'algorithm_info': {
                     'pop_size': pop_size,
                     'n_generations': n_generations,
+                    'actual_generations': len(callback.hv_callback.hv_history),
+                    'converged_early': callback.hv_callback.converged,
+                    'convergence_reason': 'hypervolume_plateau' if callback.hv_callback.converged else 'generation_limit',
+                    'hypervolume_history': callback.hv_callback.hv_history,
+                    'final_hypervolume': callback.hv_callback.hv_history[-1] if callback.hv_callback.hv_history else None,
                     'timestamp': datetime.now().isoformat()
                 },
                 'initial_conditions': initial_conditions_filtered
@@ -1830,7 +1961,7 @@ def save_scenario_results(results, output_dir=".", verbose=True):
     objectives = results['objectives']
     
     # Get objective names from the problem
-    problem_temp = RestorationProblem(results['initial_conditions'], results['scenario_params'])
+    problem_temp = RestorationProblem(results['initial_conditions'], results['scenario_params'], n_jobs=1)  # Use single process for analysis
     objective_names = problem_temp.objective_names
     
     summary = {
@@ -1921,7 +2052,7 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
         objectives = scenario_results['objectives']
         
         # Get objective names from this scenario
-        problem_temp = RestorationProblem(scenario_results['initial_conditions'], scenario_results['scenario_params'])
+        problem_temp = RestorationProblem(scenario_results['initial_conditions'], scenario_results['scenario_params'], n_jobs=1)  # Use single process for analysis
         objective_names = problem_temp.objective_names
         
         objective_ranges = {}
@@ -2025,7 +2156,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
 if __name__ == '__main__':
     # Available ecosystem types: 'all', 'forest', 'agricultural', 'grassland'
     # Choose which ecosystem to optimize for:
-    ECOSYSTEM_TO_RUN = "grassland" #'all'  # Change this to 'forest', 'agricultural', 'grassland', or 'all'
+    ECOSYSTEM_TO_RUN = "agricultural" #'all'  # Change this to 'forest', 'agricultural', 'grassland', or 'all'
     
     # Available regions: 'Bern', 'CH'
     # This affects the reference raster used for data validation
@@ -2059,7 +2190,8 @@ if __name__ == '__main__':
         pop_size=50,
         n_generations=100,
         save_results=True,
-        verbose=True
+        verbose=True,
+        n_jobs=4
     )
     
     # =========================================================================
