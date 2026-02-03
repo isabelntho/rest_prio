@@ -21,14 +21,10 @@ import numpy as np
 import pandas as pd
 import rasterio as rio
 from scipy import ndimage
-import pickle
-import json
 from datetime import datetime
 from multiprocessing import Pool
 
 from pymoo.core.problem import ElementwiseProblem, StarmapParallelization
-from pymoo.core.sampling import Sampling
-from pymoo.core.repair import Repair
 from pymoo.optimize import minimize
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.termination import get_termination
@@ -40,13 +36,16 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 # Import spatial operations from separate module
 from spatial_operations import apply_burden_sharing, apply_spatial_clustering, _enforce_exact_pixel_count
-from spatial_operations import ClusteringRepair, BurdenSharingRepair, CombinedRepair, compute_sn_dens
+from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens
 
 # Import data loading functions from separate module
 from data_loader import load_initial_conditions, ECOSYSTEM_TYPES, FOCAL_CLASSES, load_admin_regions, load_lulc_raster,create_ecosystem_mask, get_region_reference
 
 # Import results saving functions from separate module
-from results_saving import save_parameter_summary, save_scenario_results, save_combined_results
+from results_saving import (
+    save_parameter_summary, save_scenario_results, save_combined_results,
+    save_results_with_reports
+)
 
 # =============================================================================
 # WEIGHTING FUNCTION
@@ -631,399 +630,21 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     return updated_conditions
 
 # =============================================================================
-# CUSTOM SAMPLING AND REPAIR OPERATORS
+# CUSTOM SAMPLING OPERATORS
 # =============================================================================
 
-class CustomBinaryRandomSampling(Sampling):
-    """
-    Custom binary random sampling that properly handles our expanded decision vector.
-    Only generates restoration decisions, leaves conversion decisions as zeros.
-    """
-    
-    def __init__(self, initial_conditions, max_restored_pixels):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.max_restored_pixels = max_restored_pixels
-    
-    def _do(self, problem, n_samples, **kwargs):
-        n_decision_vars = problem.n_var  # n_restoration_pixels + n_conversion_pixels
-        n_restoration_pixels = problem.n_restoration_pixels
-        n_conversion_pixels = problem.n_conversion_pixels
-        X = np.zeros((n_samples, n_decision_vars), dtype=int)
-        
-        # Check if landscape objective is present to enable conversion actions
-        enable_conversions = 'landscape_anomaly' in self.initial_conditions
-        
-        for i in range(n_samples):
-            x = np.zeros(n_decision_vars, dtype=int)
-            
-            # Distribute actions between restoration and conversion
-            n_total_actions = self.max_restored_pixels
-            if n_total_actions > 0:
-                if enable_conversions:
-                    # Split actions randomly between restoration and conversion
-                    # Ensure we don't exceed available pixels for each action type
-                    max_restore = min(n_total_actions, n_restoration_pixels)
-                    max_convert = min(n_total_actions, n_conversion_pixels)
-                    
-                    n_restore = np.random.randint(0, max_restore + 1)
-                    n_convert = min(n_total_actions - n_restore, max_convert)
-                else:
-                    # Only restoration actions
-                    n_restore = min(n_total_actions, n_restoration_pixels)
-                    n_convert = 0
-                
-                # Set restoration actions (first part of decision vector)
-                if n_restore > 0:
-                    restore_indices = np.random.permutation(n_restoration_pixels)[:n_restore]
-                    x[restore_indices] = 1
-                
-                # Set conversion actions (second part of decision vector)
-                if n_convert > 0:
-                    convert_indices = np.random.permutation(n_conversion_pixels)[:n_convert]
-                    x[n_restoration_pixels + convert_indices] = 1
-            
-            X[i] = x
-        
-        return X
-
-class ClusteredSampling(Sampling):
-    """
-    Custom sampling that generates spatially clustered restoration patterns.
-    """
-    
-    def __init__(self, initial_conditions, max_restored_pixels, clustering_strength=0.5):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.max_restored_pixels = max_restored_pixels
-        self.clustering_strength = clustering_strength
-    
-    def _do(self, problem, n_samples, **kwargs):
-        n_decision_vars = problem.n_var  # n_restoration_pixels + n_conversion_pixels
-        n_restoration_pixels = problem.n_restoration_pixels
-        n_conversion_pixels = problem.n_conversion_pixels
-        X = np.zeros((n_samples, n_decision_vars), dtype=int)
-        
-        for i in range(n_samples):
-            # Generate a random solution with target number of pixels
-            x = np.zeros(n_decision_vars, dtype=int)
-            
-            # Only work with restoration decisions (first n_restoration_pixels elements)
-            n_restore = min(self.max_restored_pixels, n_restoration_pixels)
-            if n_restore > 0:
-                # Use permutation to avoid int32 overflow with large pixel indices
-                restore_indices = np.random.permutation(n_restoration_pixels)[:n_restore]
-                x[restore_indices] = 1
-                
-                # Apply spatial clustering to generate clustered pattern
-                if self.clustering_strength > 0:
-                    # Apply clustering only to restoration decisions
-                    x_restore = apply_spatial_clustering(
-                        x[:n_restoration_pixels], 
-                        self.initial_conditions, 
-                        self.clustering_strength,
-                        exact_count=n_restore
-                    )
-                    x[:n_restoration_pixels] = x_restore
-            
-            X[i] = x
-        
-        return X
 
 
-class BurdenSharingSampling(Sampling):
-    """
-    Custom sampling that generates solutions with equal restoration across regions.
-    """
-    
-    def __init__(self, initial_conditions, max_restored_pixels):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.max_restored_pixels = max_restored_pixels
-    
-    def _do(self, problem, n_samples, **kwargs):
-        print(f"DEBUG: BurdenSharingSampling._do called with n_samples={n_samples}, n_var={problem.n_var}, max_restored_pixels={self.max_restored_pixels}")
-        n_decision_vars = problem.n_var  # n_restoration_pixels + n_conversion_pixels
-        n_restoration_pixels = problem.n_restoration_pixels
-        n_conversion_pixels = problem.n_conversion_pixels
-        X = np.zeros((n_samples, n_decision_vars), dtype=int)
-        
-        for i in range(n_samples):
-            print(f"DEBUG: BurdenSharingSampling sample {i}/{n_samples}")
-            # Generate a random solution with target number of pixels
-            x = np.zeros(n_decision_vars, dtype=int)
-            
-            try:
-                print(f"DEBUG: Generating random restore count (max={self.max_restored_pixels})")
-                # Only restoration for now (conversion could be added later)
-                n_restore = np.random.randint(0, min(self.max_restored_pixels, n_restoration_pixels) + 1)
-                print(f"DEBUG: Generated n_restore={n_restore}")
-                
-                if n_restore > 0:
-                    print(f"DEBUG: Using permutation to select {n_restore} pixels from {n_restoration_pixels}")
-                    # Use permutation to avoid int32 overflow with large pixel indices
-                    restore_indices = np.random.permutation(n_restoration_pixels)[:n_restore]
-                    print(f"DEBUG: Generated restore_indices, setting pixels")
-                    # Only set restoration decisions (first n_restoration_pixels elements)
-                    x[:n_pixels][restore_indices] = 1
-                    print(f"DEBUG: Set pixels, calling apply_burden_sharing")
-                    
-                    # Apply burden sharing to distribute equally across regions (only to restoration part)
-                    seed = np.random.randint(0, 2**31 - 1)  # Use int32 safe range
-                    x_restore = apply_burden_sharing(x[:n_pixels], self.initial_conditions, seed=seed, exact_count=self.max_restored_pixels)
-                    x[:n_pixels] = x_restore  # Update restoration part of decision vector
-                    print(f"DEBUG: apply_burden_sharing completed")
-                
-            except Exception as e:
-                print(f"DEBUG: Error in BurdenSharingSampling sample {i}: {e}")
-                import traceback
-                traceback.print_exc()
-                # Return zeros for this sample if there's an error
-                x = np.zeros(n_decision_vars, dtype=int)
-            
-            X[i] = x
-        
-        print(f"DEBUG: BurdenSharingSampling._do completed")
-        return X
 
 
-class CombinedSampling(Sampling):
-    """
-    Custom sampling that combines burden sharing and spatial clustering.
-    """
-    
-    def __init__(self, initial_conditions, max_restored_pixels, clustering_strength=0.5):
-        super().__init__()
-        self.initial_conditions = initial_conditions
-        self.max_restored_pixels = max_restored_pixels
-        self.clustering_strength = clustering_strength
-    
-    def _do(self, problem, n_samples, **kwargs):
-        n_decision_vars = problem.n_var  # n_restoration_pixels + n_conversion_pixels
-        n_restoration_pixels = problem.n_restoration_pixels
-        n_conversion_pixels = problem.n_conversion_pixels
-        X = np.zeros((n_samples, n_decision_vars), dtype=int)
-        
-        for i in range(n_samples):
-            x = np.zeros(n_decision_vars, dtype=int)
-            
-            # Only work with restoration decisions (first n_restoration_pixels elements)
-            x_restore = x[:n_restoration_pixels]
-            
-            n_restore = min(self.max_restored_pixels, n_restoration_pixels)  # Ensure we don't exceed available pixels
-            if n_restore > 0:
-                # Use permutation to avoid int32 overflow with large pixel indices
-                restore_indices = np.random.permutation(n_restoration_pixels)[:n_restore]
-                x_restore[restore_indices] = 1
-                
-                # Apply burden sharing first (only to restoration decisions)
-                seed = np.random.randint(0, 2**31 - 1)  # Use int32 safe range
-                x_restore = apply_burden_sharing(x_restore, self.initial_conditions, seed=seed, exact_count=n_restore)
-                x[:n_restoration_pixels] = x_restore  # Update the full decision vector
-                
-                # Then apply spatial clustering
-                if self.clustering_strength > 0:
-                    x_restore_clustered = apply_spatial_clustering(
-                        x[:n_restoration_pixels], 
-                        self.initial_conditions, 
-                        self.clustering_strength,
-                        exact_count=n_restore
-                    )
-                    x[:n_restoration_pixels] = x_restore_clustered
-            
-            X[i] = x
-        
-        return X
-
-class ScoreCountRepair(Repair):
-    """
-    Enforces EXACT number of restored pixels, but chooses which pixels to add or remove
-    based on a per pixel score, rather than at random.
-    """
-    def __init__(self, max_restored_pixels, scores):
-        super().__init__()
-        self.max_restored_pixels = int(max_restored_pixels)
-        self.scores = np.asarray(scores, dtype=np.float64)
-
-    def _do(self, problem, X, **kwargs):
-        Xr = np.zeros_like(X)
-
-        for i in range(len(X)):
-            x = X[i].copy()
-            # Work with both restoration and conversion decisions
-            n_pixels = problem.n_pixels
-            x_restore = x[:n_pixels]
-            x_convert = x[n_pixels:]
-            
-            # Count total actions (restore + convert)
-            cur_restore = int(np.sum(x_restore))
-            cur_convert = int(np.sum(x_convert))
-            cur_total = cur_restore + cur_convert
-            k = self.max_restored_pixels
-
-            if cur_total < k:
-                need = k - cur_total
-                # Prioritize restoration actions for now (since convert is forced to 0)
-                zeros_restore = np.where(x_restore == 0)[0]
-                if zeros_restore.size > 0 and need > 0:
-                    # add best available restoration zeros
-                    add = zeros_restore[np.argsort(-self.scores[zeros_restore])][:need]
-                    x_restore[add] = 1
-
-            elif cur_total > k:
-                drop = cur_total - k
-                # Remove from restoration actions first (since convert should be 0)
-                ones_restore = np.where(x_restore == 1)[0]
-                if ones_restore.size > 0 and drop > 0:
-                    # remove worst available restoration ones
-                    rem = ones_restore[np.argsort(self.scores[ones_restore])][:drop]
-                    x_restore[rem] = 0
-
-            # Update both restoration and conversion parts of the decision vector
-            x[:n_pixels] = x_restore
-            x[n_pixels:] = x_convert
-            Xr[i] = x
-
-        return Xr
-
-class ExactCountRepair(Repair):
-    """
-    Repair operator that enforces exact count constraint after genetic operations.
-    """
-    
-    def __init__(self, max_restored_pixels, seed=None):
-        super().__init__()
-        self.max_restored_pixels = max_restored_pixels
-        self.rng = np.random.RandomState(seed)
-    
-    def _do(self, problem, X, **kwargs):
-        X_repaired = np.zeros_like(X)
-        
-        for i in range(len(X)):
-            x = X[i].copy()
-            # Work with both restoration and conversion decisions  
-            n_pixels = problem.n_pixels
-            x_restore = x[:n_pixels]
-            x_convert = x[n_pixels:]
-            
-            # Count total actions (restore + convert)
-            current_restore = np.sum(x_restore)
-            current_convert = np.sum(x_convert)
-            current_total = current_restore + current_convert
-            
-            if current_total != self.max_restored_pixels:
-                if current_total < self.max_restored_pixels:
-                    # Need to add actions - prioritize restoration for now
-                    available_restore = np.where(x_restore == 0)[0]
-                    n_to_add = self.max_restored_pixels - current_total
-                    if len(available_restore) >= n_to_add:
-                        selected = self.rng.choice(available_restore, n_to_add, replace=False)
-                        x_restore[selected] = 1
-                    else:
-                        # Add all available restoration pixels
-                        if len(available_restore) > 0:
-                            x_restore[available_restore] = 1
-                        # Could add conversion pixels here in future
-                else:
-                    # Need to remove actions - prioritize removing restoration for now  
-                    active_restore = np.where(x_restore == 1)[0]
-                    n_to_remove = current_total - self.max_restored_pixels
-                    if len(active_restore) >= n_to_remove:
-                        selected = self.rng.choice(active_restore, n_to_remove, replace=False)
-                        x_restore[selected] = 0
-                    else:
-                        # Remove all restoration pixels
-                        if len(active_restore) > 0:
-                            x_restore[active_restore] = 0
-                        # Could remove conversion pixels here in future
-            
-            # Update both restoration and conversion parts of the decision vector
-            x[:n_pixels] = x_restore
-            x[n_pixels:] = x_convert
-            
-            #n_changed = np.sum(x != X[i])
-            #print("repair changed bits:", int(n_changed), "count before after:", int(current_total), int(self.max_restored_pixels))
-
-            X_repaired[i] = x
-        
-        return X_repaired
 
 
-def create_parameter_illustration_maps(initial_conditions, save_path=None):
-    """
-    Create maps illustrating different parameter options.
-    
-    Args:
-        initial_conditions: Dict with initial conditions - load with load_initial_conditions()
-        save_path: Optional path to save the figure
-    """
-    import matplotlib.pyplot as plt
-    
-    shape = initial_conditions['shape']
-    eligible_indices = initial_conditions['eligible_indices']
-    
-    # Generate sample restoration pattern
-    np.random.seed(42)  # For reproducible illustrations
-    
-    # Row 1: Different restoration fractions (medium clustering = 0.3)
-    fractions = [0.15, 0.25, 0.35, 0.50]
-    clustering = 0.3
-    
-    # Row 2: Different clustering levels (medium fraction = 0.25)  
-    clusterings = [0.0, 0.3, 0.6, 1.0]
-    fraction = 0.25
-    
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    
-    # Row 1: Varying restoration fraction
-    for i, frac in enumerate(fractions):
-        n_restore = int(frac * len(eligible_indices))
-        decision_vars = np.zeros(len(eligible_indices))
-        if n_restore > 0:
-            decision_vars[np.random.permutation(len(eligible_indices))[:n_restore]] = 1
-        
-        # Apply clustering
-        clustered_vars = apply_spatial_clustering(decision_vars, initial_conditions, clustering)
-        
-        # Convert to 2D for visualization
-        restore_map = np.zeros(shape)
-        restore_indices = eligible_indices[clustered_vars == 1]
-        rows, cols = np.divmod(restore_indices, shape[1])
-        restore_map[rows, cols] = 1
-        
-        axes[0, i].imshow(restore_map, cmap='RdYlBu_r', vmin=0, vmax=1)
-        axes[0, i].set_title(f'Restore {frac*100:.0f}%\n(Clustering=0.3)')
-        axes[0, i].axis('off')
-    
-    # Row 2: Varying clustering
-    n_restore = int(fraction * len(eligible_indices))
-    base_decision_vars = np.zeros(len(eligible_indices))
-    if n_restore > 0:
-        base_decision_vars[np.random.permutation(len(eligible_indices))[:n_restore]] = 1
-    
-    for i, clust in enumerate(clusterings):
-        clustered_vars = apply_spatial_clustering(base_decision_vars, initial_conditions, clust)
-        
-        # Convert to 2D for visualization
-        restore_map = np.zeros(shape)
-        restore_indices = eligible_indices[clustered_vars == 1]
-        rows, cols = np.divmod(restore_indices, shape[1])
-        restore_map[rows, cols] = 1
-        
-        axes[1, i].imshow(restore_map, cmap='RdYlBu_r', vmin=0, vmax=1)
-        axes[1, i].set_title(f'Clustering={clust}\n(Restore 25%)')
-        axes[1, i].axis('off')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Parameter illustration saved to: {save_path}")
-    
-    plt.show()
-    return fig
 
-# Add this function before the RestorationProblem class (around line 750)
+
+# =============================================================================
+# OPTIMIZATION PROBLEM DEFINITION
+# =============================================================================
+
 
 def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10):
     """
@@ -1110,9 +731,6 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     
     print(f"\n   Summary: {feasible_count}/{n_samples} feasible, {infeasible_count}/{n_samples} infeasible")
     
-    # Check if objectives can improve
-    #print(f"\n4. OBJECTIVE IMPROVEMENT POTENTIAL:")
-    
     if feasible_count > 0:
         print(f"   ✓ Feasible solutions exist, Objectives show improvement with restoration")
     else:
@@ -1120,7 +738,6 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         print(f"   → Check if max_restored_pixels constraint is too restrictive")
     
     # Check for common issues
-    #print(f"\n5. POTENTIAL ISSUES:")
     issues = []
     
     if problem.max_restored_pixels == 0:
@@ -1232,7 +849,6 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         print(f"         After:  min={np.min(after_restored):.3f}, max={np.max(after_restored):.3f}, mean={np.mean(after_restored):.3f}")
         print(f"         % above threshold BEFORE: {100*np.sum(before_restored > threshold)/len(before_restored):.1f}%")
         print(f"         % above threshold AFTER:  {100*np.sum(after_restored > threshold)/len(after_restored):.1f}%")
-        #print(f"         → Improvement adds {np.mean(after_restored - before_restored):.3f} on average")
 
     print("\n" + "="*70)
     print("END DIAGNOSTICS")
@@ -1372,6 +988,11 @@ class RestorationProblem(ElementwiseProblem):
                 Next n_conversion_pixels elements: conversion decisions for conversion-eligible pixels
             out: Output dictionary for objectives and constraints
         """
+        # Initialize debug counter
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        
         # Split decision vector into restore and convert actions
         x_restore = x[:self.n_restoration_pixels]
         x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels] 
@@ -1386,6 +1007,10 @@ class RestorationProblem(ElementwiseProblem):
         n_converted = np.sum(x_convert)
         n_total_actions = n_restored + n_converted
         
+        # Debug: Track action patterns for first few evaluations
+        #if self._debug_count <= 10:
+            #print(f"DEBUG Eval {self._debug_count}: {n_restored} restore + {n_converted} convert = {n_total_actions} total")
+        
         # Apply restoration effects to both restoration and conversion decisions
         updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
         
@@ -1393,21 +1018,30 @@ class RestorationProblem(ElementwiseProblem):
         objectives = []
         
         for obj_name in self.objective_names:
-            if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
                 # Anomaly objectives: MINIMIZE negative sum (equivalent to MAXIMIZE sum)
                 # Higher anomalies are better, so we want to maximize the sum
                 # NSGA-II minimizes, so we minimize the negative
                 threshold = 0.0  # or different per objective
                 pixels_above = np.sum(updated_conditions[obj_name] > threshold)
                 obj_value = -pixels_above  # Maximize count above threshold
-                #vals = updated_conditions[obj_name][self.initial_conditions["eligible_mask"]]
-                #pixels_above = np.sum(vals > 0.0)
-
-                # smooth tie breaker, only counts how far above 0 you are
-                #margin = np.sum(np.maximum(0.0, vals))
-
-                # small weight so the count still dominates
-                #obj_value = -pixels_above - 1e-6 * margin
+                
+                # Debug abiotic/biotic anomaly if needed
+                #if self._debug_count <= 3 and obj_name == 'abiotic_anomaly':
+                #    print(f"  {obj_name}: pixels_above={pixels_above}, obj_value={obj_value}")
+                
+            elif obj_name == 'landscape_anomaly':
+                # Landscape objective: MINIMIZE the actual sum of landscape anomalies
+                # Use the actual values, not just count above threshold
+                landscape_vals = updated_conditions[obj_name]
+                obj_value = np.sum(landscape_vals)  # Minimize total landscape impact
+                
+                # Debug landscape anomaly specifically
+                #if self._debug_count <= 10:
+                #    unique_vals = np.unique(landscape_vals)
+                #    print(f"  Landscape anomaly: sum={obj_value:.6f}, obj_value={obj_value:.6f}")
+                #    print(f"  Landscape range: min={landscape_vals.min():.6f}, max={landscape_vals.max():.6f}")
+                #    print(f"  Landscape unique values: {len(unique_vals)} unique (showing first 5: {unique_vals[:5]})")
 
             elif obj_name == 'implementation_cost':
                 # Cost objective: minimize total cost (lower is better)
@@ -1566,37 +1200,31 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
     burden_sharing = scenario_params.get('burden_sharing', 'no')
     clustering_strength = scenario_params.get('spatial_clustering', 0.0)
     
-    # Select appropriate sampling strategy
-    if burden_sharing == 'yes' and clustering_strength > 0.0:
-        sampling = CombinedSampling(
-            initial_conditions, 
-            problem.max_restored_pixels, 
-            clustering_strength
-        )
-        repair = CombinedRepair(initial_conditions, clustering_strength, problem.max_restored_pixels)
-        if verbose:
-            print(f"  Using combined burden-sharing + clustering ({clustering_strength})")
-    elif burden_sharing == 'yes':
-        sampling = BurdenSharingSampling(initial_conditions, problem.max_restored_pixels)
-        repair = BurdenSharingRepair(initial_conditions, problem.max_restored_pixels)
-        if verbose:
-            print(f"  Using burden-sharing sampling/repair")
-    elif clustering_strength > 0.0:
-        sampling = ClusteredSampling(
-            initial_conditions, 
-            problem.max_restored_pixels, 
-            clustering_strength
-        )
-        repair = ClusteringRepair(initial_conditions, clustering_strength, problem.max_restored_pixels)
-        if verbose:
-            print(f"  Using clustered sampling/repair (strength={clustering_strength})")
-    else:
-        sampling = CustomBinaryRandomSampling(initial_conditions, problem.max_restored_pixels)
-        #repair = ExactCountRepair(problem.max_restored_pixels)
-        scores = build_repair_scores(initial_conditions, scenario_params)
-        repair = ScoreCountRepair(problem.max_restored_pixels, scores)
-        if verbose:
-            print(f"  Using custom binary random sampling with score-based repair")
+    # Build scores for repair operator
+    scores = build_repair_scores(initial_conditions, scenario_params)
+    
+    # Use consolidated operators for all scenarios
+    sampling = AdaptiveSampling(
+        initial_conditions, 
+        problem.max_restored_pixels, 
+        scenario_params
+    )
+    repair = AdaptiveRepair(
+        initial_conditions, 
+        problem.max_restored_pixels, 
+        scenario_params, 
+        scores
+    )
+    
+    if verbose:
+        strategy_desc = []
+        if burden_sharing == 'yes':
+            strategy_desc.append("burden-sharing")
+        if clustering_strength > 0.0:
+            strategy_desc.append(f"clustering({clustering_strength})")
+        if not strategy_desc:
+            strategy_desc.append("random with score-based repair")
+        print(f"  Using adaptive operators: {', '.join(strategy_desc)}")
     
     # Create optimization algorithm
     algorithm = NSGA2(
@@ -1647,7 +1275,7 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             problem,
             algorithm,
             termination,
-            seed=42,                # For reproducible results
+            seed=42, 
             verbose=False,
             callback=callback
         )
@@ -1657,10 +1285,6 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             print(f"\nDEBUG - Result object:")
             print(f"  result is None: {result is None}")
             if result is not None:
-                #print(f"  hasattr(result, 'F'): {hasattr(result, 'F')}")
-                #print(f"  hasattr(result, 'X'): {hasattr(result, 'X')}")
-                #print(f"  hasattr(result, 'pop'): {hasattr(result, 'pop')}")
-                
                 # Check final population
                 if hasattr(result, 'pop') and result.pop is not None:
                     print(f"\n  Final population size: {len(result.pop)}")
@@ -1685,17 +1309,6 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                                     for j in range(i+1, pop_F.shape[1]):
                                         corr = np.corrcoef(pop_F[:, i], pop_F[:, j])[0, 1]
                                         print(f"    {problem.objective_names[i]} vs {problem.objective_names[j]}: {corr:.4f}")
-                
-                #if hasattr(result, 'F'):
-                    #print(f"\n  result.F (Pareto front):")
-                    #print(f"    is None: {result.F is None}")
-                    #if result.F is not None:
-                        #print(f"    shape: {result.F.shape}")
-                        #print(f"    length: {len(result.F)}")
-                #if hasattr(result, 'X'):
-                    #print(f"  result.X is None: {result.X is None}")
-                    #if result.X is not None:
-                        #print(f"    shape: {result.X.shape}")
         
         if result is not None and hasattr(result, 'F') and result.F is not None and len(result.F) > 0:
             if verbose:
@@ -1715,6 +1328,18 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 if 'gdf' in admin_data_filtered:
                     del admin_data_filtered['gdf']
                 initial_conditions_filtered['admin_data'] = admin_data_filtered
+
+            # CAPTURE FULL POPULATION DATA FOR DIAGNOSTICS
+            full_population_data = None
+            if hasattr(result, 'pop') and result.pop is not None:
+                pop_F = result.pop.get("F")
+                pop_X = result.pop.get("X")
+                if pop_F is not None and pop_X is not None:
+                    full_population_data = {
+                        'objectives': pop_F,  # Full population objectives
+                        'decisions': pop_X,   # Full population decisions
+                        'population_size': len(pop_F)
+                    }  
             
             optimization_results = {
                 'scenario_params': scenario_params,
@@ -1730,17 +1355,26 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                     'n_generations': n_generations,
                     'actual_generations': len(callback.hv_callback.hv_history),
                     'converged_early': callback.hv_callback.converged,
+                    'termination_reason': 'hypervolume_convergence' if callback.hv_callback.converged else 'generation_limit',
                     'convergence_reason': 'hypervolume_plateau' if callback.hv_callback.converged else 'generation_limit',
                     'hypervolume_history': callback.hv_callback.hv_history,
                     'final_hypervolume': callback.hv_callback.hv_history[-1] if callback.hv_callback.hv_history else None,
+                    'hv_patience': hv_patience,
+                    'hv_min_improvement': hv_min_improvement,
+                    'sampling_method': 'adaptive',
+                    'repair_operators': ['score_based_repair', 'random_repair'],
                     'timestamp': datetime.now().isoformat()
                 },
-                'initial_conditions': initial_conditions_filtered
-            }
+                'initial_conditions': initial_conditions_filtered,
+                'hv_callback': callback.hv_callback,# Store for evolution tracking
+                'full_population': full_population_data  
             
-            # Save results if requested
+        }
+            
+            # Save results with comprehensive reporting if requested
             if save_results:
-                save_scenario_results(optimization_results, verbose=verbose)
+                # Use simplified reporting - generates all essential reports
+                save_results_with_reports(optimization_results, verbose=verbose)
             
             return optimization_results
             
@@ -1933,7 +1567,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
 if __name__ == '__main__':
     # Available ecosystem types: 'all', 'forest', 'agricultural', 'grassland'
     # Choose which ecosystem to optimize for:
-    ECOSYSTEM_TO_RUN = "agricultural" #'all'  # Change this to 'forest', 'agricultural', 'grassland', or 'all'
+    ECOSYSTEM_TO_RUN = "grassland" #Change this to 'forest', 'agricultural', 'grassland', or 'all'
     
     # Available regions: 'Bern', 'CH'
     # This affects the reference raster used for data validation
