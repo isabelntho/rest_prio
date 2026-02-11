@@ -121,12 +121,12 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
             from rasterio.warp import reproject, Resampling
             from rasterio.windows import from_bounds
             
-            print(f"🔄 Processing LULC to match reference data extent...")
+            #print(f"🔄 Processing LULC to match reference data extent...")
             
             with rio.open(original_path) as src:
                 # Check if we need to reproject
                 if target_crs and src.crs != target_crs:
-                    print(f"  Reprojecting from {src.crs} to {target_crs}")
+                    #print(f"  Reprojecting from {src.crs} to {target_crs}")
                     
                     # Create output array with target specifications
                     processed_data = np.empty(target_shape, dtype=src.dtypes[0])
@@ -153,7 +153,7 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
                         
                         # If the windowed data doesn't match target shape, resample
                         if processed_data.shape != target_shape:
-                            print(f"  Resampling from {processed_data.shape} to {target_shape}")
+                            #print(f"  Resampling from {processed_data.shape} to {target_shape}")
                             
                             # Create temporary in-memory dataset for resampling
                             temp_transform = rio.windows.transform(window, src.transform)
@@ -172,8 +172,8 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
                             processed_data = temp_data
                             
                     except Exception as window_error:
-                        print(f"  Window-based cropping failed: {window_error}")
-                        print(f"  Falling back to full reprojection...")
+                       #print(f"  Window-based cropping failed: {window_error}")
+                       #print(f"  Falling back to full reprojection...")
                         
                         # Fallback: reproject the entire raster
                         processed_data = np.empty(target_shape, dtype=src.dtypes[0])
@@ -196,18 +196,18 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
                 'bounds': target_bounds
             })
             
-            print(f"✓ Processed LULC to match reference: {processed_data.shape}")
-            print(f"  Processed unique values: {len(np.unique(processed_data[~np.isnan(processed_data)]))}")
+            #print(f"✓ Processed LULC to match reference: {processed_data.shape}")
+            #print(f"  Processed unique values: {len(np.unique(processed_data[~np.isnan(processed_data)]))}")
             
             return processed_data, lulc_meta, original_path
             
         except Exception as e:
-            print(f"Warning: Failed to process LULC to match reference data: {e}")
-            print("Using original LULC - ecosystem masking may not work correctly")
+            #print(f"Warning: Failed to process LULC to match reference data: {e}")
+            #print("Using original LULC - ecosystem masking may not work correctly")
             return lulc_data, lulc_meta, original_path
     
     else:
-        print(f"✓ Using original LULC extent (no target specified)")
+        #print(f"✓ Using original LULC extent (no target specified)")
         return lulc_data, lulc_meta, original_path
 
 
@@ -234,7 +234,7 @@ def create_ecosystem_mask(lulc_data, ecosystem_type):
     else:
         raise ValueError(f"Unknown ecosystem type: {ecosystem_type}. Available: {list(ECOSYSTEM_TYPES.keys()) + ['all']}")
     
-    print(f"✓ Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
+    #print(f"✓ Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
     return mask
 
 # =============================================================================
@@ -306,8 +306,6 @@ def load_admin_regions(workspace_dir, region='Bern'):
             region_col = 'NAME'
             unique_regions = gdf[region_col].unique()
             
-            print(f"✓ Loaded {len(unique_regions)} cantons for CH-wide optimization")
-            
             return {
                 'gdf': gdf,
                 'region_column': region_col,
@@ -338,7 +336,6 @@ def load_admin_regions(workspace_dir, region='Bern'):
             region_col = 'NAME'     
             unique_regions = gdf_bern[region_col].unique()
             
-            print(f"✓ Cropped admin regions to Bern: {len(unique_regions)} regions")
             
             return {
                 'gdf': gdf_bern,
@@ -440,8 +437,8 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 # Apply region-specific validation if available
                 if region_ref is not None:
                     # Check if the loaded data matches region expectations
-                    if str(src.crs) != region_ref['crs']:
-                        print(f"Warning: Raster CRS {src.crs} doesn't match expected {region_ref['crs']} for region {region}")
+                    #if str(src.crs) != region_ref['crs']:
+                        #print(f"Warning: Raster CRS {src.crs} doesn't match expected {region_ref['crs']} for region {region}")
                     
                     if region_ref['expected_bounds'] is not None:
                         expected = region_ref['expected_bounds']
@@ -561,13 +558,13 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                     # Check compatibility and resample if needed
                     needs_resampling = False
                     if landscape_data.shape != ref['shape']:
-                        print(f"  Landscape shape mismatch: {landscape_data.shape} vs {ref['shape']} - will resample")
+                        #print(f"  Landscape shape mismatch: {landscape_data.shape} vs {ref['shape']} - will resample")
                         needs_resampling = True
                     if src.crs != ref['crs']:
-                        print(f"  Landscape CRS mismatch: {src.crs} vs {ref['crs']} - will reproject")
+                        #print(f"  Landscape CRS mismatch: {src.crs} vs {ref['crs']} - will reproject")
                         needs_resampling = True
                     if src.transform != ref['transform']:
-                        print(f"  Landscape transform mismatch - will resample")
+                        #print(f"  Landscape transform mismatch - will resample")
                         needs_resampling = True
                     
                     if needs_resampling:
@@ -615,7 +612,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 print(f"Landscape file not found ({landscape_file_path}), computing from LULC data...")
                 
                 # Define focal classes for landscape density calculation
-                ffocal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+                focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
                     52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]  # Forest and grassland classes
                 
                 # Store information needed for efficient landscape recalculation
@@ -666,8 +663,8 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         if np.any(nan_mask):
             base_eligible_mask = base_eligible_mask & ~nan_mask
             nan_excluded = np.sum(nan_mask)
-            print(f"  Masking {nan_excluded} NaN pixels from {obj_name}")
-
+            #print(f"  Masking {nan_excluded} NaN pixels from {obj_name}")
+    print(f"  Masked NaN pixels from objective layers")
     # RESTORATION ELIGIBLE MASK: Apply ecosystem mask to eligible pixels (current method)
     restoration_eligible_mask = base_eligible_mask.copy()
     if 'ecosystem_mask' in initial_conditions:
@@ -675,7 +672,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         restoration_eligible_mask = restoration_eligible_mask & initial_conditions['ecosystem_mask']
         post_ecosystem_count = np.sum(restoration_eligible_mask)
         ecosystem_excluded = pre_ecosystem_count - post_ecosystem_count
-        print(f"  Ecosystem masking for restoration excluded {ecosystem_excluded} pixels")
+        #print(f"  Ecosystem masking for restoration excluded {ecosystem_excluded} pixels")
         print(f"  Final restoration eligible pixels for {ecosystem}: {post_ecosystem_count}")
     
     # CONVERSION ELIGIBLE MASK: Landscape LULC pixels NOT in focal_classes
@@ -687,7 +684,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                         52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
         # Additional LULC values that must never be included
         exclude_classes = np.concatenate([
-            np.arange(1, 22),          # 1–14
+            np.arange(1, 22),          # 1–21
             np.array([61, 62, 63])
         ])
 
@@ -749,17 +746,24 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             sample_mask = np.zeros(shape, dtype=bool)
             sample_mask[start_row:end_row, start_col:end_col] = True
             
-            # Combine with eligible mask to get spatially continuous sample
-            combined_mask = eligible_mask & sample_mask
-            sampled_indices = np.where(combined_mask.flatten())[0]
+            # Apply sampling to BOTH restoration and conversion masks
+            restoration_sampled_mask = restoration_eligible_mask & sample_mask
+            conversion_sampled_mask = conversion_eligible_mask & sample_mask
             
-            if len(sampled_indices) > 0:
-                eligible_indices = sampled_indices
-                eligible_mask = combined_mask
+            restoration_sampled_indices = np.where(restoration_sampled_mask.flatten())[0]
+            conversion_sampled_indices = np.where(conversion_sampled_mask.flatten())[0]
+            
+            if len(restoration_sampled_indices) > 0:
+                # Update all masks to use the sampled region
+                restoration_eligible_mask = restoration_sampled_mask
+                conversion_eligible_mask = conversion_sampled_mask
+                eligible_mask = restoration_sampled_mask  # For backward compatibility
+                eligible_indices = restoration_sampled_indices
                 
-                print(f"✓ Applied spatially continuous sampling:")
+                print(f"✓ Applied spatially continuous sampling to both restoration and conversion:")
                 print(f"  Rectangle: ({start_row}:{end_row}, {start_col}:{end_col})")
-                print(f"  Sample: {len(sampled_indices)}/{n_total_eligible} pixels ({len(sampled_indices)/n_total_eligible*100:.1f}%)")
+                print(f"  Restoration sample: {len(restoration_sampled_indices)} pixels")
+                print(f"  Conversion sample: {len(conversion_sampled_indices)} pixels")
             else:
                 print(f"✗ Warning: No eligible pixels in sample region, using all eligible pixels")
         else:

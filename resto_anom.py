@@ -16,6 +16,7 @@ Created: December 2025
 # =============================================================================
 # IMPORTS AND SETUP
 # =============================================================================
+from email.mime import base
 import os
 import numpy as np
 import pandas as pd
@@ -36,16 +37,25 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 # Import spatial operations from separate module
 from spatial_operations import apply_burden_sharing, apply_spatial_clustering, _enforce_exact_pixel_count
-from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens
+from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens, compute_sn_dens_array
 
 # Import data loading functions from separate module
 from data_loader import load_initial_conditions, ECOSYSTEM_TYPES, FOCAL_CLASSES, load_admin_regions, load_lulc_raster,create_ecosystem_mask, get_region_reference
-
+from time import perf_counter
 # Import results saving functions from separate module
 from results_saving import (
     save_parameter_summary, save_scenario_results, save_combined_results,
     save_results_with_reports
 )
+
+from scenarios import (
+    define_scenario_parameters,
+    sample_scenario_parameters,
+    expand_scenarios,
+)
+
+import psutil
+from time import time
 
 # =============================================================================
 # WEIGHTING FUNCTION
@@ -65,18 +75,21 @@ def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
     Returns:
         Array of weights in [0,1] with same shape as anomaly_values
     """
+    neg_mask = anomaly_values < 0
     # Ensure we work with absolute anomaly values
     abs_anomaly = np.abs(anomaly_values)
     
     if shape == 'exponential':
         # Exponential decay: w(a) = exp(-|a|/scale)
-        weights = np.exp(-abs_anomaly / scale)
+        weights = 1-(np.exp(-abs_anomaly / scale))
     elif shape == 'gaussian':
         # Gaussian decay: w(a) = exp(-|a|²/(2*scale²))
         weights = np.exp(-(abs_anomaly**2) / (2 * scale**2))
     else:
         raise ValueError(f"Unknown weight shape: {shape}. Use 'exponential' or 'gaussian'")
-    
+    gamma = 3.0
+    weights = weights ** gamma
+    weights = np.where(neg_mask, weights, 0.0)
     # Ensure weights are in [0,1] and handle any numerical issues
     weights = np.clip(weights, 0.0, 1.0)
     
@@ -113,115 +126,18 @@ def build_repair_scores(initial_conditions, scenario_params):
     return np.asarray(scores, dtype=np.float64)
 
 # =============================================================================
-# SCENARIO PARAMETERS
+# RESTORATION EFFECT FUNCTIONS
 # =============================================================================
 
-def define_scenario_parameters():
+def conversion_mask(convert_vars, initial_conditions):
     """
-    Define continuous ranges for scenario parameters
-    Returns:
-        dict: Dictionary with parameter names as keys and (min, max) tuples for continuous ranges
-              or lists for categorical parameters
-    """
-    scenario_parameters = {
-        'max_restoration_fraction': [0.1, 0.3],#(0.10, 0.50), # Proportion of study area to restore (min, max)
-        'spatial_clustering': [0, 0.3],#, 1.0), # Degree of spatial clustering (0=random, 1=highly clustered)
-        'burden_sharing': ['no'], # Equal sharing across admin regions (categorical)
-        # Separate improvement parameters for each anomaly type
-        'abiotic_effect': (0.005, 0.02), # Reduction in abiotic anomaly (min, max)
-        'biotic_effect': (0.005, 0.02), # Reduction in biotic anomaly (min, max)
-        #'landscape_effect': [0.01],#(0.005, 0.02), # Reduction in landscape anomaly (min, max)
-        # Anomaly-dependent improvement weighting
-        'anomaly_weight_shape': ['exponential'], # Shape of weighting function
-        'anomaly_weight_scale': [1.0], # Scale parameter for weight decay
-    }
+    Landscape calculation using full recalculation with compute_sn_dens.
     
-    return scenario_parameters
-
-def sample_scenario_parameters(n_samples_per_param=3, random_seed=42):
-    """
-    Sample values from continuous parameter ranges and combine with categorical parameters.
+    Previously used mathematical approximation for speed, but now uses full 
+    recalculation for accuracy. The approximation functions are kept for 
+    potential future use but are disabled.
     
-    Args:
-        n_samples_per_param: Number of samples to draw from each continuous parameter
-        random_seed: Random seed for reproducible sampling
-        
-    Returns:
-        list: List of parameter combinations (dicts)
-    """
-    from itertools import product
-    import numpy as np
-    
-    # Set random seed for reproducible sampling
-    np.random.seed(random_seed)
-    
-    params = define_scenario_parameters()
-    sampled_values = {}
-    
-    # Sample from continuous ranges or use categorical values
-    for param_name, param_range in params.items():
-        if isinstance(param_range, tuple) and len(param_range) == 2:
-            # Continuous parameter - sample uniformly between min and max
-            min_val, max_val = param_range
-            samples = np.linspace(min_val, max_val, n_samples_per_param)
-            sampled_values[param_name] = samples.tolist()
-        else:
-            # Categorical parameter - use all values
-            sampled_values[param_name] = param_range
-    
-    # Generate all combinations of sampled values
-    param_names = list(sampled_values.keys())
-    param_value_lists = list(sampled_values.values())
-    
-    combinations = []
-    for combo in product(*param_value_lists):
-        combo_dict = dict(zip(param_names, combo))
-        combinations.append(combo_dict)
-    
-    return combinations
-
-def get_scenario_combinations():
-    """
-    Get all possible combinations of scenario parameters (legacy function).
-    Now uses sampling approach with 3 values per continuous parameter.
-    
-    Returns:
-        list: List of parameter combinations (dicts)
-    """
-    return sample_scenario_parameters(n_samples_per_param=3)
-
-def get_scenario_by_index(scenario_index, n_samples_per_param=3, random_seed=42):
-    """
-    Get a specific scenario by index using sampled parameters.
-    
-    Args:
-        scenario_index: Index of the scenario (0-based)
-        n_samples_per_param: Number of samples per continuous parameter
-        random_seed: Random seed for reproducible sampling
-        
-    Returns:
-        dict: Parameter combination for the scenario
-    """
-    combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
-    
-    if 0 <= scenario_index < len(combinations):
-        return combinations[scenario_index]
-    else:
-        raise ValueError(f"Scenario index {scenario_index} out of range. Available: 0-{len(combinations)-1}")
-
-# =============================================================================
-# RESTORATION EFFECT FUNCTION
-# =============================================================================
-
-def fast_selective_landscape_approximation(convert_vars, initial_conditions):
-    """
-    Fast landscape calculation that combines both approximation and selective processing.
-    
-    This approach:
-    a) Only processes neighborhoods around converted pixels (selective)
-    b) Uses mathematical approximation instead of full compute_sn_dens (approximate)
-    
-    Expected speedup: 50-200x faster than full recalculation
+    Note: No longer "fast" or "selective" - performs full landscape recalculation.
     """
     if not np.any(convert_vars):
         return initial_conditions['landscape_anomaly']
@@ -234,201 +150,57 @@ def fast_selective_landscape_approximation(convert_vars, initial_conditions):
     if len(converted_indices) == 0:
         return initial_conditions['landscape_anomaly']
     
-    # Start with baseline landscape (no copying yet for efficiency)
-    baseline_landscape = initial_conditions['landscape_anomaly']
+    # Create 2D conversion mask from 1D conversion decisions
+    conversion_mask_2d = np.zeros(shape, dtype=bool)
+    rows, cols = np.divmod(converted_indices, shape[1])
+    conversion_mask_2d[rows, cols] = True
     
-    # Parameters
-    pixel_size = 100  # meters per pixel - adjust to match your data
-    radius_m = 300    # influence radius in meters
-    radius_px = int(radius_m / pixel_size)
-    
-    # Create conversion mask for affected areas only
-    affected_regions = set()
-    conversion_locations = []
-    
-    # Identify all affected neighborhoods
-    for converted_idx in converted_indices:
-        row, col = divmod(converted_idx, shape[1])
-        conversion_locations.append((row, col))
-        
-        # Mark neighborhood for processing
-        r_min = max(0, row - radius_px)
-        r_max = min(shape[0], row + radius_px + 1)
-        c_min = max(0, col - radius_px)
-        c_max = min(shape[1], col + radius_px + 1)
-        
-        affected_regions.add((r_min, r_max, c_min, c_max))
-    
-    # Merge overlapping regions for efficiency
-    merged_regions = merge_overlapping_regions(affected_regions)
-    
-    # Only copy baseline if we actually need to modify it
-    updated_landscape = baseline_landscape.copy()
-    
-    # Optional: Print debug info occasionally (every 100th call)
-    # print(f"  Fast landscape: processing {len(merged_regions)} regions around {len(converted_indices)} conversions")
-    
-    # Process each affected region
-    for region_bounds in merged_regions:
-        r_min, r_max, c_min, c_max = region_bounds
-        
-        # Extract region
-        region_shape = (r_max - r_min, c_max - c_min)
-        
-        # Find conversions within this region
-        region_conversions = []
-        for conv_row, conv_col in conversion_locations:
-            if r_min <= conv_row < r_max and c_min <= conv_col < c_max:
-                # Convert to region-local coordinates
-                local_row = conv_row - r_min
-                local_col = conv_col - c_min
-                region_conversions.append((local_row, local_col))
-        
-        if not region_conversions:
-            continue
-        
-        # Approximate landscape improvement for this region
-        region_landscape_change = approximate_region_landscape_change(
-            region_conversions, region_shape, radius_px
-        )
-        
-        # Apply changes to the corresponding area in the full landscape
-        updated_landscape[r_min:r_max, c_min:c_max] += region_landscape_change
+    # Use full recalculation with compute_sn_dens for accuracy
+    updated_landscape = recalculate_landscape_anomaly_with_conversions(
+        initial_conditions, conversion_mask_2d
+    )
     
     return updated_landscape
-
-
-def merge_overlapping_regions(regions):
-    """
-    Merge overlapping rectangular regions to minimize redundant processing.
-    """
-    if not regions:
-        return []
-    
-    # Convert set to list and sort
-    region_list = list(regions)
-    region_list.sort()
-    
-    merged = []
-    current = region_list[0]
-    
-    for next_region in region_list[1:]:
-        # Check if regions overlap
-        r_min1, r_max1, c_min1, c_max1 = current
-        r_min2, r_max2, c_min2, c_max2 = next_region
-        
-        # Check for overlap
-        if (r_max1 >= r_min2 and r_min1 <= r_max2 and 
-            c_max1 >= c_min2 and c_min1 <= c_max2):
-            # Merge regions
-            current = (
-                min(r_min1, r_min2),
-                max(r_max1, r_max2),
-                min(c_min1, c_min2),
-                max(c_max1, c_max2)
-            )
-        else:
-            # No overlap, add current to merged list
-            merged.append(current)
-            current = next_region
-    
-    merged.append(current)
-    return merged
-
-
-def approximate_region_landscape_change(conversions, region_shape, radius_px):
-    """
-    Approximate landscape change within a region using mathematical models.
-    No compute_sn_dens needed - pure mathematical approximation.
-    """
-    # Create conversion mask for this region
-    conversion_mask = np.zeros(region_shape, dtype=np.float32)
-    for row, col in conversions:
-        if 0 <= row < region_shape[0] and 0 <= col < region_shape[1]:
-            conversion_mask[row, col] = 1.0
-    
-    # Create circular influence kernel
-    y, x = np.ogrid[-radius_px:radius_px+1, -radius_px:radius_px+1]
-    kernel = ((x**2 + y**2) <= radius_px**2).astype(np.float32)
-    
-    # Distance-weighted kernel (closer pixels have more influence)
-    distances = np.sqrt(x**2 + y**2)
-    distances[distances == 0] = 1  # Avoid division by zero
-    kernel = kernel / (1 + distances * 0.1)  # Gradual distance decay
-    kernel = kernel / np.sum(kernel)  # Normalize
-    
-    # Apply convolution to estimate landscape density improvement
-    from scipy.ndimage import convolve
-    density_improvement = convolve(conversion_mask, kernel, mode='constant', cval=0.0)
-    
-    # Convert density improvement to anomaly change
-    # Density increase = anomaly decrease (improvement)
-    anomaly_improvement = -density_improvement
-    
-    # Scale the effect based on conversion effectiveness
-    # This parameter can be tuned based on validation against full calculations
-    effect_strength = 0.15  # Adjust based on your data
-    
-    return effect_strength * anomaly_improvement
-
 
 def recalculate_landscape_anomaly_with_conversions(initial_conditions, conversion_mask_2d):
     """
     Efficiently recalculate landscape anomaly after applying conversion actions.
     Converts pixels to focal classes and recalculates landscape density.
-    
+
     Args:
         initial_conditions: Dict with LULC data and focal classes
         conversion_mask_2d: 2D boolean mask of pixels to convert
-        
+
     Returns:
         numpy.ndarray: Updated landscape anomaly values
     """
-    import tempfile
-    import os as temp_os
-    
+    import numpy as np
+
     # Get original landscape LULC data and conversion info
-    lulc_data = initial_conditions['landscape_lulc_data'].copy()
-    focal_classes = initial_conditions['landscape_focal_classes']
-    lulc_meta = initial_conditions['landscape_lulc_meta'].copy()
-    
+    lulc_data = initial_conditions["landscape_lulc_data"].copy()
+    focal_classes = initial_conditions["landscape_focal_classes"]
+    lulc_meta = initial_conditions["landscape_lulc_meta"]
+
     # Apply conversions: convert pixels to a focal class (use first focal class)
-    # In future, could use different conversion rules or random selection from focal classes
-    target_lulc_value = focal_classes[0]  # Convert to first focal class (e.g., forest)
+    target_lulc_value = focal_classes[0]
     lulc_data[conversion_mask_2d] = target_lulc_value
-    
-    # Fix metadata to ensure proper rasterio compatibility
-    lulc_meta.update({
-        'width': int(lulc_data.shape[1]),
-        'height': int(lulc_data.shape[0]),
-        'count': 1,
-        'dtype': lulc_data.dtype
-    })
-    
-    # Create temporary file with modified LULC
-    with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp_file:
-        temp_lulc_path = tmp_file.name
-    
-    try:
-        # Write modified LULC to temporary file
-        with rio.open(temp_lulc_path, 'w', **lulc_meta) as tmp_dst:
-            tmp_dst.write(lulc_data, 1)
-        
-        # Recalculate landscape density with modified LULC
-        landscape_density, _ = compute_sn_dens(temp_lulc_path, focal_classes, radius_m=300)
-        
-        # Convert density to anomaly (higher density = lower anomaly)
-        landscape_anomaly = 1.0 - landscape_density
-        
-        # Handle NaN values
-        landscape_anomaly = np.nan_to_num(landscape_anomaly, nan=0.0)
-        
-        return landscape_anomaly
-        
-    finally:
-        # Clean up temporary file
-        if temp_os.path.exists(temp_lulc_path):
-            temp_os.unlink(temp_lulc_path)
+
+    # Recalculate landscape density using the in memory array
+    landscape_density = compute_sn_dens_array(
+        lulc_data,
+        nodata=lulc_meta.get("nodata"),
+        res=lulc_meta["transform"][0],
+        focal_classes=focal_classes,
+        radius_m=300
+    )
+
+    # Convert density to anomaly (higher density = lower anomaly)
+    landscape_anomaly = 1.0 - landscape_density
+
+    # Handle NaN values
+    landscape_anomaly = np.nan_to_num(landscape_anomaly, nan=0.0)
+
+    return landscape_anomaly
 
 def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_params=None):
     """
@@ -444,30 +216,11 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     Returns:
         dict: Updated objective values after restoration effects
     """
-    if effect_params is None:
-        # Default values if no effect_params provided
-        effect_params = {
-            'abiotic_effect': 0.01,       # Improvement for abiotic anomaly
-            'biotic_effect': 0.01,        # Improvement for biotic anomaly
-            #'landscape_effect': 0.01,     # Improvement for landscape anomaly
-            'neighbor_radius': 1,            # Effect radius in cells (fixed)
-            'neighbor_effect_decay': 0.0,     # Effect strength for neighbors (fixed)
-            'anomaly_weight_shape': 'exponential', # Shape of anomaly-dependent weighting
-            'anomaly_weight_scale': 1.0     # Scale parameter for weight decay
-        }
-    
-    # Set fixed values for spatial parameters (not scenario parameters)
-    effect_params = effect_params.copy()
-    effect_params['neighbor_radius'] = 1  # Fixed value
-    effect_params['neighbor_effect_decay'] = 0.0  # Fixed value
+    assert effect_params is not None
     
     # Get separate improvement effects for each anomaly type
-    abiotic_effect = effect_params.get('abiotic_effect', 0.01)
-    biotic_effect = effect_params.get('biotic_effect', 0.01)
-    #landscape_effect = effect_params.get('landscape_effect', 0.01)
-    effect_params['abiotic_improvement'] = abiotic_effect
-    effect_params['biotic_improvement'] = biotic_effect
-    #effect_params['landscape_improvement'] = landscape_effect
+    abiotic_effect = effect_params['abiotic_effect']
+    biotic_effect = effect_params['biotic_effect']
     
     # Ensure neighbor_radius is integer for array indexing
     effect_params['neighbor_radius'] = int(round(effect_params['neighbor_radius']))
@@ -514,12 +267,12 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
         if objective in ['abiotic_anomaly', 'biotic_anomaly']:
             # Restoration affects abiotic and biotic anomalies
             action_mask = restoration_mask_2d
-            improvement_key = f'{objective.split("_")[0]}_improvement'
+            improvement_key = f'{objective.split("_")[0]}_effect'
         elif objective == 'landscape_anomaly':
             # Conversion affects landscape anomaly
             if np.any(conversion_mask_2d):
                 # Use fast selective approximation (combines approximation + selective processing)
-                updated_landscape = fast_selective_landscape_approximation(
+                updated_landscape = conversion_mask(
                     convert_vars, initial_conditions
                 )
                 updated_conditions[objective] = updated_landscape
@@ -548,12 +301,13 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
             )
             
             # Apply weighted improvement: improvementᵢ = improvement × w(a₀ᵢ)
-            weighted_improvements = improvement * improvement_weights
+            #weighted_improvements = improvement * improvement_weights
             
             # Apply improvement:
-            updated_values[action_mask] = (
-                original_values[action_mask] + weighted_improvements
-            )
+            #updated_values[action_mask] = (
+            #    original_values[action_mask] + weighted_improvements
+            #)
+            updated_values[action_mask] = baseline_anomalies + (effect_params[improvement_key] * improvement_weights)
 
             # Neighbor effects
             if effect_params['neighbor_radius'] > 0:
@@ -612,34 +366,7 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
             total_cost += np.sum(base_cost[conversion_mask_2d])
         updated_conditions['implementation_cost'] = total_cost
     
-    # Population proximity (only if proximity objective is being used)
-    # Proximity is a fixed spatial property - no restoration improvement effect
-    if 'population_proximity' in initial_conditions:
-        proximity_map = initial_conditions['population_proximity'].copy()
-        total_distance = 0.0
-        total_pixels = 0
-        if np.any(restoration_mask_2d):
-            total_distance += np.sum(proximity_map[restoration_mask_2d])
-            total_pixels += np.sum(restoration_mask_2d)
-        if np.any(conversion_mask_2d):
-            total_distance += np.sum(proximity_map[conversion_mask_2d])
-            total_pixels += np.sum(conversion_mask_2d)
-        avg_distance = total_distance / total_pixels if total_pixels > 0 else 0.0
-        updated_conditions['population_proximity'] = avg_distance
-    
     return updated_conditions
-
-# =============================================================================
-# CUSTOM SAMPLING OPERATORS
-# =============================================================================
-
-
-
-
-
-
-
-
 
 # =============================================================================
 # OPTIMIZATION PROBLEM DEFINITION
@@ -655,24 +382,10 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         scenario_params: Dict with scenario parameters
         n_samples: Number of sample solutions to test
     """
-    print("\n" + "="*70)
-    print("OPTIMIZATION DIAGNOSTICS")
-    print("="*70)
+    print("\n=== Quick problem diagnostics ===")
     
     # Create problem instance
     problem = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for diagnostics
-    
-    #print(f"\nPROBLEM SETUP:")
-    #print(f"   - Decision variables: {problem.n_var} total ({problem.n_pixels} restore + {problem.n_pixels} convert)")
-    #print(f"   - Objectives: {problem.n_obj} ({problem.objective_names})")
-    #print(f"   - Constraints: {problem.n_constr}")
-    #print(f"   - Max restored pixels: {problem.max_restored_pixels}")
-    #print(f"   - Restoration fraction: {scenario_params['max_restoration_fraction']*100:.1f}%")
-    #print(f"   - Effect parameters:")
-    #if 'improvement_effect' in scenario_params:
-    #    print(f"     improvement_effect: {scenario_params['improvement_effect']:.4f} (applied to all anomaly types)")
-    #print(f"     neighbor_radius: 1 (fixed)")
-    #print(f"     neighbor_effect_decay: 0.5 (fixed)")
     
     # Check baseline objectives
     #print(f"\nBASELINE OBJECTIVES (no restoration):")
@@ -680,25 +393,13 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     out_none = {}
     problem._evaluate(x_none, out_none)
     
-    # for i, obj_name in enumerate(problem.objective_names):
-    #     if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
-    #         # Display actual anomaly sum (reverse the negative)
-    #         actual_sum = -out_none['F'][i]
-    #         print(f"   - {obj_name}: sum={actual_sum:.4e} (objective={out_none['F'][i]:.4e})")
-    #     else:
-    #         print(f"   - {obj_name}: {out_none['F'][i]:.4e}")
-    #print(f"   - Constraint violation: {out_none['G'][0]:.4e} (should be ≤ 0)")
-    
-    # Test sample solutions
-    #print(f"\n3. SAMPLE SOLUTIONS (random restoration patterns):")
-    
     feasible_count = 0
     infeasible_count = 0
     
     for i in range(n_samples):
         # Generate random solution at max allowed restoration
         x = np.zeros(problem.n_var, dtype=int)
-        n_restore = problem.max_restored_pixels
+        n_restore = problem.max_action_pixels
         if n_restore > 0 and n_restore <= problem.n_pixels:
             # Only select from restoration decisions (first half of decision vector)
             restore_indices = np.random.permutation(problem.n_pixels)[:n_restore]
@@ -724,10 +425,8 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
                     baseline_sum = -out_none['F'][j]
                     restored_sum = -out['F'][j]
                     improvement = ((restored_sum - baseline_sum) / abs(baseline_sum) * 100) if baseline_sum != 0 else 0
-                    #print(f"       {obj_name}: sum={restored_sum:.4e} (baseline={baseline_sum:.4e}, Δ {improvement:+.2f}%)")
                 else:
                     improvement = ((out_none['F'][j] - out['F'][j]) / out_none['F'][j] * 100) if out_none['F'][j] != 0 else 0
-                    #print(f"       {obj_name}: {out['F'][j]:.4e} (Δ {improvement:+.2f}%)")
     
     print(f"\n   Summary: {feasible_count}/{n_samples} feasible, {infeasible_count}/{n_samples} infeasible")
     
@@ -735,16 +434,10 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         print(f"   ✓ Feasible solutions exist, Objectives show improvement with restoration")
     else:
         print(f"   ✗ WARNING: No feasible solutions found in {n_samples} samples!")
-        print(f"   → Check if max_restored_pixels constraint is too restrictive")
+        print(f"   → Check if max_action_pixels constraint is too restrictive")
     
     # Check for common issues
     issues = []
-    
-    if problem.max_restored_pixels == 0:
-        issues.append("   ✗ Max restored pixels is 0 - no restoration possible!")
-    
-    if problem.max_restored_pixels > problem.n_pixels:
-        issues.append(f"   ✗ Max restored pixels ({problem.max_restored_pixels}) > available pixels ({problem.n_pixels})")
     
     # Check if objectives are all zero or constant
     if out_none['F'][0] == 0:
@@ -783,93 +476,15 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
             
             print(f"   {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {total_improvement/len(out['F'])*100:>6.2f}%")
     
-    print(f"\nINITIAL DATA SPATIAL CORRELATIONS:")
-    anomaly_objs = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly'] 
-                if obj in initial_conditions]
-    for i in range(len(anomaly_objs)):
-        for j in range(i+1, len(anomaly_objs)):
-        # Correlation of pixel values (only eligible pixels)
-            eligible_mask = initial_conditions['eligible_mask']
-            
-            # Ensure both data and mask are 2D and have the same shape
-            data1_full = initial_conditions[anomaly_objs[i]]
-            data2_full = initial_conditions[anomaly_objs[j]]
-            
-            # Apply mask to extract eligible pixels only
-            data1 = data1_full[eligible_mask]
-            data2 = data2_full[eligible_mask]
-            
-            if len(data1) > 0 and len(data2) > 0:
-                corr = np.corrcoef(data1, data2)[0, 1]
-                print(f"   {anomaly_objs[i]} vs {anomaly_objs[j]}: {corr:.4f}")
-            else:
-                print(f"   {anomaly_objs[i]} vs {anomaly_objs[j]}: No eligible pixels")
-
-    # Check if improvement pushes values above threshold
-    print(f"\nANOMALY VALUE DISTRIBUTIONS (threshold diagnostic):")
-    print(f"   Testing with {problem.max_restored_pixels} restored pixels...")
-    
-    # Test with max restoration
-    x_test = np.zeros(problem.n_var, dtype=int)
-    if problem.max_restored_pixels > 0:
-        # Only select from restoration decisions (first half of decision vector)
-        restore_indices = np.random.permutation(problem.n_pixels)[:problem.max_restored_pixels]
-        x_test[restore_indices] = 1
-    
-    # Get updated conditions after restoration (pass both restoration and conversion decisions)
-    x_test_restore = x_test[:problem.n_pixels]
-    x_test_convert = x_test[problem.n_pixels:]
-    updated = restoration_effect(x_test_restore, x_test_convert, initial_conditions)
-    
-    eligible_mask = initial_conditions['eligible_mask']
-    
-    for obj_name in anomaly_objs:
-        before = initial_conditions[obj_name][eligible_mask]
-        after = updated[obj_name][eligible_mask]
-        
-        # For restored pixels only
-        restored_2d = np.zeros(initial_conditions['shape'], dtype=bool)
-        # Use only restoration decisions from the test vector
-        rows, cols = np.divmod(initial_conditions['eligible_indices'][x_test_restore == 1], initial_conditions['shape'][1])
-        restored_2d[rows, cols] = True
-        restored_mask = restored_2d[eligible_mask]
-        
-        before_restored = before[restored_mask]
-        after_restored = after[restored_mask]
-        
-        threshold = 0.0
-        
-        print(f"\n   {obj_name}:")
-        print(f"      ALL eligible pixels:")
-        print(f"         Before: min={np.min(before):.3f}, max={np.max(before):.3f}, mean={np.mean(before):.3f}")
-        print(f"         % above threshold ({threshold}): {100*np.sum(before > threshold)/len(before):.1f}%")
-        
-        print(f"      RESTORED pixels only (n={len(before_restored)}):")
-        print(f"         Before: min={np.min(before_restored):.3f}, max={np.max(before_restored):.3f}, mean={np.mean(before_restored):.3f}")
-        print(f"         After:  min={np.min(after_restored):.3f}, max={np.max(after_restored):.3f}, mean={np.mean(after_restored):.3f}")
-        print(f"         % above threshold BEFORE: {100*np.sum(before_restored > threshold)/len(before_restored):.1f}%")
-        print(f"         % above threshold AFTER:  {100*np.sum(after_restored > threshold)/len(after_restored):.1f}%")
-
-    print("\n" + "="*70)
-    print("END DIAGNOSTICS")
-    print("="*70 + "\n")
-    
     return problem
 
 # =============================================================================
-# OPTIMIZATION PROBLEM DEFINITION
+# PROBLEM DEFINITION
 # =============================================================================
 
 class RestorationProblem(ElementwiseProblem):
     """
     Multi-objective restoration optimization problem.
-    
-    Objectives (all to minimize, depending on what's loaded):
-    - Abiotic condition anomaly
-    - Biotic condition anomaly
-    - Landscape condition anomaly  
-    - Implementation cost
-    - Population proximity (average distance to population centers)
     """
     
     def __init__(self, initial_conditions, scenario_params, n_jobs=None):
@@ -883,6 +498,12 @@ class RestorationProblem(ElementwiseProblem):
         """
         self.initial_conditions = initial_conditions
         self.scenario_params = scenario_params
+        #self._eval_t0 = perf_counter()
+        self._t0_wall = None
+        self._eval_n = 0
+        #self._eval_print_every = 10   # tune, 1, 5, 10, 25
+        self._slow_eval_seconds = 10.0   # print only if an eval exceeds this
+        self._proc = None
         
         # Extract effect parameters from scenario_params (excluding fixed spatial parameters)
         abiotic_effect = scenario_params.get('abiotic_effect', 0.01)
@@ -891,12 +512,8 @@ class RestorationProblem(ElementwiseProblem):
         self.effect_params = {
             'abiotic_effect': abiotic_effect,
             'biotic_effect': biotic_effect,
-            #'landscape_effect': landscape_effect,
-            'abiotic_improvement': abiotic_effect,
-            'biotic_improvement': biotic_effect,
-            #'landscape_improvement': landscape_effect,
-            'neighbor_radius': 1,  # Fixed value
-            'neighbor_effect_decay': 0.5  # Fixed value
+            'neighbor_radius': 3,  # Fixed value
+            'neighbor_effect_decay': 0.2  # Fixed value
         }
         
         # Determine which objectives are available
@@ -909,8 +526,6 @@ class RestorationProblem(ElementwiseProblem):
             self.objective_names.append('landscape_anomaly')
         if 'implementation_cost' in initial_conditions:
             self.objective_names.append('implementation_cost')
-        if 'population_proximity' in initial_conditions:
-            self.objective_names.append('population_proximity')
         
         n_objectives = len(self.objective_names)
         if n_objectives == 0:
@@ -920,8 +535,8 @@ class RestorationProblem(ElementwiseProblem):
         n_conversion_pixels = initial_conditions['n_conversion_pixels']
         max_restoration_fraction = scenario_params['max_restoration_fraction']
         
-        # Calculate max restored pixels based on restoration eligible pixels
-        self.max_restored_pixels = int(max_restoration_fraction * n_restoration_pixels)
+        # Calculate max action pixels based on restoration eligible pixels
+        self.max_action_pixels = int(max_restoration_fraction * n_restoration_pixels)
         
         # Store pixel counts for splitting decision vector
         self.n_restoration_pixels = n_restoration_pixels
@@ -977,7 +592,12 @@ class RestorationProblem(ElementwiseProblem):
                 type_var=int,                # Integer (binary) variables
                 elementwise=True
             )
-    
+    def _mem_gb(self):
+        if self._proc is None:
+            self._proc = psutil.Process(os.getpid())
+        rss = self._proc.memory_info().rss
+        return rss / (1024**3)
+
     def _evaluate(self, x, out, *args, **kwargs):
         """
         Evaluate a solution (restoration plan).
@@ -992,10 +612,19 @@ class RestorationProblem(ElementwiseProblem):
         if not hasattr(self, '_debug_count'):
             self._debug_count = 0
         self._debug_count += 1
-        
+        self._eval_n += 1
+
+        if self._t0_wall is None:
+            self._t0_wall = time()
+
+        t_eval0 = time()
+        mem0 = self._mem_gb()
+
         # Split decision vector into restore and convert actions
+        t0 = time()
         x_restore = x[:self.n_restoration_pixels]
-        x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels] 
+        x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
+        t_split = time() - t0
         
         # Enable conversion actions now that we have fast landscape calculation
         if 'landscape_anomaly' not in self.initial_conditions:
@@ -1007,13 +636,42 @@ class RestorationProblem(ElementwiseProblem):
         n_converted = np.sum(x_convert)
         n_total_actions = n_restored + n_converted
         
-        # Debug: Track action patterns for first few evaluations
-        #if self._debug_count <= 10:
-            #print(f"DEBUG Eval {self._debug_count}: {n_restored} restore + {n_converted} convert = {n_total_actions} total")
-        
         # Apply restoration effects to both restoration and conversion decisions
+        t0 = time()
         updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
+        t_effect = time() - t0
         
+        # inside RestorationProblem._evaluate, after updated_conditions is computed
+
+        a0 = self.initial_conditions["abiotic_anomaly"]
+        b0 = self.initial_conditions["biotic_anomaly"]
+        l0 = self.initial_conditions["landscape_anomaly"] if "landscape_anomaly" in self.initial_conditions else None
+
+        a1 = updated_conditions["abiotic_anomaly"]
+        b1 = updated_conditions["biotic_anomaly"]
+        l1 = updated_conditions["landscape_anomaly"] if "landscape_anomaly" in updated_conditions else None
+
+        # masks for acted pixels
+        shape = self.initial_conditions["shape"]
+        rest_mask = np.zeros(shape, dtype=bool)
+        conv_mask = np.zeros(shape, dtype=bool)
+
+        if np.any(x_restore):
+            idx = self.initial_conditions["restoration_eligible_indices"][x_restore == 1]
+            rr, cc = np.divmod(idx, shape[1])
+            rest_mask[rr, cc] = True
+
+        if np.any(x_convert):
+            idx = self.initial_conditions["conversion_eligible_indices"][x_convert == 1]
+            rr, cc = np.divmod(idx, shape[1])
+            conv_mask[rr, cc] = True
+
+        cost = updated_conditions.get("implementation_cost", np.nan)
+
+        n_rest = int(np.sum(x_restore))
+        n_conv = int(np.sum(x_convert))
+
+        t0 = time()
         # Calculate objective values (all to minimize) - only for available objectives
         objectives = []
         
@@ -1022,32 +680,29 @@ class RestorationProblem(ElementwiseProblem):
                 # Anomaly objectives: MINIMIZE negative sum (equivalent to MAXIMIZE sum)
                 # Higher anomalies are better, so we want to maximize the sum
                 # NSGA-II minimizes, so we minimize the negative
-                threshold = 0.0  # or different per objective
-                pixels_above = np.sum(updated_conditions[obj_name] > threshold)
-                obj_value = -pixels_above  # Maximize count above threshold
                 
-                # Debug abiotic/biotic anomaly if needed
-                #if self._debug_count <= 3 and obj_name == 'abiotic_anomaly':
-                #    print(f"  {obj_name}: pixels_above={pixels_above}, obj_value={obj_value}")
+                #previous: threshold objective
+                #threshold = 0.0  # or different per objective
+                #pixels_above = np.sum(updated_conditions[obj_name] > threshold)
+                #obj_value = -pixels_above  # Maximize count above threshold
+                
+                #now, trying a different construction which is to maximise improvement relative to the baseline
+                base = self.initial_conditions[obj_name]
+                mask = self.initial_conditions["restoration_eligible_mask"]
+                obj_value = -np.sum((updated_conditions[obj_name] - base)[mask])
                 
             elif obj_name == 'landscape_anomaly':
                 # Landscape objective: MINIMIZE the actual sum of landscape anomalies
                 # Use the actual values, not just count above threshold
-                landscape_vals = updated_conditions[obj_name]
-                obj_value = np.sum(landscape_vals)  # Minimize total landscape impact
-                
-                # Debug landscape anomaly specifically
-                #if self._debug_count <= 10:
-                #    unique_vals = np.unique(landscape_vals)
-                #    print(f"  Landscape anomaly: sum={obj_value:.6f}, obj_value={obj_value:.6f}")
-                #    print(f"  Landscape range: min={landscape_vals.min():.6f}, max={landscape_vals.max():.6f}")
-                #    print(f"  Landscape unique values: {len(unique_vals)} unique (showing first 5: {unique_vals[:5]})")
-
+                #landscape_vals = updated_conditions[obj_name]
+                #obj_value = np.sum(landscape_vals)  # Minimize total landscape impact
+                l0 = self.initial_conditions["landscape_anomaly"]
+                l1 = updated_conditions["landscape_anomaly"]
+                eps = 1e-12
+                obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
+ 
             elif obj_name == 'implementation_cost':
                 # Cost objective: minimize total cost (lower is better)
-                obj_value = updated_conditions[obj_name]
-            elif obj_name == 'population_proximity':
-                # Proximity objective: minimize average distance to population centers
                 obj_value = updated_conditions[obj_name]
             else:
                 raise ValueError(f"Unknown objective: {obj_name}")
@@ -1057,10 +712,11 @@ class RestorationProblem(ElementwiseProblem):
         out["F"] = objectives
         
         # Constraint: total number of pixels with actions (restore + convert)
-        out["G"] = [abs(n_total_actions - self.max_restored_pixels)]  # Should be 0 due to exact count enforcement
+        out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
+
 
 # =============================================================================
-# OPTIMIZATION EXECUTION
+# EXECUTION
 # =============================================================================
 
 class HVCallback:
@@ -1086,6 +742,12 @@ class HVCallback:
         self.best_hv = 0.0
         self.no_improvement_count = 0
         self.converged = False
+        
+        # Population statistics tracking
+        self.f_mean_history = []  # Mean of F per generation
+        self.f_std_history = []   # Std of F per generation
+        self.f_min_history = []   # Min of F per generation  
+        self.f_max_history = []   # Max of F per generation
     
     def __call__(self, algorithm):
         """
@@ -1098,6 +760,17 @@ class HVCallback:
         if hasattr(algorithm, 'pop') and algorithm.pop is not None:
             F = algorithm.pop.get("F")
             if F is not None and len(F) > 0:
+                # Calculate and store population statistics
+                f_mean = np.mean(F, axis=0)  # Mean per objective
+                f_std = np.std(F, axis=0)    # Std per objective
+                f_min = np.min(F, axis=0)    # Min per objective
+                f_max = np.max(F, axis=0)    # Max per objective
+                
+                self.f_mean_history.append(f_mean.tolist())
+                self.f_std_history.append(f_std.tolist())
+                self.f_min_history.append(f_min.tolist())
+                self.f_max_history.append(f_max.tolist())
+                
                 # Calculate hypervolume
                 try:
                     # Create reference point (worst case for each objective)
@@ -1133,6 +806,132 @@ class HVCallback:
                     if self.verbose and algorithm.n_gen == 1:
                         print(f"   Warning: Hypervolume calculation failed: {e}")
                     self.hv_history.append(0.0)
+
+def run_one(initial_conditions, scenario_params, run_settings):
+    """
+    Thin wrapper around run_single_scenario_optimization.
+    Keeps old behaviour but centralises the call site.
+    """
+    return run_single_scenario_optimization(
+        initial_conditions=initial_conditions,
+        scenario_params=scenario_params,
+        pop_size=run_settings["pop_size"],
+        n_generations=run_settings["n_generations"],
+        save_results=run_settings["save_results"],
+        verbose=run_settings["verbose"],
+        skip_diagnostics=run_settings.get("skip_diagnostics", False),
+        hv_patience=run_settings.get("hv_patience", 15),
+        hv_min_improvement=run_settings.get("hv_min_improvement", 1e-6),
+        n_jobs=run_settings.get("n_jobs", None),
+    )
+
+def run_scenario_batch(
+    initial_conditions,
+    scenario_combinations,
+    run_settings,
+):
+    """
+    Runs scenarios using run_one wrapper.
+    Returns all_results dict keyed by scenario index.
+    """
+
+    all_results = {}
+
+    verbose = run_settings.get("verbose", True)
+
+    if verbose:
+        print("\n=== MULTI SCENARIO OPTIMIZATION ===")
+        print(f"Total scenarios to run: {len(scenario_combinations)}")
+
+    for i, scenario_params in enumerate(scenario_combinations):
+
+        if verbose:
+            print(f"\n--- RUNNING SCENARIO {i+1}/{len(scenario_combinations)} ---")
+
+        result = run_one(
+            initial_conditions=initial_conditions,
+            scenario_params=scenario_params,
+            run_settings=run_settings
+        )
+
+        if result is not None:
+            all_results[i] = result
+
+            if verbose:
+                print(f"✓ Scenario {i} completed: {result['n_solutions']} solutions found")
+        else:
+            if verbose:
+                print(f"✗ Scenario {i} failed")
+
+    return all_results
+
+
+def _filter_initial_conditions_for_return(initial_conditions):
+    """
+    Keeps current behaviour, remove heavy geodataframe from admin_data if present.
+    """
+    initial_conditions_filtered = initial_conditions.copy()
+
+    if (
+        "admin_data" in initial_conditions_filtered
+        and initial_conditions_filtered["admin_data"] is not None
+    ):
+        admin_data_filtered = initial_conditions_filtered["admin_data"].copy()
+        if "gdf" in admin_data_filtered:
+            del admin_data_filtered["gdf"]
+        initial_conditions_filtered["admin_data"] = admin_data_filtered
+
+    return initial_conditions_filtered
+
+def build_combined_results(
+    initial_conditions,
+    all_results,
+    n_samples_per_param=3,
+    random_seed=42,
+    pop_size=50,
+    n_generations=100
+):
+    """
+    Returns the same combined_results structure you currently build.
+    """
+    initial_conditions_filtered = _filter_initial_conditions_for_return(initial_conditions)
+
+    combined_results = {
+        "scenarios": all_results,
+        "n_scenarios_run": len(all_results),
+        "n_scenarios_total": len(expand_scenarios(n_samples_per_param, random_seed)),
+        "scenario_parameters": define_scenario_parameters(),
+        "n_samples_per_param": n_samples_per_param,
+        "random_seed": random_seed,
+        "algorithm_info": {
+            "pop_size": pop_size,
+            "n_generations": n_generations,
+            "timestamp": datetime.now().isoformat()
+        },
+        "initial_conditions": initial_conditions_filtered
+    }
+
+    return combined_results
+
+def finalise_combined_results(combined_results, save_results=True, verbose=True):
+    """
+    Keeps current saving behaviour and conditions.
+    """
+    if not save_results:
+        return
+
+    all_results = combined_results.get("scenarios", {})
+    if not all_results:
+        return
+
+    save_combined_results(combined_results, verbose=verbose)
+
+    save_parameter_summary(
+        output_dir=".",
+        n_samples_per_param=combined_results.get("n_samples_per_param", 3),
+        random_seed=combined_results.get("random_seed", 42),
+        verbose=verbose
+    )
 
 def run_single_scenario_optimization(initial_conditions, scenario_params, pop_size=50, 
                                    n_generations=100, save_results=True, verbose=True, skip_diagnostics=False,
@@ -1173,11 +972,11 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         scenario_params=scenario_params,
         n_jobs=n_jobs
     )
-    
+    import numpy as np
     # Print additional diagnostic information
     if verbose:
         print(f"\nOptimization setup details:")
-        print(f"  Max restored pixels allowed: {problem.max_restored_pixels}")
+        print(f"  Max action pixels allowed: {problem.max_action_pixels}")
         print(f"  Number of objectives: {len(problem.objective_names)}")
         
         # Sample objective values without restoration
@@ -1188,8 +987,8 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 sample_obj_str += f"{obj_name}={val:.2e}, "
         print(sample_obj_str.rstrip(", "))
         
-        if problem.max_restored_pixels == 0:
-            print("  WARNING: max_restored_pixels is 0! No restoration possible.")
+        if problem.max_action_pixels == 0:
+            print("  WARNING: max_action_pixels is 0! No actions possible.")
         
         # Only run diagnostics if not skipped
         if not skip_diagnostics:
@@ -1206,12 +1005,12 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
     # Use consolidated operators for all scenarios
     sampling = AdaptiveSampling(
         initial_conditions, 
-        problem.max_restored_pixels, 
+        problem.max_action_pixels, 
         scenario_params
     )
     repair = AdaptiveRepair(
         initial_conditions, 
-        problem.max_restored_pixels, 
+        problem.max_action_pixels, 
         scenario_params, 
         scores
     )
@@ -1224,14 +1023,14 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             strategy_desc.append(f"clustering({clustering_strength})")
         if not strategy_desc:
             strategy_desc.append("random with score-based repair")
-        print(f"  Using adaptive operators: {', '.join(strategy_desc)}")
+        print(f"Using adaptive operators: {', '.join(strategy_desc)}")
     
     # Create optimization algorithm
     algorithm = NSGA2(
         pop_size=pop_size,
         sampling=sampling,                # Custom or standard sampling
         crossover=HUX(),                  # Half-uniform crossover
-        mutation=BitflipMutation(prob=0.05),       # Bit-flip mutation
+        mutation=BitflipMutation(prob=0.1), #increased from 0.05 5.02.2026      # Bit-flip mutation
         repair=repair                     # Custom repair to maintain properties
     )
     
@@ -1262,12 +1061,14 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                       f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min")
             
             # Stop optimization if hypervolume has converged
-            if self.hv_callback.converged:
-                algorithm.termination.force_termination = True
+            # TEMPORARILY DISABLED: Hypervolume-based early stopping
+            # if self.hv_callback.converged:
+            #     algorithm.termination.force_termination = True
     
     # Run optimization
     if verbose:
-        print("Starting optimization...")
+        from datetime import datetime
+        print(f"Starting optimisation at {datetime.now():%H:%M}...")
     
     try:
         callback = ProgressCallback(verbose=verbose)
@@ -1280,7 +1081,6 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             callback=callback
         )
         
-        # Debug: Check what's in the result
         if verbose:
             print(f"\nDEBUG - Result object:")
             print(f"  result is None: {result is None}")
@@ -1318,7 +1118,8 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 if callback.hv_callback.hv_history:
                     print(f"   Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
                 print(f"   Found {len(result.F)} Pareto-optimal solutions")
-            
+                import numpy as np
+
             # Prepare results
             # Create a copy of initial_conditions without the geodataframe to avoid large pickle files
             initial_conditions_filtered = initial_conditions.copy()
@@ -1341,14 +1142,22 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                         'population_size': len(pop_F)
                     }  
             
+            # Analyze decision patterns
+            decision_analysis = analyze_decision_patterns(result.X, initial_conditions)
+            decision_analysis['constraints']['restoration_budget_fraction'] = scenario_params.get('max_restoration_fraction', 0.0)
+            
             optimization_results = {
                 'scenario_params': scenario_params,
                 'objective_names' : problem.objective_names,
                 'objectives': result.F,           # Objective values
                 'decisions': result.X,            # Decision variables (restoration plans)
+                'decision_analysis': decision_analysis,  # Analysis of restore/convert patterns
                 'n_solutions': len(result.F),
                 'problem_info': {
-                    'n_pixels': initial_conditions['n_pixels']
+                    'n_pixels': initial_conditions['n_pixels'],
+                    'n_restoration_pixels': initial_conditions.get('n_restoration_pixels', 0),
+                    'n_conversion_pixels': initial_conditions.get('n_conversion_pixels', 0),
+                    'max_action_pixels': problem.max_action_pixels
                 },
                 'algorithm_info': {
                     'pop_size': pop_size,
@@ -1359,6 +1168,12 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                     'convergence_reason': 'hypervolume_plateau' if callback.hv_callback.converged else 'generation_limit',
                     'hypervolume_history': callback.hv_callback.hv_history,
                     'final_hypervolume': callback.hv_callback.hv_history[-1] if callback.hv_callback.hv_history else None,
+                    'population_statistics': {
+                        'f_mean_history': callback.hv_callback.f_mean_history,
+                        'f_std_history': callback.hv_callback.f_std_history,
+                        'f_min_history': callback.hv_callback.f_min_history,
+                        'f_max_history': callback.hv_callback.f_max_history
+                    },
                     'hv_patience': hv_patience,
                     'hv_min_improvement': hv_min_improvement,
                     'sampling_method': 'adaptive',
@@ -1388,100 +1203,53 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             print(f"✗ Error during optimization: {e}")
         return None
 
-def run_all_scenarios_optimization(initial_conditions, n_samples_per_param=3, pop_size=50, 
-                                 n_generations=100, save_results=True, verbose=True, random_seed=42):
-    """
-    Run optimization for all scenario combinations using sampled parameter values.
-    
-    Args:
-        initial_conditions: Initial objective conditions
-        n_samples_per_param: Number of samples to draw from each continuous parameter
-        pop_size: Population size for NSGA-II
-        n_generations: Number of optimization generations
-        save_results: Whether to save results to files
-        verbose: Print progress information
-        random_seed: Random seed for reproducible parameter sampling
-        
-    Returns:
-        dict: Combined results from all scenarios
-    """
-    scenario_combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
-    
-    if verbose:
-        print(f"\n=== MULTI-SCENARIO OPTIMIZATION ===")
-        print(f"Total scenarios to run: {len(scenario_combinations)}")
-        for i, params in enumerate(scenario_combinations):
-            print(f"  Scenario {i}: {params}")
-        print()
-    
-    all_results = {}
-    
-    # Run optimization for each scenario
-    for i, scenario_params in enumerate(scenario_combinations):
-        if verbose:
-            print(f"\n--- RUNNING SCENARIO {i+1}/{len(scenario_combinations)} ---")
-            print(f"Parameters for this scenario:")
-            for param_name, param_value in scenario_params.items():
-                if isinstance(param_value, float):
-                    print(f"  {param_name}: {param_value:.4f}")
-                else:
-                    print(f"  {param_name}: {param_value}")
-        
-        scenario_results = run_single_scenario_optimization(
-            initial_conditions=initial_conditions,
-            scenario_params=scenario_params,
-            pop_size=pop_size,
-            n_generations=n_generations,
-            save_results=False,  # Don't save individual files when running all scenarios
-            verbose=verbose,
-            skip_diagnostics=True  # Skip diagnostics for multi-scenario runs
-        )
-        
-        if scenario_results is not None:
-            all_results[i] = scenario_results
-            if verbose:
-                n_solutions = scenario_results['n_solutions']
-                print(f"✓ Scenario {i} completed: {n_solutions} solutions found")
-        else:
-            if verbose:
-                print(f"✗ Scenario {i} failed")
-    
-    # Prepare combined results
-    # Create a copy of initial_conditions without the geodataframe to avoid large pickle files
-    initial_conditions_filtered = initial_conditions.copy()
-    if 'admin_data' in initial_conditions_filtered and initial_conditions_filtered['admin_data'] is not None:
-        admin_data_filtered = initial_conditions_filtered['admin_data'].copy()
-        # Remove the geodataframe but keep other admin data
-        if 'gdf' in admin_data_filtered:
-            del admin_data_filtered['gdf']
-        initial_conditions_filtered['admin_data'] = admin_data_filtered
-    
-    combined_results = {
-        'scenarios': all_results,
-        'n_scenarios_run': len(all_results),
-        'n_scenarios_total': len(scenario_combinations),
-        'scenario_parameters': define_scenario_parameters(),
-        'n_samples_per_param': n_samples_per_param,
-        'random_seed': random_seed,
-        'algorithm_info': {
-            'pop_size': pop_size,
-            'n_generations': n_generations,
-            'timestamp': datetime.now().isoformat()
-        },
-        'initial_conditions': initial_conditions_filtered
+def run_all_scenarios_optimization(
+    initial_conditions,
+    n_samples_per_param=3,
+    pop_size=50,
+    n_generations=100,
+    save_results=True,
+    verbose=True,
+    random_seed=42,
+    hv_patience=15,
+    hv_min_improvement=1e-6,
+    n_jobs=None
+):
+    scenario_combinations = expand_scenarios(n_samples_per_param=n_samples_per_param, random_seed=random_seed)
+
+    run_settings = {
+        "pop_size": pop_size,
+        "n_generations": n_generations,
+        "save_results": False,          # ← keep old multi scenario behaviour
+        "verbose": verbose,
+        "skip_diagnostics": True,
+        "hv_patience": hv_patience,
+        "hv_min_improvement": hv_min_improvement,
+        "n_jobs": n_jobs,
     }
-    
-    # Save combined results
-    if save_results and all_results:
-        save_combined_results(combined_results, verbose=verbose)
-        # Also save parameter summary for reference
-        save_parameter_summary(output_dir=".", n_samples_per_param=n_samples_per_param, 
-                             random_seed=random_seed, verbose=verbose)
-    
+
+    all_results = run_scenario_batch(
+        initial_conditions=initial_conditions,
+        scenario_combinations=scenario_combinations,
+        run_settings=run_settings,
+    )
+
+    combined_results = build_combined_results(
+        initial_conditions=initial_conditions,
+        all_results=all_results,
+        scenario_combinations=scenario_combinations,
+        n_samples_per_param=n_samples_per_param,
+        random_seed=random_seed,
+        pop_size=pop_size,
+        n_generations=n_generations
+    )
+
     if verbose:
-        print(f"\n=== ALL SCENARIOS COMPLETE ===")
+        print("\n=== ALL SCENARIOS COMPLETE ===")
         print(f"Successfully completed: {len(all_results)}/{len(scenario_combinations)} scenarios")
-    
+
+    finalise_combined_results(combined_results, save_results=save_results, verbose=verbose)
+
     return combined_results
 
 # =============================================================================
@@ -1497,8 +1265,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
     Args:
         workspace_dir: Directory containing input data
         scenario: Scenario to run ('all' for all scenarios, or integer index for specific scenario)
-        objectives: List of objectives to use (e.g., ['abiotic', 'biotic', 'landscape'])
-                   Available: 'abiotic', 'biotic', 'landscape', 'cost'
+        objectives: List of objectives to use (e.g., ['abiotic', 'biotic', 'landscape', 'cost])
                    If None, uses all available objectives
         n_samples_per_param: Number of samples to draw from each continuous parameter
         pop_size: Population size for optimization
@@ -1506,20 +1273,28 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
         save_results: Whether to save results
         verbose: Print progress information
         random_seed: Random seed for reproducible parameter sampling
-        sample_fraction: Fraction of eligible pixels to use for optimization (e.g., 0.25 for 25%)
+        sample_fraction: Fraction of eligible pixels to use for optimization
                         If None, uses all eligible pixels
         sample_seed: Random seed for spatial sampling (default: 42)
         
     Returns:
         dict: Optimization results
     """
-    
-    if scenario == 'all':
-        # Run all scenarios
+
+    if scenario == "all":
+        initial_conditions = load_initial_conditions(
+            workspace_dir,
+            objectives=objectives,
+            region="Bern",
+            ecosystem=ecosystem,
+            sample_fraction=sample_fraction,
+            sample_seed=sample_seed,
+            ecosystem_lulc_path=lulc_path,
+            landscape_lulc_path=lulc_path
+        )
+
         return run_all_scenarios_optimization(
-            initial_conditions=load_initial_conditions(workspace_dir, objectives=objectives, 
-                                                     region='Bern', ecosystem=ecosystem, sample_fraction=sample_fraction, 
-                                                     sample_seed=sample_seed, lulc_path=lulc_path),
+            initial_conditions=initial_conditions,
             n_samples_per_param=n_samples_per_param,
             pop_size=pop_size,
             n_generations=n_generations,
@@ -1527,101 +1302,151 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
             verbose=verbose,
             random_seed=random_seed
         )
-    else:
-        # Run single scenario by index
-        if verbose:
-            print("=== RESTORATION OPTIMIZATION WORKFLOW ===")
-            if objectives is not None:
-                print(f"Using objectives: {objectives}")
-            print(f"Running scenario {scenario}")
-        
-        initial_conditions = load_initial_conditions(workspace_dir, objectives=objectives,
-                                                   region='Bern', ecosystem=ecosystem, sample_fraction=sample_fraction, 
-                                                   sample_seed=sample_seed, lulc_path=lulc_path)
-        
-        try:
-            scenario_combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
-            if 0 <= scenario < len(scenario_combinations):
-                scenario_params = scenario_combinations[scenario]
-            else:
-                raise ValueError(f"Scenario index {scenario} out of range. Available: 0-{len(scenario_combinations)-1}")
-            
-            return run_single_scenario_optimization(
-                initial_conditions=initial_conditions,
-                scenario_params=scenario_params,
-                pop_size=pop_size,
-                n_generations=n_generations,
-                save_results=save_results,
-                verbose=verbose
-            )
-            
-        except ValueError as e:
-            if verbose:
-                print(f"\n✗ Error: {e}")
-            return None
+
+    if verbose:
+        print("=== RESTORATION OPTIMIZATION WORKFLOW ===")
+        if objectives is not None:
+            print(f"Using objectives: {objectives}")
+        print(f"Running scenario {scenario}")
+
+    initial_conditions = load_initial_conditions(
+        workspace_dir,
+        objectives=objectives,
+        region="Bern",
+        ecosystem=ecosystem,
+        sample_fraction=sample_fraction,
+        sample_seed=sample_seed,
+        ecosystem_lulc_path=lulc_path,
+        landscape_lulc_path=lulc_path
+    )
+
+    scenario_combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
+
+    if not isinstance(scenario, int):
+        raise ValueError("scenario must be 'all' or an int index")
+
+    if not (0 <= scenario < len(scenario_combinations)):
+        raise ValueError(f"Scenario index {scenario} out of range. Available: 0-{len(scenario_combinations)-1}")
+
+    scenario_params = scenario_combinations[scenario]
+
+    return run_one(
+        initial_conditions=initial_conditions,
+        scenario_params=scenario_params,
+        pop_size=pop_size,
+        n_generations=n_generations,
+        save_results=save_results,
+        verbose=verbose,
+        skip_diagnostics=False
+    )
 
 # =============================================================================
 # EXECUTION
 # =============================================================================
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+
     # Available ecosystem types: 'all', 'forest', 'agricultural', 'grassland'
-    # Choose which ecosystem to optimize for:
-    ECOSYSTEM_TO_RUN = "grassland" #Change this to 'forest', 'agricultural', 'grassland', or 'all'
-    
-    # Available regions: 'Bern', 'CH'
-    # This affects the reference raster used for data validation
-    REGION = 'Bern'  # Change to 'CH' for Switzerland-wide optimization
-    
-    print(f"\\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
-    # =========================================================================
-    # IMPLEMENTATION 1: CUSTOM PARAMETERS
-    # =========================================================================
-    # Define your own parameter values and run optimization
-    
+    ECOSYSTEM_TO_RUN = "all"  # change to a single ecosystem if needed
+
+    # Region used for validation reference in load_initial_conditions
+    REGION = "Bern"  # change to 'CH' for Switzerland-wide optimisation
+
+    # Choose scenario mode:
+    #   "custom" runs exactly one scenario using custom_scenario_params
+    #   "all" runs scenario="all" using the scenario sampling logic inside main()
+    SCENARIO_MODE = "custom"  # "custom" or "all"
+
+    print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
+    print(f"Scenario mode: {SCENARIO_MODE}")
+
+    # Shared run controls
+    OBJECTIVES = ["abiotic", "biotic", "landscape", "cost"]
+    SAMPLE_FRACTION = 0.2
+    SAMPLE_SEED = 42
+    POP_SIZE = 20
+    N_GENERATIONS = 30
+    N_JOBS = 12
+    RANDOM_SEED = 42
+    N_SAMPLES_PER_PARAM = 3
+
+    # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
     custom_scenario_params = {
-         'max_restoration_fraction': 0.05,  # Restore 30% of eligible area
-         'spatial_clustering': 0,         # High spatial clustering
-         'burden_sharing': 'no',           # Equal sharing across regions
-         'abiotic_effect': 0.01,      # Effect on abiotic anomaly
-         'biotic_effect': 0.01#,       # Effect on biotic anomaly
-         #'landscape_effect': 0.01,    # Effect on landscape anomaly
+        "max_restoration_fraction": 0.1,
+        "spatial_clustering": 0,
+        "burden_sharing": "no",
+        "abiotic_effect": 0.01,
+        "biotic_effect": 0.01,
     }
-    
-    # Load data for selected ecosystem
-    initial_conditions = load_initial_conditions(".", objectives=['abiotic', 'biotic', 'landscape', 'cost'], 
-                                                 region=REGION,  # Defines validation reference
-                                                 ecosystem=ECOSYSTEM_TO_RUN,  # This applies LULC masking
-                                                 sample_fraction=None, sample_seed=42)
-    
-    # Run optimization
-    results = run_single_scenario_optimization(
-        initial_conditions=initial_conditions,
-        scenario_params=custom_scenario_params,
-        pop_size=50,
-        n_generations=100,
-        save_results=True,
-        verbose=True,
-        n_jobs=4
-    )
-    
-    # =========================================================================
-    # IMPLEMENTATION 2: ALL SCENARIOS OPTIMIZATION
-    # =========================================================================
-    # Run optimization for all parameter combinations (sampled from ranges)
-    
-    # results = run_all_scenarios_optimization(
-    #    initial_conditions=load_initial_conditions(".", objectives=['abiotic', 'biotic', 'landscape', 'cost'], 
-    #                                              sample_fraction=0.10, sample_seed=42),  # Use 25% sample
-    #    n_samples_per_param=2,  # 3 samples per continuous parameter
-    #    pop_size=20,
-    #    n_generations=50,
-    #    save_results=True,
-    #    verbose=True,
-    #    random_seed=42
-    # )
-    
-    if results is not None:
-        print("\n✓ Optimization completed successfully!")
+
+    if ECOSYSTEM_TO_RUN == "all":
+        ecosystems_to_run = ["forest", "agricultural", "grassland"]
     else:
-        print("\n✗ Optimization failed.")
+        ecosystems_to_run = [ECOSYSTEM_TO_RUN]
+
+    all_results = {}
+
+    for ecosystem in ecosystems_to_run:
+        print(f"=== Starting optimisation for {ecosystem.upper()} ecosystem ===")
+
+        try:
+            if SCENARIO_MODE == "all":
+                results = main(
+                    workspace_dir=".",
+                    scenario="all",
+                    objectives=OBJECTIVES,
+                    n_samples_per_param=N_SAMPLES_PER_PARAM,
+                    pop_size=POP_SIZE,
+                    n_generations=N_GENERATIONS,
+                    save_results=True,
+                    verbose=True,
+                    random_seed=RANDOM_SEED,
+                    sample_fraction=SAMPLE_FRACTION,
+                    sample_seed=SAMPLE_SEED,
+                    ecosystem=ecosystem,
+                    lulc_path=None
+                )
+            else:
+                initial_conditions = load_initial_conditions(
+                    ".",
+                    objectives=OBJECTIVES,
+                    region=REGION,
+                    ecosystem=ecosystem,
+                    sample_fraction=SAMPLE_FRACTION,
+                    sample_seed=SAMPLE_SEED
+                )
+
+                results = run_single_scenario_optimization(
+                    initial_conditions=initial_conditions,
+                    scenario_params=custom_scenario_params,
+                    pop_size=POP_SIZE,
+                    n_generations=N_GENERATIONS,
+                    save_results=True,
+                    verbose=True,
+                    n_jobs=N_JOBS
+                )
+
+            if results is not None:
+                all_results[ecosystem] = results
+                print(f"\n✓ {ecosystem.title()} optimisation completed successfully!")
+            else:
+                print(f"\n✗ {ecosystem.title()} optimisation failed.")
+
+        except Exception as e:
+            print(f"\n✗ Error optimising {ecosystem} ecosystem: {e}")
+            continue
+
+    print(f"\n{'='*80}")
+    print("=== OPTIMISATION SUMMARY ===")
+    print(f"{'='*80}")
+    successful_runs = len(all_results)
+    total_runs = len(ecosystems_to_run)
+    print(f"Successfully completed {successful_runs}/{total_runs} ecosystem optimisations:")
+    for ecosystem in ecosystems_to_run:
+        status = "✓ SUCCESS" if ecosystem in all_results else "✗ FAILED"
+        print(f"  {ecosystem.title():<12}: {status}")
+
+    if successful_runs > 0:
+        print(f"\n✓ Completed with outputs for {successful_runs} ecosystems.")
+    else:
+        print("\n✗ No optimisations completed successfully.")
