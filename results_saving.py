@@ -33,11 +33,17 @@ def create_optimization_report(results, output_dir=".", verbose=True):
     if verbose:
         print("\nCreating comprehensive optimization report...")
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%d%m')
     ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
-    report_filename = os.path.join(output_dir, f"optimization_report{ecosystem_suffix}_{timestamp}.json")
+    # Find next available file number
+    x = 1
+    while True:
+        report_filename = os.path.join(output_dir, f"optimization_report{ecosystem_suffix}_{timestamp}_{x}.json")
+        if not os.path.exists(report_filename):
+            break
+        x += 1
     
     # Extract key information from results
     initial_conditions = results.get('initial_conditions', {})
@@ -159,7 +165,8 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                 "hypervolume": hv_callback.best_hv if hv_callback and hasattr(hv_callback, 'best_hv') else None
             },
             "objective_statistics": {},
-            "convergence_metrics": {}
+            "convergence_metrics": {},
+            #"decision_patterns": results.get('decision_analysis', {})
         },
         # =============================================================================
         # POPULATION DIAGNOSTICS
@@ -196,15 +203,29 @@ def create_optimization_report(results, output_dir=".", verbose=True):
         
         # Add baseline values
         if obj_name in initial_conditions:
-            if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
-                # These are spatial arrays - sum them up
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
+                # These objectives use improvement over eligible pixels only
+                # Baseline = -sum(initial_anomaly - initial_anomaly) over eligible = 0
+                # But to be consistent with objective calculation:
+                baseline_array = initial_conditions[obj_name]
+                mask = initial_conditions["restoration_eligible_mask"]
+                # For reporting purposes, show the sum of initial anomalies over eligible pixels
+                baseline_val = float(np.sum(baseline_array[mask]))
+                
+            elif obj_name == 'landscape_anomaly':
+                # Landscape objective sums entire array (global objective)
                 baseline_array = initial_conditions[obj_name]
                 if hasattr(baseline_array, 'sum'):
                     baseline_val = float(baseline_array.sum())
                 else:
                     baseline_val = float(baseline_array)
+                    
+            elif obj_name == 'implementation_cost':
+                # Implementation cost baseline is 0 (no cost when no actions taken)
+                baseline_val = 0.0
+                
             else:
-                # These should be scalar values
+                # Handle other potential objectives
                 baseline_value = initial_conditions[obj_name]
                 if hasattr(baseline_value, 'item') and hasattr(baseline_value, 'size') and baseline_value.size == 1:
                     # It's a numpy scalar with single element
@@ -221,6 +242,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                         baseline_val = float(baseline_value)
                     except (TypeError, ValueError):
                         baseline_val = 0.0  # fallback
+                        
             report["problem_definition"]["objectives"]["baseline_values"][obj_name] = baseline_val
         
         # Add final ranges
@@ -435,11 +457,22 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
     if verbose:
         print("\nCreating evolution tracking report...")
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%d%m')
+    
+    # Get ecosystem information for filename
     ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
-    evolution_filename = os.path.join(output_dir, f"evolution_report{ecosystem_suffix}_{timestamp}.json")
+    # Find next available file number
+    x = 1
+    while True:
+        evolution_filename = os.path.join(
+            output_dir,
+            f"evolution_report{ecosystem_suffix}_{timestamp}_{x}.json"
+        )
+        if not os.path.exists(evolution_filename):
+            break
+        x += 1
     
     # Extract evolution data
     hv_callback = results.get('hv_callback', None)
@@ -545,12 +578,67 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
                 }
             }
     
+    # Process population statistics if available
+    pop_stats = algorithm_info.get('population_statistics', {})
+    if pop_stats:
+        evolution_report["population_evolution"] = {
+            "enabled": True,
+            "f_mean_history": pop_stats.get('f_mean_history', []),
+            "f_std_history": pop_stats.get('f_std_history', []),
+            "f_min_history": pop_stats.get('f_min_history', []),
+            "f_max_history": pop_stats.get('f_max_history', []),
+            "objectives": objective_names
+        }
+        
+        # Compute convergence metrics based on population statistics
+        f_mean_history = pop_stats.get('f_mean_history', [])
+        if len(f_mean_history) > 0 and len(objective_names) > 0:
+            try:
+                # Convert to numpy array for easier analysis
+                f_mean_array = np.array(f_mean_history)  # shape: (n_generations, n_objectives)
+                
+                # Convergence analysis for each objective
+                objective_convergence = {}
+                for i, obj_name in enumerate(objective_names):
+                    if f_mean_array.shape[1] > i:
+                        obj_history = f_mean_array[:, i]
+                        objective_convergence[obj_name] = {
+                            "initial_mean": float(obj_history[0]) if len(obj_history) > 0 else 0.0,
+                            "final_mean": float(obj_history[-1]) if len(obj_history) > 0 else 0.0,
+                            "total_change": float(obj_history[-1] - obj_history[0]) if len(obj_history) > 0 else 0.0,
+                            "final_5_gen_std": float(np.std(obj_history[-5:])) if len(obj_history) >= 5 else 0.0
+                        }
+                
+                evolution_report["convergence_metrics"]["objective_based"] = objective_convergence
+                
+            except Exception as e:
+                if verbose:
+                    print(f"   Warning: Could not process population statistics: {e}")
+    
     # Add generation-by-generation statistics if available
+    pop_stats = algorithm_info.get('population_statistics', {})
     for gen in range(algorithm_info.get('actual_generations', 0)):
         generation_stats = {
             "generation": gen,
             "hypervolume": hv_history[gen] if hv_callback and len(hv_history) > gen else None
         }
+        
+        # Add population statistics for this generation if available
+        if pop_stats:
+            f_mean_history = pop_stats.get('f_mean_history', [])
+            f_std_history = pop_stats.get('f_std_history', [])
+            f_min_history = pop_stats.get('f_min_history', [])
+            f_max_history = pop_stats.get('f_max_history', [])
+            
+            if len(f_mean_history) > gen:
+                generation_stats["f_mean"] = f_mean_history[gen]
+            if len(f_std_history) > gen:
+                generation_stats["f_std"] = f_std_history[gen]
+            if len(f_min_history) > gen:
+                generation_stats["f_min"] = f_min_history[gen]
+            if len(f_max_history) > gen:
+                generation_stats["f_max"] = f_max_history[gen]
+        
         evolution_report["generation_statistics"][f"generation_{gen}"] = generation_stats
     
     # Save evolution report
@@ -564,6 +652,10 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
             print(f"   Tracked {hv_count} generations of hypervolume evolution")
             if len(evolution_report["optimization_phases"]) > 0:
                 print(f"   Identified {len(evolution_report['optimization_phases'])} optimization phases")
+        
+        pop_stats = algorithm_info.get('population_statistics', {})
+        if pop_stats:
+            f_mean_history = pop_stats.get('f_mean_history', [])
     
     return evolution_filename
 
@@ -624,7 +716,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
     """
     from resto_anom import define_scenario_parameters, sample_scenario_parameters
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%d%m')
     
     # Get parameter ranges and sampled values
     param_ranges = define_scenario_parameters()
@@ -670,8 +762,14 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
             'parameters': combo
         })
     
-    # Save to JSON
-    summary_filename = os.path.join(output_dir, f"parameter_summary_{timestamp}.json")
+    # Save to JSON with incremental numbering
+    x = 1
+    while True:
+        summary_filename = os.path.join(output_dir, f"parameter_summary_{timestamp}_{x}.json")
+        if not os.path.exists(summary_filename):
+            break
+        x += 1
+    
     with open(summary_filename, 'w') as f:
         json.dump(param_summary, f, indent=2)
     
@@ -723,8 +821,8 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
         pickle.dump(results, f)
     generated_files['pickle_file'] = results_filename
     
-    # Save summary (JSON format)
-    summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}.json")
+    # Save summary (JSON format) with same numbering as pickle file
+    summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}_{x}.json")
     
     objectives = results['objectives']
     
@@ -803,10 +901,11 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     ecosystem = first_scenario_results.get('initial_conditions', {}).get('ecosystem', 'all')
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
+    # Find next available file number
     x = 1
     while True:
-        results_filename = os.path.join(output_dir, f"results_{timestamp}_{x}.pkl")
-        summary_filename = os.path.join(output_dir, f"results_sc_{timestamp}_{x}.json")
+        results_filename = os.path.join(output_dir, f"results{ecosystem_suffix}_{timestamp}_{x}.pkl")
+        summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}_{x}.json")
         if not os.path.exists(results_filename):
             break
         x += 1
