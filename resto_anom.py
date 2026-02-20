@@ -454,6 +454,10 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     
     # Test with different restoration amounts
     print(f"\n OBJECTIVE SENSITIVITY TO RESTORATION AMOUNT:")
+    print(f"   Baseline objectives (no restoration):")
+    for j, obj_name in enumerate(problem.objective_names):
+        print(f"      {obj_name}: {out_none['F'][j]:.6f}")
+    
     test_fractions = [0.05, 0.10, 0.15, 0.20]
     
     for frac in test_fractions:
@@ -469,17 +473,33 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
             
             # Calculate total improvement across all objectives
             total_improvement = 0
+            n_improved_objectives = 0
             for j in range(len(out['F'])):
-                if out_none['F'][j] != 0:
-                    improvement = (out_none['F'][j] - out['F'][j]) / out_none['F'][j]
+                # For difference-based objectives where baseline is 0, check absolute improvement
+                if out_none['F'][j] == 0:
+                    # Objective is 0 at baseline - check if restoration makes it more negative (better)
+                    if out['F'][j] < 0:
+                        improvement = abs(out['F'][j])  # Absolute improvement from 0
+                        total_improvement += improvement
+                        n_improved_objectives += 1
+                elif out_none['F'][j] != 0:
+                    # Standard relative improvement calculation
+                    improvement = (out_none['F'][j] - out['F'][j]) / abs(out_none['F'][j])
                     total_improvement += improvement
+                    n_improved_objectives += 1
             
-            print(f"   {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {total_improvement/len(out['F'])*100:>6.2f}%")
-    
-    return problem
+            avg_improvement = (total_improvement / n_improved_objectives) if n_improved_objectives > 0 else 0.0
+            print(f"   {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {avg_improvement*100:>6.2f}%")
+            
+            # Show per-objective details for first test fraction
+            if frac == test_fractions[0]:
+                print(f"      Per-objective details:")
+                for j, obj_name in enumerate(problem.objective_names):
+                    baseline_val = out_none['F'][j]
+                    restored_val = out['F'][j]
+                    change = restored_val - baseline_val
+                    print(f"         {obj_name}: {baseline_val:.6f} → {restored_val:.6f} (Δ={change:.6f})")
 
-# =============================================================================
-# PROBLEM DEFINITION
 # =============================================================================
 
 class RestorationProblem(ElementwiseProblem):
@@ -713,11 +733,52 @@ class RestorationProblem(ElementwiseProblem):
         
         # Constraint: total number of pixels with actions (restore + convert)
         out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
+        
+        # Log constraint violations
+        if not hasattr(self, 'constraint_log'):
+            self.constraint_log = []
+        
+        # Log constraint violations (G[0] > 0 means violation)
+        for i, g_val in enumerate(out["G"]):
+            if g_val > 0:
+                self.constraint_log.append({
+                    'generation': getattr(self, 'current_gen', 0), 
+                    'violation_value': g_val,
+                    'constraint_type': 'budget'
+                })
 
 
 # =============================================================================
 # EXECUTION
 # =============================================================================
+
+def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42):
+    """
+    Build a fixed hypervolume reference point using a warm up sample of solutions.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+
+    # Use the provided Sampling operator to generate candidate solutions
+    # This returns a Population in pymoo, so we extract X
+    pop = sampling.do(problem, n_samples)
+    X = pop.get("X")
+
+    F_list = []
+    for k in range(X.shape[0]):
+        out = {}
+        problem._evaluate(X[k], out)
+        F_list.append(out["F"])
+
+    Fw = np.asarray(F_list, dtype=float)
+
+    worst = np.max(Fw, axis=0)
+    span = np.maximum(np.ptp(Fw, axis=0), 1e-12)
+
+    ref_point = worst + margin * span
+    return ref_point
+
 
 class HVCallback:
     """
@@ -726,7 +787,7 @@ class HVCallback:
     is observed for a specified number of generations.
     """
     
-    def __init__(self, patience=15, min_improvement=1e-6, verbose=True):
+    def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None):
         """
         Initialize hypervolume callback.
         
@@ -738,6 +799,7 @@ class HVCallback:
         self.patience = patience
         self.min_improvement = min_improvement
         self.verbose = verbose
+        self.ref_point = ref_point
         self.hv_history = []
         self.best_hv = 0.0
         self.no_improvement_count = 0
@@ -774,10 +836,10 @@ class HVCallback:
                 # Calculate hypervolume
                 try:
                     # Create reference point (worst case for each objective)
-                    ref_point = np.max(F, axis=0) + 1.0
-                    
-                    # Calculate hypervolume using pymoo's HV indicator
-                    hv_indicator = HV(ref_point=ref_point)
+                    if self.ref_point is None:
+                        raise ValueError("HVCallback requires a fixed ref_point")
+
+                    hv_indicator = HV(ref_point=self.ref_point)
                     current_hv = hv_indicator(F)
                     
                     self.hv_history.append(current_hv)
@@ -823,6 +885,7 @@ def run_one(initial_conditions, scenario_params, run_settings):
         hv_patience=run_settings.get("hv_patience", 15),
         hv_min_improvement=run_settings.get("hv_min_improvement", 1e-6),
         n_jobs=run_settings.get("n_jobs", None),
+        use_repair=run_settings.get("use_repair", True)
     )
 
 def run_scenario_batch(
@@ -935,7 +998,7 @@ def finalise_combined_results(combined_results, save_results=True, verbose=True)
 
 def run_single_scenario_optimization(initial_conditions, scenario_params, pop_size=50, 
                                    n_generations=100, save_results=True, verbose=True, skip_diagnostics=False,
-                                   hv_patience=15, hv_min_improvement=1e-6, n_jobs=None):
+                                   hv_patience=15, hv_min_improvement=1e-6, n_jobs=None, use_repair=True):
     """
     Run the multi-objective restoration optimization for a single scenario.
     
@@ -966,11 +1029,12 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         problem_temp = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for setup
         print(f"Objectives: {problem_temp.objective_names} ({len(problem_temp.objective_names)} total)")
     
-    # Create optimization problem
+    # Create optimization problem - force serial execution to avoid pickle errors
+    # Parallelization at problem level conflicts with pymoo's own parallelization
     problem = RestorationProblem(
         initial_conditions=initial_conditions,
         scenario_params=scenario_params,
-        n_jobs=n_jobs
+        n_jobs=1  # Serial execution - parallelization handled by pymoo if needed
     )
     import numpy as np
     # Print additional diagnostic information
@@ -1013,8 +1077,16 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         problem.max_action_pixels, 
         scenario_params, 
         scores
-    )
+    ) if use_repair else None
     
+    fixed_ref = build_fixed_ref_point(
+        problem=problem,
+        sampling=sampling,
+        n_samples=200,
+        margin=0.05,
+        seed=42
+    )   
+
     if verbose:
         strategy_desc = []
         if burden_sharing == 'yes':
@@ -1042,7 +1114,7 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         def __init__(self, verbose=True):
             self.verbose = verbose
             self.start_time = None
-            self.hv_callback = HVCallback(patience=hv_patience, min_improvement=hv_min_improvement, verbose=verbose)
+            self.hv_callback = HVCallback(patience=hv_patience, min_improvement=hv_min_improvement, verbose=verbose, ref_point=fixed_ref)
             
         def __call__(self, algorithm):
             if self.start_time is None:
@@ -1051,14 +1123,27 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             # Call hypervolume callback for early stopping check
             self.hv_callback(algorithm)
             
+            # Update current generation in problem for constraint logging
+            if hasattr(algorithm, 'problem'):
+                algorithm.problem.current_gen = algorithm.n_gen
+            
             gen = algorithm.n_gen
             elapsed = (datetime.now() - self.start_time).total_seconds()
             
             if self.verbose and gen % 10 == 0:
                 progress = (gen / n_generations) * 100
                 eta = (elapsed / gen) * (n_generations - gen) if gen > 0 else 0
+                
+                # Report constraint violations
+                violation_info = ""
+                if hasattr(algorithm, 'problem') and hasattr(algorithm.problem, 'constraint_log'):
+                    gen_violations = [c for c in algorithm.problem.constraint_log 
+                                    if c.get('generation', 0) == gen]
+                    if gen_violations:
+                        violation_info = f" - Violations: {len(gen_violations)}"
+                
                 print(f"   Generation {gen}/{n_generations} ({progress:.1f}%) - "
-                      f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min")
+                      f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}")
             
             # Stop optimization if hypervolume has converged
             # TEMPORARILY DISABLED: Hypervolume-based early stopping
@@ -1082,29 +1167,27 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         )
         
         if verbose:
-            print(f"\nDEBUG - Result object:")
-            print(f"  result is None: {result is None}")
+            #print(f"\nDEBUG - Result object:")
+            #print(f"  result is None: {result is None}")
             if result is not None:
                 # Check final population
                 if hasattr(result, 'pop') and result.pop is not None:
-                    print(f"\n  Final population size: {len(result.pop)}")
                     if len(result.pop) > 0:
                         pop_F = result.pop.get("F")
                         if pop_F is not None:
-                            print(f"  Population objectives shape: {pop_F.shape}")
-                            print(f"  Sample objectives (first 3 solutions):")
+                            print(f"\nSample objectives (first 3 solutions):")
                             for i in range(min(3, len(pop_F))):
                                 print(f"    Sol {i}: {pop_F[i]}")
                             
                             # Check for diversity
-                            print(f"\n  Objective statistics across population:")
+                            print(f"Objective statistics across population:")
                             for j, obj_name in enumerate(problem.objective_names):
                                 obj_vals = pop_F[:, j]
                                 print(f"    {obj_name}: min={np.min(obj_vals):.4e}, max={np.max(obj_vals):.4e}, std={np.std(obj_vals):.4e}")
                             
                             # Check correlation between objectives
                             if pop_F.shape[1] > 1:
-                                print(f"\n  Objective correlations (high correlation = no trade-offs):")
+                                print(f"Objective correlations (high correlation = no trade-offs):")
                                 for i in range(pop_F.shape[1]):
                                     for j in range(i+1, pop_F.shape[1]):
                                         corr = np.corrcoef(pop_F[:, i], pop_F[:, j])[0, 1]
@@ -1116,8 +1199,8 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 final_gen = len(callback.hv_callback.hv_history)
                 print(f"✓ Optimization completed after {final_gen} generations ({convergence_reason})")
                 if callback.hv_callback.hv_history:
-                    print(f"   Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
-                print(f"   Found {len(result.F)} Pareto-optimal solutions")
+                    print(f"Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
+                print(f"Found {len(result.F)} Pareto-optimal solutions")
                 import numpy as np
 
             # Prepare results
@@ -1143,15 +1226,15 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                     }  
             
             # Analyze decision patterns
-            decision_analysis = analyze_decision_patterns(result.X, initial_conditions)
-            decision_analysis['constraints']['restoration_budget_fraction'] = scenario_params.get('max_restoration_fraction', 0.0)
+            #decision_analysis = analyze_decision_patterns(result.X, initial_conditions)
+            #decision_analysis['constraints']['restoration_budget_fraction'] = scenario_params.get('max_restoration_fraction', 0.0)
             
             optimization_results = {
                 'scenario_params': scenario_params,
                 'objective_names' : problem.objective_names,
                 'objectives': result.F,           # Objective values
                 'decisions': result.X,            # Decision variables (restoration plans)
-                'decision_analysis': decision_analysis,  # Analysis of restore/convert patterns
+                #'decision_analysis': decision_analysis,  # Analysis of restore/convert patterns
                 'n_solutions': len(result.F),
                 'problem_info': {
                     'n_pixels': initial_conditions['n_pixels'],
@@ -1226,6 +1309,7 @@ def run_all_scenarios_optimization(
         "hv_patience": hv_patience,
         "hv_min_improvement": hv_min_improvement,
         "n_jobs": n_jobs,
+        "use_repair": True
     }
 
     all_results = run_scenario_batch(
@@ -1361,7 +1445,7 @@ if __name__ == "__main__":
     print(f"Scenario mode: {SCENARIO_MODE}")
 
     # Shared run controls
-    OBJECTIVES = ["abiotic", "biotic", "landscape", "cost"]
+    OBJECTIVES = ["abiotic", "biotic","cost"]# "landscape", "cost"]
     SAMPLE_FRACTION = 0.2
     SAMPLE_SEED = 42
     POP_SIZE = 20
@@ -1423,7 +1507,8 @@ if __name__ == "__main__":
                     n_generations=N_GENERATIONS,
                     save_results=True,
                     verbose=True,
-                    n_jobs=N_JOBS
+                    n_jobs=N_JOBS, 
+                    use_repair=True
                 )
 
             if results is not None:
