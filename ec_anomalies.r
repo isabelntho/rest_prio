@@ -184,21 +184,17 @@ for (ecosystem in ECOSYSTEM_TYPES) {
                    ecosystem))
         
         # Calculate mean anomalies by ECT category for this ecosystem
-        for (ect_category in names(ECT_CATEGORIES)) {
-            ect_anomaly <- calculate_ect_mean_anomaly(eco_anomalies, ect_category)
-            
-            if (!is.null(ect_anomaly)) {
-                # Add to combined ECT results
-                if (is.null(ect_results[[ect_category]])) {
-                    ect_results[[ect_category]] <- ect_anomaly
-                    cat(sprintf("  - %s anomaly initialized for %s\n", ect_category, ecosystem))
-                } else {
-                    # Merge with existing data
-                    ect_results[[ect_category]] <- merge(ect_results[[ect_category]], ect_anomaly)
-                    cat(sprintf("  - %s anomaly merged for %s\n", ect_category, ecosystem))
-                }
-            }
+    for (ect_category in names(ECT_CATEGORIES)) {
+    ect_anomaly <- calculate_ect_mean_anomaly(eco_anomalies, ect_category)
+
+    if (!is.null(ect_anomaly)) {
+        if (is.null(ect_results[[ect_category]])) {
+            ect_results[[ect_category]] <- ect_anomaly
+        } else {
+            ect_results[[ect_category]] <- terra::cover(ect_results[[ect_category]], ect_anomaly)
         }
+    }
+    }
     }
 }
 

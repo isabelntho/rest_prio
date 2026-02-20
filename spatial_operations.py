@@ -48,6 +48,30 @@ def compute_sn_dens(raster_path, focal_classes, radius_m=300):
 
     return sn_dens, profile
 
+from scipy.ndimage import convolve
+
+def compute_sn_dens_array(lu, nodata, res, focal_classes, radius_m=300):
+    focal = np.where(np.isin(lu, focal_classes), 1.0, 0.0)
+    valid = np.ones(lu.shape, dtype=np.float32)
+
+    if nodata is not None:
+        nodata_mask = (lu == nodata)
+        focal = focal.astype(np.float32)
+        focal[nodata_mask] = 0.0
+        valid[nodata_mask] = 0.0
+    else:
+        focal = focal.astype(np.float32)
+
+    radius_px = int(radius_m / res)
+    y, x = np.ogrid[-radius_px:radius_px+1, -radius_px:radius_px+1]
+    K = ((x**2 + y**2) <= radius_px**2).astype(np.float32)
+
+    sum_focal = convolve(focal, K, mode="constant", cval=0.0)
+    n_valid = convolve(valid, K, mode="constant", cval=0.0)
+
+    dens = np.divide(sum_focal, n_valid, out=np.full_like(sum_focal, np.nan), where=(n_valid > 0))
+    return dens
+
 # fclass = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
 #     52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
 
@@ -73,6 +97,84 @@ def compute_sn_dens(raster_path, focal_classes, radius_m=300):
 #def compute_forest_dens(raster_path, forest_classes, radius_m=300):
     #place holder
 
+
+def merge_overlapping_regions(regions):
+    """
+    Merge overlapping rectangular regions to minimize redundant processing.
+    
+    NOTE: This function is currently unused as we switched to full landscape 
+    recalculation, but kept for potential future selective processing.
+    """
+    if not regions:
+        return []
+    
+    # Convert set to list and sort
+    region_list = list(regions)
+    region_list.sort()
+    
+    merged = []
+    current = region_list[0]
+    
+    for next_region in region_list[1:]:
+        # Check if regions overlap
+        r_min1, r_max1, c_min1, c_max1 = current
+        r_min2, r_max2, c_min2, c_max2 = next_region
+        
+        # Check for overlap
+        if (r_max1 >= r_min2 and r_min1 <= r_max2 and 
+            c_max1 >= c_min2 and c_min1 <= c_max2):
+            # Merge regions
+            current = (
+                min(r_min1, r_min2),
+                max(r_max1, r_max2),
+                min(c_min1, c_min2),
+                max(c_max1, c_max2)
+            )
+        else:
+            # No overlap, add current to merged list
+            merged.append(current)
+            current = next_region
+    
+    merged.append(current)
+    return merged
+
+def approximate_region_landscape_change(conversions, region_shape, radius_px):
+    """
+    Approximate landscape change within a region using mathematical models.
+    No compute_sn_dens needed - pure mathematical approximation.
+    
+    NOTE: This function is currently unused as we switched to full landscape 
+    recalculation for accuracy, but kept for potential future use.
+    """
+    # Create conversion mask for this region
+    conversion_mask = np.zeros(region_shape, dtype=np.float32)
+    for row, col in conversions:
+        if 0 <= row < region_shape[0] and 0 <= col < region_shape[1]:
+            conversion_mask[row, col] = 1.0
+    
+    # Create circular influence kernel
+    y, x = np.ogrid[-radius_px:radius_px+1, -radius_px:radius_px+1]
+    kernel = ((x**2 + y**2) <= radius_px**2).astype(np.float32)
+    
+    # Distance-weighted kernel (closer pixels have more influence)
+    distances = np.sqrt(x**2 + y**2)
+    distances[distances == 0] = 1  # Avoid division by zero
+    kernel = kernel / (1 + distances * 0.1)  # Gradual distance decay
+    kernel = kernel / np.sum(kernel)  # Normalize
+    
+    # Apply convolution to estimate landscape density improvement
+    from scipy.ndimage import convolve
+    density_improvement = convolve(conversion_mask, kernel, mode='constant', cval=0.0)
+    
+    # Convert density improvement to anomaly change
+    # Density increase = anomaly decrease (improvement)
+    anomaly_improvement = -density_improvement
+    
+    # Scale the effect based on conversion effectiveness
+    # This parameter can be tuned based on validation against full calculations
+    effect_strength = 0.15  # Adjust based on your data
+    
+    return effect_strength * anomaly_improvement
 
 # =============================================================================
 # BURDEN SHARING AND CLUSTERING ALGORITHMS
@@ -394,12 +496,21 @@ class AdaptiveRepair(Repair):
             scenario_params = {}
         self.burden_sharing = scenario_params.get('burden_sharing', 'no') == 'yes'
         self.clustering_strength = scenario_params.get('spatial_clustering', 0.0)
+        
+        # Initialize repair logging
+        self.call_log = []  # Store repair events: {'generation': int, 'type': str, 'individuals_repaired': int}
+        self.total_calls = 0
     
     def _do(self, problem, X, **kwargs):
         X_repaired = np.zeros_like(X)
         
         score_repairs = 0
         random_repairs = 0
+        individuals_repaired = 0
+        
+        # Track repair call
+        self.total_calls += 1
+        generation = kwargs.get('generation', self.total_calls)
         
         for i in range(len(X)):
             try:
@@ -415,7 +526,10 @@ class AdaptiveRepair(Repair):
                 tolerance = max(target * 0.2, 100)  # 20% tolerance or at least 100 pixels
                 
                 if abs(current_total - target) > tolerance:
-                    if self.scores is not None and np.random.random() < 0.3:
+                    individuals_repaired += 1
+                    # Use neutral (random) repair only - scores disabled for neutral repair
+                    # Change this condition to enable score-based repair: if self.scores is not None and np.random.random() < 0.3:
+                    if False:  # Disabled score-based repair for neutral constraint enforcement
                         x = self._enforce_count_with_scores(x, problem)
                         score_repairs += 1
                     else:
@@ -450,6 +564,17 @@ class AdaptiveRepair(Repair):
                 traceback.print_exc()
                 # Return original individual on error
                 X_repaired[i] = X[i]
+        
+        # Log repair event
+        repair_type = 'score_based' if score_repairs > 0 else 'random' if random_repairs > 0 else 'none'
+        if individuals_repaired > 0:
+            self.call_log.append({
+                'generation': generation,
+                'type': repair_type,
+                'individuals_repaired': individuals_repaired,
+                'score_repairs': score_repairs,
+                'random_repairs': random_repairs
+            })
         
         return X_repaired
     

@@ -17,6 +17,8 @@ execute:
   message: false
   warning: false
   fig-align: center
+params:
+  file_ext: "20260105_211335"
 ---
 
 # Overview
@@ -263,7 +265,7 @@ print(grass_layout)
 
 # Condition index {.tabset}
 
-- Use condition index or mean anomaly across classes to define if pixels are in need of restoration.
+-   Use condition index or mean anomaly across classes to define if pixels are in need of restoration.
 
 ::: panel-tabset
 # Raw
@@ -486,7 +488,7 @@ eco_mean_anoms <- anom_long %>%
 
 ```{r}
 
-class_mean_a <- class_mean_anoms %>%
+#class_mean_a <- class_mean_anoms %>%
 
 ```
 
@@ -679,7 +681,6 @@ ind_list_df <- ind_list_df |> group_by(Ecosystem, Class) |>
   ungroup()
 
 ```
-
 
 ```{r}
 
@@ -932,8 +933,6 @@ inset_al <- p1 +
 
 ```
 
-
-
 ```{r}
 #| label: plot_anoms
 row1 <-  (inset_ab | inset_bl)
@@ -1090,7 +1089,7 @@ inset_al <- p1 +
 
 # With cost
 
-- Based on slope, soil suitability, distance from roads, land cost
+-   Based on slope, soil suitability, distance from roads, land cost
 
 ```{r}
 cost_dir <- "Y:/CH_Kanton_Bern/03_Workspaces/03_Habitat_condition/Restoration_potential/Implementation_cost_eva/Result/"
@@ -1108,7 +1107,6 @@ cost_df <- left_join(class_mean_anoms, comb, by=c("x"="x", "y"="y"))
 
 
 ```
-
 :::
 
 # Optimisation logic
@@ -1116,16 +1114,15 @@ cost_df <- left_join(class_mean_anoms, comb, by=c("x"="x", "y"="y"))
 Potential scenario elements:
 
 | Decision option | Parameter | Possible values |
-|-------|------|---------|
-|  Maximum area to restore |  % of eligible pixels  |    10, 20, 30   |
-|  Spatial clustering of areas to restore  |  Size of moving window used in smoothing |   None, 3, 15, 31   |
-|  Effect of restoration (pixel-level)  | Change assumed when area selected for restoration |  Condition improved to threshold (good condition), Condition improved by % value  |
-|  Quantification of optimal solutions  | Calculation of objective function |  Sum of change in objective variable per pixel, mean of change in objective variable per pixel, % of pixels above threshold (in good condition)
+|-----------------------|--------------------|-----------------------------|
+| Maximum area to restore | \% of eligible pixels | 10, 20, 30 |
+| Spatial clustering of areas to restore | Size of moving window used in smoothing | None, 3, 15, 31 |
+| Effect of restoration (pixel-level) | Change assumed when area selected for restoration | Condition improved to threshold (good condition), Condition improved by % value |
+| Quantification of optimal solutions | Calculation of objective function | Sum of change in objective variable per pixel, mean of change in objective variable per pixel, % of pixels above threshold (in good condition) |
 
-# Decision variable{.tabset}
+# Decision variable {.tabset}
 
 ::: panel-tabset
-
 # Maximum area to restore
 
 ```{r}
@@ -1231,15 +1228,32 @@ ggplot()+
 
 # Optimisation {.tabset}
 
-- Forest areas, 100 iterations
-* Objectives
-  + 
+-   Forest areas, 100 iterations
+-   Objectives
+    -   
 
-::: panel-tabset
+```{r}
+file_ext <- params$file_ext
+
+```
+
+![](figs/parallel_coordinates_%60r%20file_ext%60.png)
+
+# Sensitivity
+
+"To support decision-making, exploratory modelling can help identifying the main factors of change and decision boundaries. Factors of change might include external uncertainties (i.e. factors that cannot be controlled), planning decisions (i.e. factors that can be controlled) and inherent system stochasticity." (Roman et al., 2026)
+
+| External uncertainties | Planning decisions | Inherent system stochasticity |
+|----|----|----|
+| Improvement of condition upon restoration | Maximum area to restore |  |
+|  | Degree of spatial clustering/size of planning unit |  |
+|  | Burden sharing across administrative regions |  |
 
 # All to good
-- restoration brings all negative anomalies to threshold - everything selected recieves maximum effort to become good condition
-- additive objective: the total change in condition anomaly
+
+::: panel-tabset
+-   restoration brings all negative anomalies to threshold - everything selected recieves maximum effort to become good condition
+-   additive objective: the total change in condition anomaly
 
 ```{r}
 
@@ -1275,8 +1289,10 @@ ggplot()+
 ```
 
 # Proportion above threshold
-- restoration increases condition of pixel, increasing all anomaly values by 0.5% in positive direction
-- additive objective: the proportion of cells above threshold value
+
+-   restoration increases condition of pixel, increasing all anomaly values by 0.5% in positive direction
+-   additive objective: the proportion of cells above threshold value
+
 ```{r}
 
 base_prop <- global(forest_all > 0, "mean", na.rm = TRUE)[, 1]
@@ -1309,8 +1325,9 @@ ggplot()+
 ```
 
 # Landscape spillover
-- restoration increases condition of pixel, increasing abiotic and biotics anomaly values by 0.5% in positive direction. For landscape anomaly, the effect of restoration is observed on surrounding cells
-- additive objective: the proportion of cells above threshold value
+
+-   restoration increases condition of pixel, increasing abiotic and biotics anomaly values by 0.5% in positive direction. For landscape anomaly, the effect of restoration is observed on surrounding cells
+-   additive objective: the proportion of cells above threshold value
 
 ```{r}
 
@@ -1365,9 +1382,7 @@ ggplot()+
 
 
 ```
-
 :::
-
 
 # Time series data
 
