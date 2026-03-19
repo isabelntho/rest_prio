@@ -2,8 +2,9 @@
 title: "Restoration Optimization: Results/problems/debugging"
 author: inthomas@ethz.ch
 date: "`r Sys.Date()`"
-format: 
+format:
   html:
+    embed-resources: true
     theme: cosmo
     toc: true
     toc-depth: 3
@@ -461,14 +462,13 @@ $$
 
 **Abiotic & biotic condition**
 
-Positive or neutral anomalies receive no improvement. For restored pixels starting with a negative anomaly: 
-$$
+Positive or neutral anomalies receive no improvement. For restored pixels starting with a negative anomaly: $$
 a_i^{1} = a_i^{0} + \alpha_A \, w(a_i^{0})
 $$
 
-- $a_i^{1}$ is the anomaly after restoration, $a_i^{0}$ is the baseline anomaly
-- $\alpha_A$ = abiotic effect, i.e. a constant that represents an arbitrary improvement achieved through restoration
-- $w(a)$ is a weighting function based on the magnitude of the anomaly. 
+-   $a_i^{1}$ is the anomaly after restoration, $a_i^{0}$ is the baseline anomaly
+-   $\alpha_A$ = abiotic effect, i.e. a constant that represents an arbitrary improvement achieved through restoration
+-   $w(a)$ is a weighting function based on the magnitude of the anomaly.
 
 The improvement is scaled by a weight that depends on the baseline anomaly. This assigns larger improvement weights to pixels with larger negative anomalies. If the anomaly is close to zero, the weight is small. As the anomaly becomes more negative, the weight increases and approaches 1.
 
@@ -476,7 +476,7 @@ $$
 w(a) = \left(1 - e^{-\frac{|a|}{s}}\right)^{\gamma}
 $$
 
-- s and $gamma$ are shape parameters that control how quickly the weight increases with the magnitude of the anomaly. Probably both aren't needed.
+-   s and $gamma$ are shape parameters that control how quickly the weight increases with the magnitude of the anomaly. Probably both aren't needed.
 
 ```{r}
 #Overview of the weighting function effect
@@ -530,13 +530,11 @@ p_g <- ggplot(df_g, aes(a, w, colour = factor(gamma))) +
 grid.arrange(p_s, p_g, ncol = 2)
 ```
 
-
-For pixels neighbouring restored pixels:
-$$
+For pixels neighbouring restored pixels: $$
 a_k^{1} = a_k^{0} + \alpha_A \, \lambda \, w(a_k^{0})
 $$
 
-- $\lambda$ is the effect decay with distance from the restored pixel.
+-   $\lambda$ is the effect decay with distance from the restored pixel.
 
 Optimisation minimises the negative total improvement over the study area (i.e., Maximises total abiotic/biotic improvement from restoration):
 
@@ -544,7 +542,7 @@ $$
 f_{\text{a/biotic}}(x)=-\sum_{i \in \Omega_R}\left(a_i^{1} - a_i^{0}\right)
 $$
 
-Other choices for the objective function could be to  maximise the improvement in the worst-off pixels (i.e., minimising the worst anomaly after restoration), or maximising the number of pixels for which condition passes a certain threshold.
+Other choices for the objective function could be to maximise the improvement in the worst-off pixels (i.e., minimising the worst anomaly after restoration), or maximising the number of pixels for which condition passes a certain threshold.
 
 **Landscape condition**
 
@@ -554,8 +552,7 @@ $$
 L^{1} = 1 - D(\mathrm{LULC}^{1})
 $$
 
-where 
-$$
+where $$
 \mathrm{LULC}^{1} =\begin{cases}\text{focal class}, & \text{if } x_j^{C} = 1 \\\mathrm{LULC}^{0}, & \text{otherwise}\end{cases}
 $$
 
@@ -633,9 +630,9 @@ The total number of selected pixels, including restoration and conversion action
 
 A unified adaptive repair operator is applied after crossover and mutation.
 
-- Solutions that deviate strongly from the target number of actions (>20% of target number) are adjusted to restore feasibility.
-- Small deviations are tolerated to preserve diversity.
-- When repair is required, pixels are added or removed using a neutral, random mechanism.
+-   Solutions that deviate strongly from the target number of actions (\>20% of target number) are adjusted to restore feasibility.
+-   Small deviations are tolerated to preserve diversity.
+-   When repair is required, pixels are added or removed using a neutral, random mechanism.
 
 # Output from optimisation runs
 
@@ -687,7 +684,6 @@ DT::datatable(ecosystem_summary_t,
               options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE),
               rownames = FALSE)
 ```
-
 
 ```{r}
 #| label: pareto-comparison
@@ -806,7 +802,10 @@ if (!is.null(decision_stats) && nrow(decision_stats) > 0) {
 ```{python}
 #| label: generate-ecosystem-plots
 #| echo: false
+#| cache: false
 #| output: false
+
+from patch_approach import convert_patch_results_to_pixel_decisions
 
 # Generate and save all plots for each ecosystem
 plot_files = {
@@ -821,16 +820,60 @@ for ecosystem in r.ecosystem_types:
     if results_file:
         try:
             print(f"\n=== {ecosystem.upper()} ECOSYSTEM ===")
+
+            results = safe_pickle_load(results_file)
             
+               # Check what's in the results
+            if isinstance(results, dict):
+              print(f"Keys in results: {results.keys()}")
+              
+              # Check decision vector shape
+              if 'decisions' in results:
+                  print(f"decisions shape: {results['decisions'].shape}")
+              if 'X' in results:
+                  print(f"X shape: {results['X'].shape}")
+              if 'decisions_pixels' in results:
+                  print(f"decisions_pixels shape: {results['decisions_pixels'].shape}")
+              if 'decisions_patches' in results:
+                  print(f"decisions_patches shape: {results['decisions_patches'].shape}")
+              
+              # Check if patch-based
+              if 'patch_mappings' in results:
+                  print(f"✓ Has patch_mappings")
+                  print(f"  n_restoration_patches: {results['patch_mappings']['restoration_patches']['n_patches']}")
+                  print(f"  n_conversion_patches: {results['patch_mappings']['conversion_patches']['n_patches']}")
+              else:
+                  print(f"✗ No patch_mappings found")
+              
+              if 'is_patch_based' in results:
+                  print(f"is_patch_based: {results['is_patch_based']}")
+            else:
+                # It's a pymoo Result object
+                print(f"Type: {type(results)}")
+                print(f"X shape: {results.X.shape}")
+
+            # Check if patch-based and convert if needed
+            if 'patch_mappings' in results:
+                print(f"Converting patch-based results to pixels for {ecosystem}...")
+                results = convert_patch_results_to_pixel_decisions(
+                    results, 
+                    results['patch_mappings']
+                )
+                # Temporarily save converted results
+                converted_file = results_file.replace('.pkl', '_pixels.pkl')
+                with open(converted_file, 'wb') as f:
+                    pickle.dump(results, f)
+                results_file = converted_file
+
             # Selection frequency map
             create_selection_frequency_map(
                 pkl_path=results_file,
-                save_path=f'figs/selection_frequency_{ecosystem}.png',
+                save_path=f'figs/selection_frequency_{ecosystem}_patch.png',
                 cmap='YlOrRd',
                 title=f"Selection Frequency - {ecosystem.title()}",
                 action_type='combined'
             )
-            plot_files['selection_frequency'][ecosystem] = f'figs/selection_frequency_{ecosystem}.png'
+            plot_files['selection_frequency'][ecosystem] = f'figs/selection_frequency_{ecosystem}_patch.png'
             
             # Example solution
             plot_example_solution(
@@ -838,27 +881,27 @@ for ecosystem in r.ecosystem_types:
                 choose="best_sum",
                 title=f"Example Solution - {ecosystem.title()}",
                 action_type='combined',
-                save_path=f'figs/example_solution_{ecosystem}.png'
+                save_path=f'figs/example_solution_{ecosystem}_patch.png'
             )
-            plot_files['example_solution'][ecosystem] = f'figs/example_solution_{ecosystem}.png'
+            plot_files['example_solution'][ecosystem] = f'figs/example_solution_{ecosystem}_patch.png'
             
             # Pareto front
             plot_pareto_front(
                 pkl_path=results_file,
-                save_path=f'figs/pareto_front_{ecosystem}.png',
+                save_path=f'figs/pareto_front_{ecosystem}_patch.png',
                 figsize=(10, 8),
                 alpha=0.7
             )
-            plot_files['pareto_front'][ecosystem] = f'figs/pareto_front_{ecosystem}.png'
+            plot_files['pareto_front'][ecosystem] = f'figs/pareto_front_{ecosystem}_patch.png'
             
             # Parallel coordinates
             plot_parallel_coordinates(
                 pkl_path=results_file,
-                save_path=f'figs/parallel_coordinates_{ecosystem}.png',
+                save_path=f'figs/parallel_coordinates_{ecosystem}_patch.png',
                 figsize=(12, 7),
                 alpha_background=0.15
             )
-            plot_files['parallel_coordinates'][ecosystem] = f'figs/parallel_coordinates_{ecosystem}.png'
+            plot_files['parallel_coordinates'][ecosystem] = f'figs/parallel_coordinates_{ecosystem}_patch.png'
             
             print(f"✓ All plots generated for {ecosystem} ecosystem")
             
@@ -869,6 +912,8 @@ for ecosystem in r.ecosystem_types:
 
 print("\n=== Plot Generation Complete ===")
 ```
+
+## Results based on three objectives (abiotic, biotic, implementation cost)
 
 ```{python}
 #| label: generate-ecosystem-plots-alt
@@ -950,249 +995,6 @@ for ecosystem in r.ecosystem_types:
     print(f"✗ Error generating ALT plots for {ecosystem}: {e}")
 ```
 
-## A: Weak spatial signal in selection
-
-### Selection Frequency Maps
-
-(small error in the pixel counts on these plots)
-
-```{r}
-#| label: selection-frequency-grid
-#| fig.width: 15
-#| fig.height: 5
-#| echo: false
-
-# Create selection frequency maps grid
-selection_plots <- list()
-for (ecosystem in ecosystem_types) {
-  img_path <- paste0("figs/selection_frequency_", ecosystem, ".png")
-  if (file.exists(img_path)) {
-    img <- image_read(img_path)
-    selection_plots[[ecosystem]] <- ggdraw() + draw_image(img)
-  }
-}
-
-
-selection_grobs <- list()
-
-for (ecosystem in names(selection_plots)) {
-
-  p <- selection_plots[[ecosystem]]
-  
-  # Create label grob
-  label <- textGrob(
-    ecosystem,
-    gp = gpar(fontsize = 12, fontface = "bold")
-  )
-  
-  # Stack label above plot
-  selection_grobs[[ecosystem]] <- arrangeGrob(
-    label,
-    p,
-    ncol = 1,
-    heights = c(0.08, 0.92)
-  )
-}
-
-if (length(selection_grobs) > 0) {
-
-  selection_grid <- grid.arrange(
-    grobs = selection_grobs,   nrow = 1,   ncol = 3
-  )
-
-} else {
-  cat("No selection frequency plots available\n")
-}
-```
-
-### Example Pareto-Optimal Solutions
-
-```{r}
-#| label: example-solution-grid
-#| fig.width: 15
-#| fig.height: 5
-#| echo: false
-
-# Create example solution grid
-example_plots <- list()
-for (ecosystem in ecosystem_types) {
-  img_path <- paste0("figs/example_solution_", ecosystem, ".png")
-  if (file.exists(img_path)) {
-    img <- image_read(img_path)
-    example_plots[[ecosystem]] <- ggdraw() + draw_image(img)
-  }
-}
-
-example_grobs <- list()
-
-for (ecosystem in names(example_plots)) {
-
-  p <- example_plots[[ecosystem]]
-
-  # Create label grob
-  label <- textGrob(ecosystem, gp = gpar(fontsize = 12, fontface = "bold"))
-  
-  # Stack label above plot
-  example_grobs[[ecosystem]] <- arrangeGrob(label, p, ncol = 1, heights = c(0.08, 0.92))
-}
-
-if (length(example_grobs) > 0) {
-  example_grid <- grid.arrange(grobs = example_grobs, nrow = 1, ncol = 3)
-} else {
-  cat("No example solution plots available\n")
-}
-```
-
-## B: Objective space problems
-
-## B1: Redundancy of objectives
-
-Cause identified - this is only because the landscape objective is not well implemented
-
-### Pareto fronts
-
-```{r}
-#| label: pareto-front-grid
-#| fig.width: 15
-#| fig.height: 5
-#| echo: false
-
-# Create Pareto front grid
-pareto_plots <- list()
-for (ecosystem in ecosystem_types) {
-  img_path <- paste0("figs/pareto_front_", ecosystem, ".png")
-  if (file.exists(img_path)) {
-    img <- image_read(img_path)
-    pareto_plots[[ecosystem]] <- ggdraw() + draw_image(img)
-  }
-}
-
-pareto_grobs <- list()
-
-for (ecosystem in names(pareto_plots)) {
-
-  p <- pareto_plots[[ecosystem]]
-  
-  # Create label grob
-  label <- textGrob(ecosystem, gp = gpar(fontsize = 12, fontface = "bold"))
-  
-  # Stack label above plot
-  pareto_grobs[[ecosystem]] <- arrangeGrob(
-    label, p, ncol = 1,
-    heights = c(0.08, 0.92)
-  )
-}
-
-if (length(pareto_grobs) > 0) {
-  pareto_grid <- grid.arrange(grobs = pareto_grobs, nrow = 1, ncol = 3)
-} else {
-  cat("No pareto front plots available\n")
-}
-```
-
-### Parallel coordinates
-```{r}
-#| label: parallel-coordinates-grid
-#| fig.width: 15
-#| fig.height: 5
-#| echo: false
-
-# Create parallel coordinates grid
-parallel_plots <- list()
-for (ecosystem in ecosystem_types) {
-  img_path <- paste0("figs/parallel_coordinates_", ecosystem, ".png")
-  if (file.exists(img_path)) {
-    img <- image_read(img_path)
-    parallel_plots[[ecosystem]] <- ggdraw() + draw_image(img)
-  }
-}
-
-parallel_grobs <- list()
-
-for (ecosystem in names(parallel_plots)) {
-
-  p <- parallel_plots[[ecosystem]]
-  
-  # Create label grob
-  label <- textGrob(ecosystem, gp = gpar(fontsize = 12, fontface = "bold"))
-  
-  # Stack label above plot
-  parallel_grobs[[ecosystem]] <- arrangeGrob(
-    label, p, ncol = 1,
-    heights = c(0.08, 0.92)
-  )
-}
-
-if (length(parallel_grobs) > 0) {
-  parallel_grid <- grid.arrange(grobs = parallel_grobs, nrow = 1, ncol = 3)
-} else {
-  cat("No parallel coordinates plots available\n")
-}
-```
-
-### Objective correlations
-```{r}
-#| label: correlation-analysis
-
-# Load gridExtra for grid.arrange
-library(gridExtra)
-
-# Extract and visualize correlation matrices
-correlation_plots <- list()
-correlation_tables <- list()
-
-for (ecosystem in names(ecosystem_reports)) {
-  report <- ecosystem_reports[[ecosystem]]
-  
-  if (!is.null(report$population_diagnostics$objective_correlations)) {
-    correlations <- report$population_diagnostics$objective_correlations
-    
-    # Convert to matrix format
-    obj_names <- names(correlations)
-    corr_matrix <- matrix(NA, length(obj_names), length(obj_names))
-    rownames(corr_matrix) <- colnames(corr_matrix) <- obj_names
-    
-    for (i in seq_along(obj_names)) {
-      for (j in seq_along(obj_names)) {
-        corr_matrix[i, j] <- correlations[[obj_names[i]]][[obj_names[j]]]
-      }
-    }
-    
-    # Create correlation heatmap
-    corr_matrix_diag <- corr_matrix
-    diag(corr_matrix_diag) <- NA
-    corr_df <- as.data.frame(as.table(corr_matrix_diag))
-    names(corr_df) <- c("Objective1", "Objective2", "Correlation")
-    
-    p_corr <- ggplot(corr_df, aes(x = Objective1, y = Objective2, fill = Correlation)) +
-      geom_tile(color = "white") +
-      scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0,
-                          limit = c(-1, 1), space = "Lab",
-                          name = "Correlation", na.value="grey80") +
-      labs(title = str_to_title(ecosystem)) +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1),
-            plot.title = element_text(size = 12),
-            axis.title = element_blank()) +
-      coord_fixed()
-    
-    # Store plot and correlation table
-    correlation_plots[[ecosystem]] <- p_corr
-    correlation_tables[[ecosystem]] <- corr_matrix
-  }
-}
-
-# Display correlation plots in a 2x2 grid
-if (length(correlation_plots) > 0) {
-  grid.arrange(correlation_plots[[1]], correlation_plots[[2]], 
-                correlation_plots[[3]], layout_matrix = rbind(c(1, 2), c(3, NA)))
-}
-```
-
-## Without landscape objective:
-Running *without* landscape objective
---> less solutions, higher diversity in solutions, weaker correlations between objectives
-
 ### Pareto fronts
 
 ```{r}
@@ -1233,8 +1035,9 @@ if (length(pareto_grobs) > 0) {
   cat("No pareto front plots available\n")
 }
 ```
- 
+
 ### Parallel coordinates
+
 ```{r}
 #| label: parallel-coordinates-grid-ab
 #| fig.width: 15
@@ -1275,6 +1078,7 @@ if (length(parallel_grobs) > 0) {
 ```
 
 ### Objective correlations
+
 ```{r}
 #| label: correlation-analysis-ab
 
@@ -1350,14 +1154,783 @@ for (ecosystem in names(ecosystem_reports_alt)) {
 
 # Display correlation plots in a 2x2 grid
 if (length(correlation_plots) > 0) {
-  grid.arrange(correlation_plots[[1]], correlation_plots[[2]], 
-                correlation_plots[[3]], layout_matrix = rbind(c(1, 2), c(3, NA)))
+  gridExtra::grid.arrange(grobs = correlation_plots, ncol = 3)
+} else {
+  cat("No correlation plots available\n")
 }
 ```
 
-## B2: Weak sensitivity of landscape objective
+## A. Weak spatial signal in selection, indicating degeneracy
 
-Basically the current set up of this objective drives very little change in landscape anomaly values across the solution space, so it has very little influence on selection of solutions. CV of landscape objective in all ecosystems is very low.
+Selection frequency:
+
+```{r}
+#| label: selection-frequency-grid-weak
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create selection frequency maps grid
+selection_plots <- list()
+for (ecosystem in ecosystem_types) {
+  img_path <- paste0("figs/selection_frequency_", ecosystem, "_patch.png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    selection_plots[[ecosystem]] <- ggdraw() + draw_image(img)
+  }
+}
+
+selection_grobs <- list()
+
+for (ecosystem in names(selection_plots)) {
+
+  p <- selection_plots[[ecosystem]]
+  
+  # Create label grob
+  label <- textGrob(
+    ecosystem,
+    gp = gpar(fontsize = 12, fontface = "bold")
+  )
+  
+  # Stack label above plot
+  selection_grobs[[ecosystem]] <- arrangeGrob(
+    label,
+    p,
+    ncol = 1,
+    heights = c(0.08, 0.92)
+  )
+}
+
+if (length(selection_grobs) > 0) {
+
+  selection_grid <- grid.arrange(
+    grobs = selection_grobs,   nrow = 1,   ncol = 3
+  )
+
+} else {
+  cat("No selection frequency plots available\n")
+}
+```
+
+What is driving weak spatial signal in selection?
+
+Comparing across seeds, as different seeds generate different initial populations and evolutionary paths.
+
+```{python}
+#| echo: false
+#| message: false
+#| warning: false
+#| results: hide
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pymoo.indicators.hv import HV
+from analyze_spatial_agreement import analyze_spatial_agreement
+import os
+
+# Date code for the multi-seed run files to analyze (MMDD format)
+FILE_DATE = "2602"  # Change this to analyze a different run
+
+# File numbering range (e.g., 1-10 or 11-20)
+FILE_START = 11  # Starting file number
+FILE_END = 20    # Ending file number (inclusive)
+
+# Ecosystem to analyze
+ECOSYSTEM = "forest"
+
+# K nearest neighbors to consider
+K_NEIGHBORS = 5
+
+# Whether these are patch-based results
+USE_PATCH_APPROACH = False  # Set to True for patch-based results
+
+# =============================================================================
+# Run Spatial Agreement Analysis
+# =============================================================================
+
+# Generate expected output filename
+suffix = "_patch" if USE_PATCH_APPROACH else "_pixel"
+output_file = f"spatial_agreement_{ECOSYSTEM}_{FILE_DATE}{suffix}.csv"
+
+# Check if analysis has already been run
+if os.path.exists(output_file):
+    print(f"Loading existing results from {output_file}...")
+    agreement_df = pd.read_csv(output_file)
+    print(f"✓ Loaded {len(agreement_df)} solutions")
+else:
+    print(f"Running spatial agreement analysis...")
+    # Run analysis (results will be saved to CSV)
+    agreement_df = analyze_spatial_agreement(
+        ecosystem=ECOSYSTEM,
+        file_date=FILE_DATE,
+        file_start=FILE_START,
+        file_end=FILE_END,
+        k_neighbors=K_NEIGHBORS,
+        use_patch_approach=USE_PATCH_APPROACH,
+        output_file=output_file
+    )
+
+# =============================================================================
+# Plot Results
+# =============================================================================
+
+if agreement_df is not None and len(agreement_df) > 0:
+    # Plot spatial agreement vs objective distance
+    fig, axes = plt.subplots(1, 1, figsize=(14, 5))
+    
+    # Scatter: Jaccard vs objective distance
+    scatter = axes.scatter(agreement_df['mean_obj_distance'], 
+                              agreement_df['mean_jaccard'],
+                              c=agreement_df['seed'], 
+                              cmap='viridis', 
+                              alpha=0.6, s=50)
+    axes.set_xlabel('Mean Objective Distance to Neighbors')
+    axes.set_ylabel('Mean Jaccard Similarity')
+    axes.set_title('Spatial Agreement vs Objective Space Proximity')
+    axes.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=axes, label='Seed')
+    
+    plt.tight_layout()
+    plt.show()
+else:
+    print("✗ No spatial agreement data available for plotting")
+
+```
+
+- Mean objective distance to neighbours: average Euclidean distance in normalised objective space between a Pareto solution and its K closest solutions from other seeds.
+
+- Mean Jaccard similarity: the average proportion of shared selected pixels between that solution and the same K objective matched neighbours.
+
+Solutions that are very close in objective space (low mean objective distance) also have low value for Jaccard similarity, meaning that many different spatial configurations yield nearly identical objective values. This indicates substitutability in decision space:
+- Many alternative configurations are good
+- Pixels can be swapped without much effect on objective values
+
+## Test solution: select patches, rather than pixels
+
+Tested across different patch sizes for forest ecosystem.
+
+Shows that the weak spatial pattern was due to pixel-level substitutability: 
+  - Aggregating pixels into patches increases spatial agreement between solutions, but it also increases alignment between objectives, which become more correlated and reducing trade-offs.
+
+### Patches improve spatial agreement between solutions...
+
+```{python}
+#| label: patch-size-plots
+#| echo: false
+#| output: false
+
+import os
+import pickle
+import matplotlib.pyplot as plt
+from patch_approach import convert_patch_results_to_pixel_decisions
+
+# Configuration
+PATCH_SIZES = [2, 5, 10]
+ECOSYSTEM = "forest"
+SEED = 100  # Use one representative seed for visualization
+DATE_TAG = "0403"
+
+plot_files_patchsize = {
+  'selection_frequency': {},
+  'parallel_coordinates': {},
+  'pareto_front': {}
+}
+
+# Create figs directory if it doesn't exist
+os.makedirs('patch_tests/figs', exist_ok=True)
+
+# Generate plots for each patch size
+for patch_size in PATCH_SIZES:
+    results_dir = f"patch_tests/{ECOSYSTEM}_{patch_size}_{SEED}"
+    results_file = None
+    
+    # Find the pkl file
+    if os.path.exists(results_dir):
+        pkl_files = [
+            f for f in os.listdir(results_dir)
+            if f.endswith(".pkl") and DATE_TAG in f
+        ]
+        if pkl_files:
+            results_file = os.path.join(results_dir, pkl_files[0])
+    
+    if results_file:
+        try:
+            print(f"\n=== Patch Size {patch_size}×{patch_size} ===")
+            print(f"Using: {results_file}")
+            
+            # Load and convert patch-based results to pixel-based
+            with open(results_file, 'rb') as f:
+                results = pickle.load(f)
+            
+            # Check if patch-based and convert if needed
+            if 'patch_mappings' in results:
+                print(f"Converting patch-based results to pixel decisions...")
+                results = convert_patch_results_to_pixel_decisions(
+                    results, 
+                    results['patch_mappings']
+                )
+                # Save converted results
+                converted_file = results_file.replace('.pkl', '_pixels.pkl')
+                with open(converted_file, 'wb') as f:
+                    pickle.dump(results, f)
+                results_file = converted_file
+                print(f"Converted results saved to: {converted_file}")
+            
+            # Selection frequency map
+            create_selection_frequency_map(
+                pkl_path=results_file,
+                save_path=f'patch_tests/figs/selection_frequency_{ECOSYSTEM}_patch{patch_size}.png',
+                cmap='YlOrRd',
+                title=f"Selection Frequency - Patch {patch_size}×{patch_size}",
+                action_type='combined'
+            )
+            plt.close("all")
+            plot_files_patchsize['selection_frequency'][patch_size] = f'patch_tests/figs/selection_frequency_{ECOSYSTEM}_patch{patch_size}.png'
+            
+            # Parallel coordinates
+            plot_parallel_coordinates(
+                pkl_path=results_file,
+                save_path=f'patch_tests/figs/parallel_coordinates_{ECOSYSTEM}_patch{patch_size}.png',
+                figsize=(12, 7),
+                alpha_background=0.15
+            )
+            plt.close("all")
+            plot_files_patchsize['parallel_coordinates'][patch_size] = f'patch_tests/figs/parallel_coordinates_{ECOSYSTEM}_patch{patch_size}.png'
+            
+            # Pareto front
+            plot_pareto_front(
+                pkl_path=results_file,
+                save_path=f'patch_tests/figs/pareto_front_{ECOSYSTEM}_patch{patch_size}.png',
+                figsize=(10, 8),
+                alpha=0.7
+            )
+            plt.close("all")
+            plot_files_patchsize['pareto_front'][patch_size] = f'patch_tests/figs/pareto_front_{ECOSYSTEM}_patch{patch_size}.png'
+            
+            print(f"✓ Plots generated for patch size {patch_size}")
+            
+        except Exception as e:
+            print(f"✗ Error generating plots for patch size {patch_size}: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"✗ No results file for patch size {patch_size}")
+```
+
+Selection frequency:
+
+```{r}
+#| label: patch-size-selection-freq
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create selection frequency grid by patch size
+sel_freq_plots <- list()
+patch_sizes <- c(2, 5, 10)
+
+for (ps in patch_sizes) {
+  img_path <- paste0("patch_tests/figs/selection_frequency_forest_patch", ps, ".png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    sel_freq_plots[[as.character(ps)]] <- ggdraw() + draw_image(img)
+  }
+}
+
+if (length(sel_freq_plots) > 0) {
+  plot_grid(plotlist = sel_freq_plots, ncol = 3, 
+            labels = paste0("Patch ", names(sel_freq_plots), "×", names(sel_freq_plots)),
+            label_size = 12)
+} else {
+  cat("No selection frequency plots available for patch size comparison\n")
+}
+```
+Spatial Agreement 
+
+```{python}
+#| label: jaccard-analysis-patchsize
+#| echo: false
+#| output: true
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import cdist
+from patch_approach import convert_patch_results_to_pixel_decisions
+
+def jaccard_similarity(x1, x2):
+    intersection = np.sum(np.logical_and(x1, x2))
+    union = np.sum(np.logical_or(x1, x2))
+    return float(intersection / union) if union > 0 else 0.0
+
+ECOSYSTEM = "forest"
+PATCH_SIZES = [2, 5, 10]
+SEEDS = [100, 101, 102, 103, 104]
+K_NEIGHBORS = 5
+DATE_TAG = "0403"
+
+all_agreement_data = []
+
+for patch_size in PATCH_SIZES:
+
+    all_decisions = []
+    all_objectives = []
+    seed_labels = []
+
+    for seed in SEEDS:
+        results_dir = f"patch_tests/{ECOSYSTEM}_{patch_size}_{seed}"
+        if not os.path.exists(results_dir):
+            print(f"  Seed {seed}: folder not found")
+            continue
+
+        pkl_files = [
+            f for f in os.listdir(results_dir)
+            if f.endswith(".pkl") and DATE_TAG in f
+        ]
+        if not pkl_files:
+            print(f"  Seed {seed}: no pkl files found")
+            continue
+
+        # Prefer original pkl; fall back to pixels pkl if that is all that exists
+        preferred = [f for f in pkl_files if "_pixels" not in f]
+        chosen = preferred[0] if preferred else pkl_files[0]
+        results_file = os.path.join(results_dir, chosen)
+
+        try:
+            with open(results_file, "rb") as f:
+                results = pickle.load(f)
+
+            # Convert patch-based to pixel-based if needed
+            if isinstance(results, dict) and ("patch_mappings" in results):
+                results = convert_patch_results_to_pixel_decisions(results, results["patch_mappings"])
+
+            # Robust extraction of decisions
+            X = None
+            if isinstance(results, dict):
+                for k in ["X", "decisions_pixels", "decisions"]:
+                    if k in results and results[k] is not None and np.size(results[k]) > 0:
+                        X = np.asarray(results[k])
+                        break
+            else:
+                if hasattr(results, "X") and results.X is not None and np.size(results.X) > 0:
+                    X = np.asarray(results.X)
+
+            # Robust extraction of objectives
+            F = None
+            if isinstance(results, dict):
+                for k in ["objectives", "F"]:
+                    if k in results and results[k] is not None and np.size(results[k]) > 0:
+                        F = np.asarray(results[k])
+                        break
+            else:
+                if hasattr(results, "F") and results.F is not None and np.size(results.F) > 0:
+                    F = np.asarray(results.F)
+
+            if X is None or F is None:
+                keys = list(results.keys()) if isinstance(results, dict) else [a for a in dir(results) if a in ["X", "F"]]
+                print(f"  Seed {seed}: missing X or F, available keys: {keys}")
+                continue
+
+            if X.shape[0] != F.shape[0]:
+                print(f"  Seed {seed}: mismatch rows, X {X.shape}, F {F.shape}; skipping")
+                continue
+
+            all_decisions.append(X)
+            all_objectives.append(F)
+            seed_labels.extend([seed] * X.shape[0])
+
+        except Exception as e:
+            print(f"  Seed {seed}: error loading {results_file}: {e}")
+
+    if not all_decisions:
+        print("  ✗ No usable solutions found for this patch size")
+        continue
+
+    X_all = np.vstack(all_decisions)
+    F_all = np.vstack(all_objectives)
+    seed_labels = np.asarray(seed_labels)
+
+    # Pairwise distances in objective space
+    obj_distances = cdist(F_all, F_all, metric="euclidean")
+
+    collected_this_ps = 0
+
+    for i in range(X_all.shape[0]):
+        current_seed = seed_labels[i]
+        different_seed_mask = seed_labels != current_seed
+
+        if np.sum(different_seed_mask) < K_NEIGHBORS:
+            continue
+
+        distances_to_others = obj_distances[i, different_seed_mask]
+        indices_different_seeds = np.where(different_seed_mask)[0]
+
+        nearest_k_local = np.argsort(distances_to_others)[:K_NEIGHBORS]
+        neighbor_indices = indices_different_seeds[nearest_k_local]
+
+        jaccard_values = [jaccard_similarity(X_all[i], X_all[j]) for j in neighbor_indices]
+
+        all_agreement_data.append({
+            "patch_size": int(patch_size),
+            "seed": int(current_seed),
+            "solution_idx": int(i),
+            "mean_jaccard": float(np.mean(jaccard_values)),
+            "std_jaccard": float(np.std(jaccard_values)),
+            "min_jaccard": float(np.min(jaccard_values)),
+            "max_jaccard": float(np.max(jaccard_values)),
+            "mean_obj_distance": float(np.mean(distances_to_others[nearest_k_local])),
+        })
+        collected_this_ps += 1
+
+    if collected_this_ps == 0:
+        print("  ✗ No agreement records collected (likely too few cross-seed neighbors)")
+    else:
+        mean_j = np.mean([d["mean_jaccard"] for d in all_agreement_data if d["patch_size"] == patch_size])
+
+if all_agreement_data:
+    agreement_df = pd.DataFrame(all_agreement_data)
+
+    output_file = f"spatial_agreement_patchsize_comparison_{ECOSYSTEM}.csv"
+    agreement_df.to_csv(output_file, index=False)
+
+    summary = agreement_df.groupby("patch_size")["mean_jaccard"].agg(["mean", "std", "min", "max"])
+    print(summary)
+else:
+    print("\n✗ No agreement data collected")
+    agreement_df = None
+```
+
+### ... but also likely over-constrains the problem...
+
+```{r}
+#| label: jaccard-plot-patchsize
+#| echo: false
+#| fig.width: 12
+#| fig.height: 6
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+ECOSYSTEM <- "forest"
+csv_path <- paste0("spatial_agreement_patchsize_comparison_", ECOSYSTEM, ".csv")
+
+if (!file.exists(csv_path)) {
+  cat("✗ Cannot plot: CSV not found at ", csv_path, "\n", sep = "")
+} else {
+
+  agreement_df <- read.csv(csv_path)
+
+  if (nrow(agreement_df) == 0) {
+    cat("✗ Cannot plot: CSV is empty\n")
+  } else {
+
+    agreement_df <- agreement_df %>%
+      mutate(patch_size = as.integer(patch_size)) %>%
+      mutate(patch_label = paste0(patch_size, "×", patch_size))
+    p <- ggplot(
+      agreement_df,
+      aes(x = mean_obj_distance, y = mean_jaccard)
+    ) +
+      geom_point(alpha = 0.7, size = 2) +
+      facet_wrap(~ patch_size, ncol = 3) +
+      labs(
+        x = "Mean Objective Distance to Neighbors",
+        y = "Mean Jaccard Similarity",
+        title = "Spatial Agreement by Patch Size"
+      ) +
+      theme_minimal() +
+      theme(
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+
+    dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+    out_png <- "figs/jaccard_patchsize_comparison.png"
+    ggsave(out_png, p, width = 12, height = 6, dpi = 300)
+
+    print(p)
+  }
+}
+```
+
+### ...as patch approach increases objective correlations and reduce trade-offs
+
+Pareto Fronts
+
+```{r}
+#| label: patch-size-pareto
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create pareto front grid by patch size
+pareto_plots <- list()
+
+for (ps in patch_sizes) {
+  img_path <- paste0("patch_tests/figs/pareto_front_forest_patch", ps, ".png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    pareto_plots[[as.character(ps)]] <- ggdraw() + draw_image(img)
+  }
+}
+
+if (length(pareto_plots) > 0) {
+  plot_grid(plotlist = pareto_plots, ncol = 3,
+            labels = paste0("Patch ", names(pareto_plots), "×", names(pareto_plots)),
+            label_size = 12)
+} else {
+  cat("No pareto front plots available for patch size comparison\n")
+}
+```
+
+Parallel Coordinates
+
+```{r}
+#| label: patch-size-parallel
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create parallel coordinates grid by patch size
+par_coord_plots <- list()
+
+for (ps in patch_sizes) {
+  img_path <- paste0("patch_tests/figs/parallel_coordinates_forest_patch", ps, ".png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    par_coord_plots[[as.character(ps)]] <- ggdraw() + draw_image(img)
+  }
+}
+
+if (length(par_coord_plots) > 0) {
+  plot_grid(plotlist = par_coord_plots, ncol = 3,
+            labels = paste0("Patch ", names(par_coord_plots), "×", names(par_coord_plots)),
+            label_size = 12)
+} else {
+  cat("No parallel coordinate plots available for patch size comparison\n")
+}
+```
+
+Objective Correlations
+
+```{r}
+#| label: patch-size-correlations
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Extract correlations for each patch size from JSON reports
+corr_plots_ps <- list()
+
+for (ps in patch_sizes) {
+  results_dir <- paste0("patch_tests/forest_", ps, "_100")
+  json_files <- list.files(
+    results_dir,
+    pattern = "optimization_report.*0403.*\\.json$",
+    full.names = TRUE
+  )
+  
+  if (length(json_files) > 0) {
+    json_text <- readLines(json_files[1], warn = FALSE)
+    json_text <- paste(json_text, collapse = "\n")
+    json_text <- gsub('\\bNaN\\b', 'null', json_text)
+    report <- fromJSON(json_text, flatten = FALSE)
+    
+    if (!is.null(report$population_diagnostics$objective_correlations)) {
+      correlations <- report$population_diagnostics$objective_correlations
+      obj_names <- names(correlations)
+      n_obj <- length(obj_names)
+      corr_matrix <- matrix(NA, n_obj, n_obj)
+      rownames(corr_matrix) <- obj_names
+      colnames(corr_matrix) <- obj_names
+      
+      for (i in 1:n_obj) {
+        for (j in 1:n_obj) {
+          corr_matrix[i, j] <- correlations[[obj_names[i]]][[obj_names[j]]]
+        }
+      }
+      
+      # Create correlation heatmap
+      corr_df <- as.data.frame(as.table(corr_matrix))
+      names(corr_df) <- c("Objective1", "Objective2", "Correlation")
+      
+      p_corr <- ggplot(corr_df, aes(x = Objective1, y = Objective2, fill = Correlation)) +
+        geom_tile(color = "white") +
+        geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3) +
+        scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0,
+                            name = "Correlation", na.value="grey80") +
+        labs(title = paste0("Patch ", ps, "×", ps)) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              axis.title = element_blank())
+      
+      corr_plots_ps[[as.character(ps)]] <- p_corr
+    }
+  }
+}
+
+if (length(corr_plots_ps) > 0) {
+  plot_grid(plotlist = corr_plots_ps, ncol = 3)
+} else {
+  cat("No correlation data available for patch size comparison\n")
+}
+```
+
+--> Next steps: 
+- Introduce boundary penalties (as per Marxan) - fragmented solutions become more expensive: could be as a fourth objective, as a constraint, or in the repair operator.
+- Introduce connectivity benefit (as per Zonation): make condition improvement partially dependent on the condition of neighbouring pixles, so that clustered decision variables are better than scattered ones.
+
+## B: Landscape objective is not working as intended
+
+When landscape improvement/conversion action is included in the optimisation, results show high correlations between objectives.
+
+### Pareto fronts
+
+```{r}
+#| label: pareto-front-grid
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create Pareto front grid
+pareto_plots <- list()
+for (ecosystem in ecosystem_types) {
+  img_path <- paste0("figs/pareto_front_", ecosystem, "_patch.png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    pareto_plots[[ecosystem]] <- ggdraw() + draw_image(img)
+  }
+}
+
+pareto_grobs <- list()
+
+for (ecosystem in names(pareto_plots)) {
+
+  p <- pareto_plots[[ecosystem]]
+  
+  # Create label grob
+  label <- textGrob(ecosystem, gp = gpar(fontsize = 12, fontface = "bold"))
+  
+  # Stack label above plot
+  pareto_grobs[[ecosystem]] <- arrangeGrob(
+    label, p, ncol = 1,
+    heights = c(0.08, 0.92)
+  )
+}
+
+if (length(pareto_grobs) > 0) {
+  pareto_grid <- grid.arrange(grobs = pareto_grobs, nrow = 1, ncol = 3)
+} else {
+  cat("No pareto front plots available\n")
+}
+```
+
+### Parallel coordinates
+
+```{r}
+#| label: parallel-coordinates-grid
+#| fig.width: 15
+#| fig.height: 5
+#| echo: false
+
+# Create parallel coordinates grid
+parallel_plots <- list()
+for (ecosystem in ecosystem_types) {
+  img_path <- paste0("figs/parallel_coordinates_", ecosystem, "_patch.png")
+  if (file.exists(img_path)) {
+    img <- image_read(img_path)
+    parallel_plots[[ecosystem]] <- ggdraw() + draw_image(img)
+  }
+}
+
+parallel_grobs <- list()
+
+for (ecosystem in names(parallel_plots)) {
+
+  p <- parallel_plots[[ecosystem]]
+  
+  # Create label grob
+  label <- textGrob(ecosystem, gp = gpar(fontsize = 12, fontface = "bold"))
+  
+  # Stack label above plot
+  parallel_grobs[[ecosystem]] <- arrangeGrob(
+    label, p, ncol = 1,
+    heights = c(0.08, 0.92)
+  )
+}
+
+if (length(parallel_grobs) > 0) {
+  parallel_grid <- grid.arrange(grobs = parallel_grobs, nrow = 1, ncol = 3)
+} else {
+  cat("No parallel coordinates plots available\n")
+}
+```
+
+### Objective correlations
+
+```{r}
+#| label: correlation-analysis
+
+# Load gridExtra for grid.arrange
+library(gridExtra)
+
+# Extract and visualize correlation matrices
+correlation_plots <- list()
+correlation_tables <- list()
+
+for (ecosystem in names(ecosystem_reports)) {
+  report <- ecosystem_reports[[ecosystem]]
+  
+  if (!is.null(report$population_diagnostics$objective_correlations)) {
+    correlations <- report$population_diagnostics$objective_correlations
+    
+    # Convert to matrix format
+    obj_names <- names(correlations)
+    corr_matrix <- matrix(NA, length(obj_names), length(obj_names))
+    rownames(corr_matrix) <- colnames(corr_matrix) <- obj_names
+    
+    for (i in seq_along(obj_names)) {
+      for (j in seq_along(obj_names)) {
+        corr_matrix[i, j] <- correlations[[obj_names[i]]][[obj_names[j]]]
+      }
+    }
+    
+    # Create correlation heatmap
+    corr_matrix_diag <- corr_matrix
+    diag(corr_matrix_diag) <- NA
+    corr_df <- as.data.frame(as.table(corr_matrix_diag))
+    names(corr_df) <- c("Objective1", "Objective2", "Correlation")
+    
+    p_corr <- ggplot(corr_df, aes(x = Objective1, y = Objective2, fill = Correlation)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0,
+                          limit = c(-1, 1), space = "Lab",
+                          name = "Correlation", na.value="grey80") +
+      labs(title = str_to_title(ecosystem)) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(size = 12),
+            axis.title = element_blank()) +
+      coord_fixed()
+    
+    # Store plot and correlation table
+    correlation_plots[[ecosystem]] <- p_corr
+    correlation_tables[[ecosystem]] <- corr_matrix
+  }
+}
+
+# Display correlation plots in a 2x2 grid
+if (length(correlation_plots) > 0) {
+  gridExtra::grid.arrange(grobs = correlation_plots, ncol = 3)
+} else {
+  cat("No correlation plots available\n")
+}
+```
+
+The current set up of this objective drives very little change in landscape anomaly values across the solution space, so it has very little influence on selection of solutions. CV of landscape objective in all ecosystems is very low.
 
 ### Landscape Objective Sensitivity Test
 
@@ -1465,7 +2038,8 @@ else:
     plt.show()
 ```
 
-Different intensities of conversion produce only small changes to objective value/
+Different intensities of conversion produce only small changes to objective value
+
 ```{python}
 #| echo: false
 #| message: false
@@ -1613,6 +2187,7 @@ if (!is.null(all_objective_stats) && nrow(all_objective_stats) > 0) {
 }
 ```
 
+# Other results - probably needs to be re-evaluated.
 ### Population vs Pareto Front Variance
 
 For run without landscape objective.
@@ -1891,5 +2466,3 @@ if (length(ecosystem_evolution_reports) > 0) {
     facet_wrap(~Ecosystem, scales = "free_y", ncol = 1)
 ```
 
-
-------------------------------------------------------------------------

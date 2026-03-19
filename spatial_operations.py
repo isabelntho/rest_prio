@@ -72,6 +72,8 @@ def compute_sn_dens_array(lu, nodata, res, focal_classes, radius_m=300):
     dens = np.divide(sum_focal, n_valid, out=np.full_like(sum_focal, np.nan), where=(n_valid > 0))
     return dens
 
+# https://docs.scipy.org/doc/scipy/reference/ndimage.html may be faster
+
 # fclass = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
 #     52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
 
@@ -496,6 +498,7 @@ class AdaptiveRepair(Repair):
             scenario_params = {}
         self.burden_sharing = scenario_params.get('burden_sharing', 'no') == 'yes'
         self.clustering_strength = scenario_params.get('spatial_clustering', 0.0)
+        self.adjacency_beta = float(scenario_params.get('adjacency_beta', 0.25))  # Tunable adjacency weight
         
         # Initialize repair logging
         self.call_log = []  # Store repair events: {'generation': int, 'type': str, 'individuals_repaired': int}
@@ -527,9 +530,8 @@ class AdaptiveRepair(Repair):
                 
                 if abs(current_total - target) > tolerance:
                     individuals_repaired += 1
-                    # Use neutral (random) repair only - scores disabled for neutral repair
-                    # Change this condition to enable score-based repair: if self.scores is not None and np.random.random() < 0.3:
-                    if False:  # Disabled score-based repair for neutral constraint enforcement
+                    # Use score-based repair with adjacency-aware dynamic scoring
+                    if self.scores is not None:
                         x = self._enforce_count_with_scores(x, problem)
                         score_repairs += 1
                     else:
@@ -578,8 +580,62 @@ class AdaptiveRepair(Repair):
         
         return X_repaired
     
+    def _compute_adjacency_scores(self, x_restore):
+        """
+        Compute 4-neighbourhood adjacency scores for all pixels in the restoration eligible set.
+        Returns the count of selected neighbours for each pixel.
+        
+        Args:
+            x_restore: Binary array indicating selected restoration pixels
+            
+        Returns:
+            adjacency_scores: Array with adjacency count (0-4) for each pixel
+        """
+        shape = self.initial_conditions["shape"]
+        n_pixels = len(x_restore)
+        adjacency_scores = np.zeros(n_pixels, dtype=np.float64)
+        
+        # Get indices of currently selected pixels
+        selected_indices = np.where(x_restore == 1)[0]
+        
+        if len(selected_indices) == 0:
+            return adjacency_scores
+        
+        # Convert selected indices to 2D coordinates
+        selected_rows, selected_cols = np.divmod(selected_indices, shape[1])
+        
+        # Create a 2D map of selected pixels for fast lookup
+        selected_map = np.zeros(shape, dtype=bool)
+        selected_map[selected_rows, selected_cols] = True
+        
+        # Get all restoration-eligible indices
+        elig_indices = self.initial_conditions.get("restoration_eligible_indices", np.arange(n_pixels))
+        rows, cols = np.divmod(elig_indices, shape[1])
+        
+        # Compute 4-neighbourhood adjacency for each pixel
+        # 4-neighbourhood: up, down, left, right
+        for i in range(n_pixels):
+            r, c = rows[i], cols[i]
+            adj_count = 0
+            
+            # Check 4 neighbours
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < shape[0] and 0 <= nc < shape[1]:
+                    if selected_map[nr, nc]:
+                        adj_count += 1
+            
+            adjacency_scores[i] = float(adj_count)
+        
+        return adjacency_scores
+    
     def _enforce_count_with_scores(self, x, problem):
-        """Enforce exact count using scores to prioritize which pixels to add/remove."""
+        """
+        Enforce exact count using dynamic scores that combine base scores with adjacency.
+        
+        Dynamic score = base_score + beta * adjacency_score
+        where adjacency_score = number of selected neighbours in 4-neighbourhood.
+        """
         try:
             n_pixels = problem.n_pixels
             x_restore = x[:n_pixels].copy()
@@ -593,21 +649,29 @@ class AdaptiveRepair(Repair):
 
             if cur_total < k:
                 need = k - cur_total
-                # Prioritize restoration actions for now (since convert is forced to 0)
+                # Compute dynamic scores based on current state and adjacency
+                adjacency_scores = self._compute_adjacency_scores(x_restore)
+                dynamic_scores = self.scores + self.adjacency_beta * adjacency_scores
+                
+                # Prioritize restoration actions (since convert is forced to 0)
                 zeros_restore = np.where(x_restore == 0)[0]
                 if zeros_restore.size > 0 and need > 0:
-                    # add best available restoration zeros
-                    add = zeros_restore[np.argsort(-self.scores[zeros_restore])][:need]
-                    x_restore[add] = 1
+                    # Add best available restoration zeros by dynamic score
+                    add_indices = zeros_restore[np.argsort(-dynamic_scores[zeros_restore])][:need]
+                    x_restore[add_indices] = 1
 
             elif cur_total > k:
                 drop = cur_total - k
+                # Compute dynamic scores based on current state and adjacency
+                adjacency_scores = self._compute_adjacency_scores(x_restore)
+                dynamic_scores = self.scores + self.adjacency_beta * adjacency_scores
+                
                 # Remove from restoration actions first (since convert should be 0)
                 ones_restore = np.where(x_restore == 1)[0]
                 if ones_restore.size > 0 and drop > 0:
-                    # remove worst available restoration ones
-                    rem = ones_restore[np.argsort(self.scores[ones_restore])][:drop]
-                    x_restore[rem] = 0
+                    # Remove worst available restoration ones by dynamic score
+                    rem_indices = ones_restore[np.argsort(dynamic_scores[ones_restore])][:drop]
+                    x_restore[rem_indices] = 0
 
             # Update both restoration and conversion parts of the decision vector
             x[:n_pixels] = x_restore

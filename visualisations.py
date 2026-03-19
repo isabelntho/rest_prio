@@ -10,6 +10,92 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from matplotlib.colors import ListedColormap
+import sys
+from patch_approach import (
+    convert_patch_decisions_to_pixels,
+    create_patch_mappings_for_restoration_and_conversion,
+)
+
+
+def _pickle_load_with_numpy_compat(path):
+    """Load pickle with fallback for numpy module path changes across versions."""
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except ModuleNotFoundError as exc:
+        if 'numpy._core' not in str(exc):
+            raise
+
+    # Retry with compatibility alias for pickles created in different numpy builds.
+    sys.modules['numpy._core'] = np.core
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def _convert_patch_decisions_to_pixel_matrix(decisions, initial_conditions, results=None):
+    """Convert patch-level decision matrix to pixel-level [restoration, conversion] matrix.
+
+    Returns None when conversion is not possible.
+    """
+    decisions = np.asarray(decisions)
+    if decisions.ndim != 2:
+        return None
+
+    n_var = decisions.shape[1]
+    n_rest = len(initial_conditions.get("restoration_eligible_indices", []))
+    n_conv = len(initial_conditions.get("conversion_eligible_indices", []))
+
+    # Already in pixel space
+    if n_var in (n_rest, n_rest + n_conv, 2 * len(initial_conditions.get("eligible_indices", []))):
+        return decisions
+
+    patch_mappings = None
+    if results is not None:
+        patch_mappings = results.get("patch_mappings")
+    if patch_mappings is None:
+        patch_mappings = initial_conditions.get("patch_mappings")
+
+    # If patch mappings are missing, try to infer a patch size that matches n_var.
+    if patch_mappings is None:
+        for ps in [2, 3, 4, 5, 6, 8, 10, 12, 15, 20]:
+            try:
+                candidate = create_patch_mappings_for_restoration_and_conversion(initial_conditions, patch_size=ps)
+                n_rest_p = candidate["restoration_patches"]["n_patches"]
+                n_conv_p = candidate["conversion_patches"]["n_patches"]
+                if (n_rest_p + n_conv_p) == n_var:
+                    patch_mappings = candidate
+                    break
+            except Exception:
+                continue
+
+    if patch_mappings is None:
+        return None
+
+    n_rest_patches = patch_mappings["restoration_patches"]["n_patches"]
+    n_conv_patches = patch_mappings["conversion_patches"]["n_patches"]
+    if (n_rest_patches + n_conv_patches) != n_var:
+        return None
+
+    pixel_decisions = np.zeros((decisions.shape[0], n_rest + n_conv), dtype=np.int8)
+    for i in range(decisions.shape[0]):
+        x_patch = decisions[i]
+        x_restore_p = x_patch[:n_rest_patches]
+        x_convert_p = x_patch[n_rest_patches:]
+
+        x_restore = convert_patch_decisions_to_pixels(
+            x_restore_p,
+            patch_mappings["restoration_patches"],
+            n_rest,
+        )
+        x_convert = convert_patch_decisions_to_pixels(
+            x_convert_p,
+            patch_mappings["conversion_patches"],
+            n_conv,
+        )
+        pixel_decisions[i, :n_rest] = x_restore
+        pixel_decisions[i, n_rest:] = x_convert
+
+    return pixel_decisions
 
 
 def plot_eligible_pixels(initial_conditions, save_path=None, figsize=(12, 10), pad=0, title=None):
@@ -241,8 +327,7 @@ def load_results(pkl_path, scenario_id=None):
             - If single scenario or specific scenario_id: Results dictionary
             - If scenario_id='all': List of results dictionaries for all scenarios
     """
-    with open(pkl_path, 'rb') as f:
-        raw_results = pickle.load(f)
+    raw_results = _pickle_load_with_numpy_compat(pkl_path)
 
     # Detect file structure
     if 'scenarios' in raw_results:
@@ -811,7 +896,7 @@ def create_selection_frequency_map(pkl_path, save_path=None, cmap='YlOrRd', titl
     results = load_results(pkl_path)
     
     # Extract key information
-    decisions = results['decisions']  # Shape: (n_solutions, 2*n_pixels) or (n_solutions, n_pixels)
+    decisions = results['decisions']  # May be pixel-space or patch-space
     initial_conditions = results['initial_conditions']
     shape = initial_conditions['shape']
     eligible_indices = initial_conditions['eligible_indices']
@@ -829,6 +914,15 @@ def create_selection_frequency_map(pkl_path, save_path=None, cmap='YlOrRd', titl
     print(f"Loaded {n_solutions} Pareto-optimal solutions")
     print(f"Raster shape: {shape}")
     print(f"Eligible pixels: {n_eligible}")
+    # Convert patch-space decisions to pixel-space when needed.
+    decisions_converted = _convert_patch_decisions_to_pixel_matrix(
+        decisions,
+        initial_conditions,
+        results=results,
+    )
+    if decisions_converted is not None:
+        decisions = decisions_converted
+
     print(f"Decision vector shape: {decisions.shape}")
     
     # Calculate selection frequency for each eligible pixel
@@ -862,18 +956,22 @@ def create_selection_frequency_map(pkl_path, save_path=None, cmap='YlOrRd', titl
             mapping_indices = conversion_indices
             print(f"Calculating conversion frequency for separate pixel sets")
         elif action_type == 'combined':
-            # For combined, create frequency map showing both restoration and conversion
-            # We need to map each to their respective pixel locations
-            selection_frequency_map = np.zeros(shape)
-            
+            # For combined, create frequency map showing both restoration and conversion.
+            # Keep non-action-eligible pixels as NaN so they can be rendered in grey when show_eligible=True.
+            selection_frequency_map = np.full(shape, np.nan, dtype=float)
+            action_eligible_indices = np.unique(
+                np.concatenate([np.asarray(restoration_indices), np.asarray(conversion_indices)])
+            )
+            selection_frequency_map.flat[action_eligible_indices] = 0.0
+
             # Map restoration frequencies
             restore_freq = np.sum(decisions[:, :n_restoration], axis=0) / n_solutions * 100
             selection_frequency_map.flat[restoration_indices] = restore_freq
-            
+
             # Add conversion frequencies (they should not overlap)
             convert_freq = np.sum(decisions[:, n_restoration:], axis=0) / n_solutions * 100
             selection_frequency_map.flat[conversion_indices] = convert_freq
-            
+
             # For the return format, we'll use the map directly
             selection_frequency = None  # Will use selection_frequency_map instead
             mapping_indices = None
@@ -1429,9 +1527,11 @@ def show_key_spatial_contrasts(pkl_path, save_path="spatial_contrasts.png"):
                 best_idx = np.argmin(np.sum(objectives, axis=1))
                 
                 # Create spatial visualization (simplified)
-                restoration_map = create_spatial_map_from_decision(
-                    decisions[best_idx], 
-                    results['initial_conditions']
+                restoration_map = decision_to_map_2d(
+                    decisions[best_idx],
+                    results['initial_conditions'],
+                    fill_value=np.nan,
+                    action_type='combined',
                 )
                 
                 axes[i].imshow(restoration_map, cmap='RdYlBu_r')

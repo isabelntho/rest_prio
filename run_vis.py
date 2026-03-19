@@ -24,6 +24,7 @@ from visualisations import (
 )
 from data_loader import load_initial_conditions
 
+
 def run_basic_analysis(pkl_path):
     """Run basic analysis and print summary statistics."""
     print("="*50)
@@ -129,7 +130,7 @@ def run_visualizations(pkl_file, visualizations="all"):
 # Main execution
 if __name__ == "__main__":
     # Configuration
-    pkl_file = "agricultural_0902_1"  # Change this to your file
+    pkl_file = "forest_1803_1"  # Change this to your file
     
     # Run all visualizations
     #run_visualizations(pkl_file, "all")

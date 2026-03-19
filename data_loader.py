@@ -375,8 +375,10 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     """
     # Define all possible objectives and their file mappings
     all_objectives = {
-        'abiotic': 'abiotic_condition_anomaly.tif',
-        'biotic': 'biotic_condition_anomaly.tif', 
+        #'abiotic': 'abiotic_condition_anomaly.tif',
+        #'biotic': 'biotic_condition_anomaly.tif', 
+        'abiotic': 'abiotic_idw.tif',
+        'biotic': 'biotic_idw.tif', 
         'landscape': 'sn_dens.tif',
         'cost': 'implementation_cost.tif',
         'population_proximity': 'population_proximity.tif'

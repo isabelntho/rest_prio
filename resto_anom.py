@@ -47,6 +47,13 @@ from results_saving import (
     save_parameter_summary, save_scenario_results, save_combined_results,
     save_results_with_reports
 )
+# Import patch-based optimization approach
+from patch_approach import (
+    create_patch_mappings_for_restoration_and_conversion,
+    PatchRepair,
+    PatchAwareSampling,
+    aggregate_patch_scores_from_pixel_scores,
+)
 
 from scenarios import (
     define_scenario_parameters,
@@ -124,6 +131,63 @@ def build_repair_scores(initial_conditions, scenario_params):
         scores = scores - 1e-6 * c
 
     return np.asarray(scores, dtype=np.float64)
+
+# =============================================================================
+# PATCH-BASED APPROACH INITIALIZATION
+# =============================================================================
+
+def initialize_patch_approach(initial_conditions, patch_size=100):
+    """
+    Add patch mappings to initial_conditions for patch-based optimization.
+    
+    This function creates patch definitions for both restoration and conversion
+    eligible areas, enabling patch-level decision making while maintaining
+    pixel-level objective calculations.
+    
+    Args:
+        initial_conditions: Dict with shape, masks, and indices
+        patch_size: Size of each patch in pixels (default: 100x100)
+    
+    Returns:
+        Updated initial_conditions dict with patch mappings added
+    """
+    print(f"\nInitializing patch-based approach (patch size: {patch_size}x{patch_size} pixels)...")
+    
+    # Create patch mappings for restoration and conversion areas
+    patch_mappings = create_patch_mappings_for_restoration_and_conversion(
+        initial_conditions, 
+        patch_size=patch_size
+    )
+    
+    # Add patch mappings to initial_conditions
+    initial_conditions['patch_mappings'] = patch_mappings
+    initial_conditions['patch_approach_enabled'] = True
+    initial_conditions['patch_size'] = patch_size
+    
+    # Store patch counts for easy access
+    initial_conditions['n_restoration_patches'] = patch_mappings['restoration_patches']['n_patches']
+    initial_conditions['n_conversion_patches'] = patch_mappings['conversion_patches']['n_patches']
+    
+    print(f"✓ Patch approach initialized:")
+    print(f"  Restoration patches: {initial_conditions['n_restoration_patches']}")
+    print(f"  Conversion patches: {initial_conditions['n_conversion_patches']}")
+    
+    # Calculate average pixels per patch for information
+    if initial_conditions['n_restoration_patches'] > 0:
+        avg_pixels_per_restoration_patch = (
+            initial_conditions['n_restoration_pixels'] / 
+            initial_conditions['n_restoration_patches']
+        )
+        print(f"  Avg pixels per restoration patch: {avg_pixels_per_restoration_patch:.1f}")
+    
+    if initial_conditions['n_conversion_patches'] > 0:
+        avg_pixels_per_conversion_patch = (
+            initial_conditions['n_conversion_pixels'] / 
+            initial_conditions['n_conversion_patches']
+        )
+        print(f"  Avg pixels per conversion patch: {avg_pixels_per_conversion_patch:.1f}")
+    
+    return initial_conditions
 
 # =============================================================================
 # RESTORATION EFFECT FUNCTIONS
@@ -749,10 +813,169 @@ class RestorationProblem(ElementwiseProblem):
 
 
 # =============================================================================
+# PATCH-BASED RESTORATION PROBLEM
+# =============================================================================
+
+class PatchRestorationProblem(RestorationProblem):
+    """
+    Patch-based restoration optimization problem.
+    
+    Decision variables are at the patch level (groups of pixels), but objectives
+    are calculated at the pixel level using the existing restoration_effect() logic.
+    
+    This provides a coarser decision space while maintaining pixel-level accuracy
+    for objective calculations.
+    
+    Constraint types:
+    - 'patch_count': Fixed number of patches (variable pixel count)
+    - 'pixel_count': Fixed number of pixels (variable patch count) - RECOMMENDED
+    """
+    
+    def __init__(self, initial_conditions, scenario_params, n_jobs=None,
+                 patch_constraint_type='pixel_count', pixel_tolerance=0.05):
+        """
+        Initialize the patch-based optimization problem.
+        
+        Args:
+            initial_conditions: Dict with initial conditions including patch_mappings
+            scenario_params: Dict with scenario parameters
+            n_jobs: Number of parallel jobs to use
+            patch_constraint_type: 'patch_count' or 'pixel_count'
+            pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
+        """
+        # Check if patch approach is initialized
+        if not initial_conditions.get('patch_approach_enabled', False):
+            raise ValueError(
+                "Patch approach not initialized. Call initialize_patch_approach() first."
+            )
+        
+        # Store patch mapping information
+        self.patch_mappings = initial_conditions['patch_mappings']
+        self.restoration_patches = self.patch_mappings['restoration_patches']
+        self.conversion_patches = self.patch_mappings['conversion_patches']
+        
+        self.n_restoration_patches = initial_conditions['n_restoration_patches']
+        self.n_conversion_patches = initial_conditions['n_conversion_patches']
+        
+        # Initialize parent class with pixel-level information
+        # This sets up all the objective functions and constraints
+        # We'll override n_var after parent initialization
+        super().__init__(initial_conditions, scenario_params, n_jobs=n_jobs)
+        
+        # Override decision variable dimensions to use patches instead of pixels
+        # Decision vector structure: [restoration_patches, conversion_patches]
+        self.n_var = self.n_restoration_patches + self.n_conversion_patches
+        
+        # Store constraint configuration
+        self.patch_constraint_type = patch_constraint_type
+        self.pixel_tolerance = pixel_tolerance
+        
+        # Calculate target values for different constraint types
+        if patch_constraint_type == 'pixel_count':
+            self.target_constraint_value = self.max_action_pixels
+        elif patch_constraint_type == 'patch_count':
+            # Estimate max patches from max pixels
+            if self.n_restoration_patches > 0:
+                avg_pixels_per_patch = (
+                    initial_conditions['n_restoration_pixels'] / 
+                    self.n_restoration_patches
+                )
+                self.target_constraint_value = max(1, int(
+                    self.max_action_pixels / avg_pixels_per_patch
+                ))
+            else:
+                self.target_constraint_value = 0
+        
+        print(f"Patch-based problem initialized:")
+        print(f"  Decision variables: {self.n_var} patches "
+              f"({self.n_restoration_patches} restoration + {self.n_conversion_patches} conversion)")
+        print(f"  Constraint type: {patch_constraint_type}")
+        print(f"  Target value: {self.target_constraint_value}")
+        if patch_constraint_type == 'pixel_count':
+            print(f"  Tolerance: ±{pixel_tolerance*100:.1f}%")
+        print(f"  (pixel-based equivalent: {self.max_action_pixels} pixels)")
+    
+    def _evaluate(self, x_patches, out, *args, **kwargs):
+        """
+        Evaluate a patch-based solution.
+        
+        Args:
+            x_patches: Patch-level decision variables (binary array)
+                      First n_restoration_patches: restoration patch decisions
+                      Next n_conversion_patches: conversion patch decisions
+            out: Output dictionary for objectives and constraints
+        """
+        from patch_approach import convert_patch_decisions_to_pixels
+        
+        # Split patch decisions into restoration and conversion
+        x_restore_patches = x_patches[:self.n_restoration_patches]
+        x_convert_patches = x_patches[self.n_restoration_patches:]
+        
+        # Convert patch-level decisions to pixel-level decisions
+        x_restore_pixels = convert_patch_decisions_to_pixels(
+            x_restore_patches,
+            self.restoration_patches,
+            self.n_restoration_pixels
+        )
+        
+        x_convert_pixels = convert_patch_decisions_to_pixels(
+            x_convert_patches,
+            self.conversion_patches,
+            self.n_conversion_pixels
+        )
+        
+        # Create combined pixel-level decision vector for parent class evaluation
+        x_pixels = np.concatenate([x_restore_pixels, x_convert_pixels])
+        
+        # Use parent class evaluation with pixel-level decisions
+        super()._evaluate(x_pixels, out, *args, **kwargs)
+        
+        # Override constraint based on constraint type
+        if self.patch_constraint_type == 'patch_count':
+            n_patches_used = np.sum(x_restore_patches) + np.sum(x_convert_patches)
+            constraint_value = abs(n_patches_used - self.target_constraint_value)
+        
+        elif self.patch_constraint_type == 'pixel_count':
+            # Count actual restoration + conversion pixels separately
+            n_restore_pixels = np.sum(x_restore_pixels)
+            n_convert_pixels = np.sum(x_convert_pixels)
+            n_pixels_used = n_restore_pixels + n_convert_pixels
+            
+            # Use LARGER tolerance for constraint evaluation than repair uses
+            # This accounts for discretization errors from whole-patch constraints
+            # that repair cannot perfectly fix
+            evaluation_tolerance = self.pixel_tolerance * 1.5  # 50% larger tolerance
+            
+            min_pixels = int(self.target_constraint_value * (1 - evaluation_tolerance))
+            max_pixels = int(self.target_constraint_value * (1 + evaluation_tolerance))
+            
+            # DEBUG: Print constraint check details
+            if not hasattr(self, '_constraint_debug_count'):
+                self._constraint_debug_count = 0
+            if self._constraint_debug_count < 5:
+                print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
+                print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
+                self._constraint_debug_count += 1
+            
+            if min_pixels <= n_pixels_used <= max_pixels:
+                constraint_value = 0  # Accept as feasible
+            else:
+                # Penalize violations outside the evaluation tolerance
+                constraint_value = min(
+                    abs(n_pixels_used - min_pixels),
+                    abs(n_pixels_used - max_pixels)
+                )
+                if self._constraint_debug_count <= 5:
+                    print(f"                    VIOLATION: G={constraint_value}")
+        
+        out["G"] = [constraint_value]
+
+
+# =============================================================================
 # EXECUTION
 # =============================================================================
 
-def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42):
+def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42, verbose=False):
     """
     Build a fixed hypervolume reference point using a warm up sample of solutions.
     """
@@ -770,6 +993,8 @@ def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42
         out = {}
         problem._evaluate(X[k], out)
         F_list.append(out["F"])
+        if verbose and (k + 1) % 25 == 0:
+            print(f"  Warm-up ref point evaluation: {k + 1}/{X.shape[0]}")
 
     Fw = np.asarray(F_list, dtype=float)
 
@@ -885,7 +1110,9 @@ def run_one(initial_conditions, scenario_params, run_settings):
         hv_patience=run_settings.get("hv_patience", 15),
         hv_min_improvement=run_settings.get("hv_min_improvement", 1e-6),
         n_jobs=run_settings.get("n_jobs", None),
-        use_repair=run_settings.get("use_repair", True)
+        use_repair=run_settings.get("use_repair", True),
+        use_patch_approach=run_settings.get("use_patch_approach", False),
+        patch_size=run_settings.get("patch_size", 100)
     )
 
 def run_scenario_batch(
@@ -998,7 +1225,9 @@ def finalise_combined_results(combined_results, save_results=True, verbose=True)
 
 def run_single_scenario_optimization(initial_conditions, scenario_params, pop_size=50, 
                                    n_generations=100, save_results=True, verbose=True, skip_diagnostics=False,
-                                   hv_patience=15, hv_min_improvement=1e-6, n_jobs=None, use_repair=True):
+                                   hv_patience=15, hv_min_improvement=1e-6, n_jobs=None, use_repair=True, 
+                                   random_seed=None, use_patch_approach=False, patch_size=100,
+                                   patch_constraint_type='pixel_count', pixel_tolerance=0.05, output_dir="."):
     """
     Run the multi-objective restoration optimization for a single scenario.
     
@@ -1009,39 +1238,77 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         n_generations: Number of optimization generations
         save_results: Whether to save results to files
         verbose: Print progress information
+        skip_diagnostics: Skip optimization setup diagnostics
+        hv_patience: Generations to wait for hypervolume improvement before stopping
+        hv_min_improvement: Minimum hypervolume improvement to reset patience counter
+        n_jobs: Number of parallel jobs (None = use all cores)
+        use_repair: Whether to use repair operator for constraints
+        random_seed: Random seed for reproducibility
+        use_patch_approach: Use patch-based optimization instead of pixel-based
+        patch_size: Size of patches in pixels (for patch approach)
+        patch_constraint_type: Constraint type for patch approach:
+            - 'pixel_count': Constrain total number of pixels (RECOMMENDED for fair comparison)
+            - 'patch_count': Constrain number of patches (original, less fair)
+        pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
         skip_diagnostics: Skip diagnostic output (useful for multi-scenario runs)
         hv_patience: Generations to wait for hypervolume improvement before stopping
         hv_min_improvement: Minimum relative hypervolume improvement threshold
         n_jobs: Number of parallel jobs to use (None for automatic, 1 for serial, -1 for all cores)
+        random_seed: Random seed for reproducibility (None uses random initialization)
+        use_patch_approach: If True, use patch-based decision vector; if False, use pixel-based (default)
+        patch_size: Size of patches in pixels (e.g., 100 = 100x100 patches). Only used if use_patch_approach=True
+        output_dir: Directory to save results (default: current directory)
         
     Returns:
         dict: Optimization results
     """
+    # Auto-initialize patch approach if requested and not already initialized
+    if use_patch_approach and not initial_conditions.get('patch_approach_enabled', False):
+        if verbose:
+            print(f"Initializing patch approach with patch_size={patch_size}...")
+        initial_conditions = initialize_patch_approach(initial_conditions, patch_size=patch_size)
+    
     if verbose:
-        print(f"\n=== SINGLE SCENARIO OPTIMIZATION ===") 
+        approach_str = "PATCH-BASED" if use_patch_approach else "PIXEL-BASED"
+        print(f"\n=== SINGLE SCENARIO OPTIMIZATION ({approach_str}) ===") 
         print(f"Scenario parameters: {scenario_params}")
         print(f"Population size: {pop_size}")
         print(f"Generations: {n_generations} (with HV early stopping: patience={hv_patience})")
         #print(f"Max restoration: {scenario_params['max_restoration_fraction']*100:.1f}% of eligible area")
-        print(f"Eligible pixels: {initial_conditions['n_pixels']}")
+        
+        if use_patch_approach:
+            print(f"Eligible patches: {initial_conditions['n_restoration_patches']} restoration + "
+                  f"{initial_conditions['n_conversion_patches']} conversion")
+        else:
+            print(f"Eligible pixels: {initial_conditions['n_pixels']}")
         
         # Show which objectives are being used
-        problem_temp = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for setup
-        print(f"Objectives: {problem_temp.objective_names} ({len(problem_temp.objective_names)} total)")
+        #problem_temp = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)  # Use single process for setup
+        #print(f"Objectives: {problem_temp.objective_names} ({len(problem_temp.objective_names)} total)")
     
-    # Create optimization problem - force serial execution to avoid pickle errors
+    # Create optimization problem - choose between pixel and patch based approach
+    # Force serial execution to avoid pickle errors
     # Parallelization at problem level conflicts with pymoo's own parallelization
-    problem = RestorationProblem(
-        initial_conditions=initial_conditions,
-        scenario_params=scenario_params,
-        n_jobs=1  # Serial execution - parallelization handled by pymoo if needed
-    )
+    if use_patch_approach:
+        problem = PatchRestorationProblem(
+            initial_conditions=initial_conditions,
+            scenario_params=scenario_params,
+            n_jobs=1,  # Serial execution - parallelization handled by pymoo if needed
+            patch_constraint_type=patch_constraint_type,
+            pixel_tolerance=pixel_tolerance
+        )
+    else:
+        problem = RestorationProblem(
+            initial_conditions=initial_conditions,
+            scenario_params=scenario_params,
+            n_jobs=1  # Serial execution - parallelization handled by pymoo if needed
+        )
     import numpy as np
     # Print additional diagnostic information
     if verbose:
         print(f"\nOptimization setup details:")
         print(f"  Max action pixels allowed: {problem.max_action_pixels}")
-        print(f"  Number of objectives: {len(problem.objective_names)}")
+        print(f"  Number of objectives: {len(problem.objective_names)} ({', '.join(problem.objective_names)})")
         
         # Sample objective values without restoration
         sample_obj_str = "  Baseline objectives (no restoration): "
@@ -1063,39 +1330,95 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
     burden_sharing = scenario_params.get('burden_sharing', 'no')
     clustering_strength = scenario_params.get('spatial_clustering', 0.0)
     
-    # Build scores for repair operator
-    scores = build_repair_scores(initial_conditions, scenario_params)
+    # For patch approach, use patch-aware operators
+    if use_patch_approach:
+        # Build restoration-informed patch scores (used by both sampling and repair).
+        restoration_scores = build_repair_scores(initial_conditions, scenario_params)
+        patch_scores = aggregate_patch_scores_from_pixel_scores(
+            patch_mappings=initial_conditions['patch_mappings'],
+            restoration_pixel_scores=restoration_scores,
+            conversion_pixel_scores=None,
+            mode='mean'
+        )
+
+        patch_score_temperature = float(scenario_params.get('patch_score_temperature', 0.25))
+        patch_random_share = float(scenario_params.get('patch_random_share', 0.15))
+        patch_repair_top_k = int(scenario_params.get('patch_repair_top_k', 12))
+
+        # Use intelligent sampling that respects target pixel count
+        sampling = PatchAwareSampling(
+            patch_mappings=initial_conditions['patch_mappings'],
+            target_pixels=problem.target_constraint_value,
+            pixel_tolerance=pixel_tolerance,
+            patch_scores=patch_scores,
+            score_temperature=patch_score_temperature,
+            random_share=patch_random_share,
+        )
+        
+        # Create PatchRepair with appropriate constraint type
+        if use_repair:
+            repair = PatchRepair(
+                constraint_type=patch_constraint_type,
+                target_value=problem.target_constraint_value,
+                patch_mappings=initial_conditions['patch_mappings'],
+                pixel_tolerance=pixel_tolerance,
+                patch_scores=patch_scores,
+                score_temperature=patch_score_temperature,
+                top_k=patch_repair_top_k,
+            )
+        else:
+            repair = None
+        
+        if verbose:
+            print(
+                "Using stochastic score-guided patch operators "
+                f"({patch_constraint_type}, temp={patch_score_temperature}, "
+                f"random_share={patch_random_share}, top_k={patch_repair_top_k})"
+            )
+    else:
+        # Build scores for repair operator (pixel-based only)
+        scores = build_repair_scores(initial_conditions, scenario_params)
+        
+        # Use consolidated operators for pixel-based scenarios
+        sampling = AdaptiveSampling(
+            initial_conditions, 
+            problem.max_action_pixels, 
+            scenario_params
+        )
+        repair = AdaptiveRepair(
+            initial_conditions, 
+            problem.max_action_pixels, 
+            scenario_params, 
+            scores
+        ) if use_repair else None
+        
+        if verbose:
+            strategy_desc = []
+            if burden_sharing == 'yes':
+                strategy_desc.append("burden-sharing")
+            if clustering_strength > 0.0:
+                strategy_desc.append(f"clustering({clustering_strength})")
+            if not strategy_desc:
+                strategy_desc.append("random with score-based repair")
+            print(f"Using adaptive operators: {', '.join(strategy_desc)}")
     
-    # Use consolidated operators for all scenarios
-    sampling = AdaptiveSampling(
-        initial_conditions, 
-        problem.max_action_pixels, 
-        scenario_params
+    hv_warmup_samples = int(
+        scenario_params.get(
+            "hv_warmup_samples",
+            40 if use_patch_approach else 200
+        )
     )
-    repair = AdaptiveRepair(
-        initial_conditions, 
-        problem.max_action_pixels, 
-        scenario_params, 
-        scores
-    ) if use_repair else None
-    
+    if verbose:
+        print(f"Building fixed HV ref point with {hv_warmup_samples} warm-up samples...")
+
     fixed_ref = build_fixed_ref_point(
         problem=problem,
         sampling=sampling,
-        n_samples=200,
+        n_samples=hv_warmup_samples,
         margin=0.05,
         seed=42
-    )   
-
-    if verbose:
-        strategy_desc = []
-        if burden_sharing == 'yes':
-            strategy_desc.append("burden-sharing")
-        if clustering_strength > 0.0:
-            strategy_desc.append(f"clustering({clustering_strength})")
-        if not strategy_desc:
-            strategy_desc.append("random with score-based repair")
-        print(f"Using adaptive operators: {', '.join(strategy_desc)}")
+        ,verbose=verbose
+    )
     
     # Create optimization algorithm
     algorithm = NSGA2(
@@ -1105,6 +1428,27 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
         mutation=BitflipMutation(prob=0.1), #increased from 0.05 5.02.2026      # Bit-flip mutation
         repair=repair                     # Custom repair to maintain properties
     )
+    
+    # Diagnostic: Check initial population quality for patch approach
+    if use_patch_approach and verbose:
+        # Directly call _do to get numpy array (avoid Individual wrapping)
+        test_sample = sampling._do(problem, 5)
+        if hasattr(problem, 'patch_mappings'):
+            patch_mappings = problem.patch_mappings
+            pixel_counts = []
+            for i in range(test_sample.shape[0]):
+                x = test_sample[i]
+                pixels = 0
+                for j, selected in enumerate(x[:problem.n_restoration_patches]):
+                    if selected == 1:
+                        pixels += len(patch_mappings['restoration_patches']['patch_to_pixels'][j])
+                for j, selected in enumerate(x[problem.n_restoration_patches:]):
+                    if selected == 1:
+                        pixels += len(patch_mappings['conversion_patches']['patch_to_pixels'][j])
+                pixel_counts.append(pixels)
+            target_min = int(problem.target_constraint_value * (1 - pixel_tolerance))
+            target_max = int(problem.target_constraint_value * (1 + pixel_tolerance))
+            print(f"  Initial sampling check: {len([p for p in pixel_counts if target_min <= p <= target_max])}/5 within target [{target_min}, {target_max}]")
     
     # Set up termination (use standard generation-based termination)
     termination = get_termination("n_gen", n_generations)
@@ -1161,7 +1505,7 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             problem,
             algorithm,
             termination,
-            seed=42, 
+            seed=random_seed,  # Use provided seed for reproducibility
             verbose=False,
             callback=callback
         )
@@ -1174,24 +1518,24 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 if hasattr(result, 'pop') and result.pop is not None:
                     if len(result.pop) > 0:
                         pop_F = result.pop.get("F")
-                        if pop_F is not None:
-                            print(f"\nSample objectives (first 3 solutions):")
-                            for i in range(min(3, len(pop_F))):
-                                print(f"    Sol {i}: {pop_F[i]}")
+                        #if pop_F is not None:
+                            #print(f"\nSample objectives (first 3 solutions):")
+                            #for i in range(min(3, len(pop_F))):
+                                #print(f"    Sol {i}: {pop_F[i]}")
                             
                             # Check for diversity
-                            print(f"Objective statistics across population:")
-                            for j, obj_name in enumerate(problem.objective_names):
-                                obj_vals = pop_F[:, j]
-                                print(f"    {obj_name}: min={np.min(obj_vals):.4e}, max={np.max(obj_vals):.4e}, std={np.std(obj_vals):.4e}")
+                            #print(f"Objective statistics across population:")
+                            #for j, obj_name in enumerate(problem.objective_names):
+                            #    obj_vals = pop_F[:, j]
+                            #    print(f"    {obj_name}: min={np.min(obj_vals):.4e}, max={np.max(obj_vals):.4e}, std={np.std(obj_vals):.4e}")
                             
                             # Check correlation between objectives
-                            if pop_F.shape[1] > 1:
-                                print(f"Objective correlations (high correlation = no trade-offs):")
-                                for i in range(pop_F.shape[1]):
-                                    for j in range(i+1, pop_F.shape[1]):
-                                        corr = np.corrcoef(pop_F[:, i], pop_F[:, j])[0, 1]
-                                        print(f"    {problem.objective_names[i]} vs {problem.objective_names[j]}: {corr:.4f}")
+                            #if pop_F.shape[1] > 1:
+                            #    print(f"Objective correlations (high correlation = no trade-offs):")
+                            #    for i in range(pop_F.shape[1]):
+                            #        for j in range(i+1, pop_F.shape[1]):
+                            #            corr = np.corrcoef(pop_F[:, i], pop_F[:, j])[0, 1]
+                            #            print(f"    {problem.objective_names[i]} vs {problem.objective_names[j]}: {corr:.4f}")
         
         if result is not None and hasattr(result, 'F') and result.F is not None and len(result.F) > 0:
             if verbose:
@@ -1240,7 +1584,10 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                     'n_pixels': initial_conditions['n_pixels'],
                     'n_restoration_pixels': initial_conditions.get('n_restoration_pixels', 0),
                     'n_conversion_pixels': initial_conditions.get('n_conversion_pixels', 0),
-                    'max_action_pixels': problem.max_action_pixels
+                    'max_action_pixels': problem.max_action_pixels,
+                    'is_patch_based': use_patch_approach,
+                    'n_restoration_patches': initial_conditions.get('n_restoration_patches', 0) if use_patch_approach else None,
+                    'n_conversion_patches': initial_conditions.get('n_conversion_patches', 0) if use_patch_approach else None,
                 },
                 'algorithm_info': {
                     'pop_size': pop_size,
@@ -1269,16 +1616,62 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             
         }
             
+            # Add patch mappings if using patch approach
+            if use_patch_approach and 'patch_mappings' in initial_conditions:
+                optimization_results['patch_mappings'] = initial_conditions['patch_mappings']
+            
             # Save results with comprehensive reporting if requested
             if save_results:
                 # Use simplified reporting - generates all essential reports
-                save_results_with_reports(optimization_results, verbose=verbose)
+                save_results_with_reports(optimization_results, output_dir=output_dir, verbose=verbose)
             
             return optimization_results
             
         else:
             if verbose:
                 print("✗ Optimization failed - no solutions found")
+                # Diagnostic: why did it fail?
+                if result is None:
+                    print("  Reason: result is None")
+                elif not hasattr(result, 'F'):
+                    print("  Reason: result has no F attribute")
+                elif result.F is None:
+                    print("  Reason: result.F is None")
+                    # Check the population for feasibility
+                    if hasattr(result, 'pop') and result.pop is not None and len(result.pop) > 0:
+                        pop_G = result.pop.get("G")
+                        pop_X = result.pop.get("X")
+                        if pop_G is not None:
+                            n_feasible = np.sum(np.all(pop_G <= 0, axis=1))
+                            n_total = len(pop_G)
+                            print(f"  Final population: {n_total} solutions, {n_feasible} feasible")
+                            if n_feasible == 0 and pop_X is not None:
+                                # Check actual pixel counts for first few solutions
+                                print(f"  Checking actual pixel counts for first 5 solutions:")
+                                for i in range(min(5, len(pop_X))):
+                                    x_patches = pop_X[i]
+                                    # Count pixels
+                                    pixels = 0
+                                    patch_mappings = initial_conditions['patch_mappings']
+                                    for j in range(problem.n_restoration_patches):
+                                        if x_patches[j] == 1:
+                                            pixels += len(patch_mappings['restoration_patches']['patch_to_pixels'][j])
+                                    for j in range(problem.n_conversion_patches):
+                                        if x_patches[problem.n_restoration_patches + j] == 1:
+                                            pixels += len(patch_mappings['conversion_patches']['patch_to_pixels'][j])
+                                    print(f"    Sol {i}: pixels={pixels}, G={pop_G[i]}")
+                elif len(result.F) == 0:
+                    print("  Reason: result.F has length 0 (no feasible solutions)")
+                    # Check if there's a population
+                    if hasattr(result, 'pop') and result.pop is not None:
+                        pop_G = result.pop.get("G")
+                        if pop_G is not None:
+                            n_feasible = np.sum(np.all(pop_G <= 0, axis=1))
+                            print(f"  Population: {len(pop_G)} solutions, {n_feasible} feasible")
+                            if n_feasible == 0:
+                                print(f"  Constraint violations (first 5):")
+                                for i in range(min(5, len(pop_G))):
+                                    print(f"    Solution {i}: G={pop_G[i]}")
             return None
             
     except Exception as e:
@@ -1430,8 +1823,11 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
 
 if __name__ == "__main__":
 
-    # Available ecosystem types: 'all', 'forest', 'agricultural', 'grassland'
-    ECOSYSTEM_TO_RUN = "all"  # change to a single ecosystem if needed
+    # Available ecosystem run modes:
+    # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
+    # - 'all': run three separate optimisations (one per ecosystem)
+    # - 'combined': run one optimisation without ecosystem filtering
+    ECOSYSTEM_TO_RUN = "forest"  # change to a single ecosystem if needed
 
     # Region used for validation reference in load_initial_conditions
     REGION = "Bern"  # change to 'CH' for Switzerland-wide optimisation
@@ -1446,7 +1842,7 @@ if __name__ == "__main__":
 
     # Shared run controls
     OBJECTIVES = ["abiotic", "biotic","cost"]# "landscape", "cost"]
-    SAMPLE_FRACTION = 0.2
+    SAMPLE_FRACTION = None
     SAMPLE_SEED = 42
     POP_SIZE = 20
     N_GENERATIONS = 30
@@ -1456,22 +1852,33 @@ if __name__ == "__main__":
 
     # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
     custom_scenario_params = {
-        "max_restoration_fraction": 0.1,
+        "max_restoration_fraction": 0.05,
         "spatial_clustering": 0,
-        "burden_sharing": "no",
-        "abiotic_effect": 0.01,
         "biotic_effect": 0.01,
+        "adjacency_beta": 0.25,  # Tunable adjacency weighting: 0.1 (weak) to 1.0 (strong). Higher values encourage clustering.
     }
+    
+    # Patch approach settings (optional - set to enable patch-based optimization)
+    USE_PATCH_APPROACH = True  # Set to True to use patch-based decision vector
+    PATCH_SIZE = 2  # Size of patches in pixels (e.g., 100 = 100x100 patches)
+    PATCH_CONSTRAINT_TYPE = 'pixel_count'  # 'pixel_count' (recommended) or 'patch_count'
+    PIXEL_TOLERANCE = 0.05  # Tolerance for pixel_count constraint (±5%)
 
     if ECOSYSTEM_TO_RUN == "all":
-        ecosystems_to_run = ["forest", "agricultural", "grassland"]
+        runs = [
+            ("forest", "forest"),
+            ("agricultural", "agricultural"),
+            ("grassland", "grassland"),
+        ]
+    elif ECOSYSTEM_TO_RUN == "combined":
+        runs = [("combined", "all")]
     else:
-        ecosystems_to_run = [ECOSYSTEM_TO_RUN]
+        runs = [(ECOSYSTEM_TO_RUN, ECOSYSTEM_TO_RUN)]
 
     all_results = {}
 
-    for ecosystem in ecosystems_to_run:
-        print(f"=== Starting optimisation for {ecosystem.upper()} ecosystem ===")
+    for run_label, ecosystem_for_loader in runs:
+        print(f"=== Starting optimisation for {run_label.upper()} ecosystem ===")
 
         try:
             if SCENARIO_MODE == "all":
@@ -1487,7 +1894,7 @@ if __name__ == "__main__":
                     random_seed=RANDOM_SEED,
                     sample_fraction=SAMPLE_FRACTION,
                     sample_seed=SAMPLE_SEED,
-                    ecosystem=ecosystem,
+                    ecosystem=ecosystem_for_loader,
                     lulc_path=None
                 )
             else:
@@ -1495,7 +1902,7 @@ if __name__ == "__main__":
                     ".",
                     objectives=OBJECTIVES,
                     region=REGION,
-                    ecosystem=ecosystem,
+                    ecosystem=ecosystem_for_loader,
                     sample_fraction=SAMPLE_FRACTION,
                     sample_seed=SAMPLE_SEED
                 )
@@ -1508,28 +1915,32 @@ if __name__ == "__main__":
                     save_results=True,
                     verbose=True,
                     n_jobs=N_JOBS, 
-                    use_repair=True
+                    use_repair=True,
+                    use_patch_approach=USE_PATCH_APPROACH,
+                    patch_size=PATCH_SIZE,
+                    patch_constraint_type=PATCH_CONSTRAINT_TYPE,
+                    pixel_tolerance=PIXEL_TOLERANCE
                 )
 
             if results is not None:
-                all_results[ecosystem] = results
-                print(f"\n✓ {ecosystem.title()} optimisation completed successfully!")
+                all_results[run_label] = results
+                print(f"\n✓ {run_label.title()} optimisation completed successfully!")
             else:
-                print(f"\n✗ {ecosystem.title()} optimisation failed.")
+                print(f"\n✗ {run_label.title()} optimisation failed.")
 
         except Exception as e:
-            print(f"\n✗ Error optimising {ecosystem} ecosystem: {e}")
+            print(f"\n✗ Error optimising {run_label} ecosystem: {e}")
             continue
 
     print(f"\n{'='*80}")
     print("=== OPTIMISATION SUMMARY ===")
     print(f"{'='*80}")
     successful_runs = len(all_results)
-    total_runs = len(ecosystems_to_run)
+    total_runs = len(runs)
     print(f"Successfully completed {successful_runs}/{total_runs} ecosystem optimisations:")
-    for ecosystem in ecosystems_to_run:
-        status = "✓ SUCCESS" if ecosystem in all_results else "✗ FAILED"
-        print(f"  {ecosystem.title():<12}: {status}")
+    for run_label, _ in runs:
+        status = "✓ SUCCESS" if run_label in all_results else "✗ FAILED"
+        print(f"  {run_label.title():<12}: {status}")
 
     if successful_runs > 0:
         print(f"\n✓ Completed with outputs for {successful_runs} ecosystems.")
