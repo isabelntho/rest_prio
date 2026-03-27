@@ -8,7 +8,7 @@ Created: March 2026
 
 import os
 from datetime import datetime
-from resto_anom import run_single_scenario_optimization
+from resto_anom import run_optimization_instance
 from data_loader import load_initial_conditions
 
 # =============================================================================
@@ -96,7 +96,7 @@ def main():
                 os.makedirs(run_output_dir, exist_ok=True)
                 
                 try:
-                    results = run_single_scenario_optimization(
+                    results = run_optimization_instance(
                         initial_conditions=initial_conditions,
                         scenario_params=scenario_params,
                         pop_size=POP_SIZE,

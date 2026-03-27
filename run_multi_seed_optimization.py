@@ -11,7 +11,7 @@ import os
 import json
 import numpy as np
 from datetime import datetime
-from resto_anom import run_single_scenario_optimization
+from resto_anom import run_optimization_instance
 from data_loader import load_initial_conditions
 
 # =============================================================================
@@ -90,7 +90,7 @@ def run_optimization_with_seed(seed, initial_conditions, run_index, total_runs, 
     print(f"{'='*80}")
     
     try:
-        results = run_single_scenario_optimization(
+        results = run_optimization_instance(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
             pop_size=POP_SIZE,

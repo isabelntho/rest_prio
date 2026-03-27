@@ -228,11 +228,15 @@ def create_ecosystem_mask(lulc_data, ecosystem_type):
         for codes in ECOSYSTEM_TYPES.values():
             all_codes.extend(codes)
         mask = np.isin(lulc_data, all_codes)
+    elif ecosystem_type == 'fg':
+        # Combined forest and grassland
+        fg_codes = ECOSYSTEM_TYPES['forest'] + ECOSYSTEM_TYPES['grassland']
+        mask = np.isin(lulc_data, fg_codes)
     elif ecosystem_type in ECOSYSTEM_TYPES:
         lulc_codes = ECOSYSTEM_TYPES[ecosystem_type]
         mask = np.isin(lulc_data, lulc_codes)
     else:
-        raise ValueError(f"Unknown ecosystem type: {ecosystem_type}. Available: {list(ECOSYSTEM_TYPES.keys()) + ['all']}")
+        raise ValueError(f"Unknown ecosystem type: {ecosystem_type}. Available: {list(ECOSYSTEM_TYPES.keys()) + ['all', 'fg']}")
     
     #print(f"✓ Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
     return mask

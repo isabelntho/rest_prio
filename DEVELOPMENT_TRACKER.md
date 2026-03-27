@@ -12,6 +12,7 @@ flowchart TD
     SC[scenarios.py]
     RS[results_saving.py]
     RA[resto_anom.py]
+    RNS[run_scenarios.py]
     UT[utils.py]
 
     RPE[run_patch_size_experiments.py]
@@ -29,7 +30,10 @@ flowchart TD
     SP --> RA
     PA --> RA
     SC --> RA
+    SC --> RNS
     RA --> RS
+    RA --> RNS
+    RNS --> RS
     RS --> OUT
 
     RPE --> RA
@@ -54,7 +58,16 @@ mermaid.initialize({ startOnLoad: true });
 ## Scripts and Contributions
 
 ### Core Optimization Pipeline
-- resto_anom.py: Main optimization engine. Defines objectives and constraints, initializes patch mode, runs NSGA-II, and orchestrates saving/reporting. 
+- **resto_anom.py**: Optimization engine. Defines `RestorationProblem` / `PatchRestorationProblem`, all effect calculation helpers, operator builders (`_build_operators`, `_build_algorithm`), results packaging (`_package_results`), `HVCallback`, `ProgressCallback`, and the primary single-run entry point `run_optimization_instance`. Multi-scenario orchestration has been moved to `run_scenarios.py`.
+- **run_scenarios.py**: Scenario orchestration layer. Handles looping over scenario combinations, assembling and saving combined multi-scenario results. Imports `run_optimization_instance` from `resto_anom.py`; `resto_anom.py` does not depend on this module.
+
+#### run_scenarios.py
+Scenario orchestration layer, extracted from `resto_anom.py`.
+- `run_one`: runs a single optimization instance from a `run_settings` dict.
+- `run_scenario_batch`: loops over a list of scenario parameter dicts, collecting results.
+- `run_all_scenarios_optimization`: expands the full scenario space and runs a complete batch.
+- `build_combined_results`: assembles the combined results dict from a completed batch.
+- `finalise_combined_results`: saves combined results and parameter summary to disk.
 
 #### data_loader.py
 Loads rasters and preprocessing inputs; builds masks and initial_conditions for optimization.
@@ -101,8 +114,8 @@ Writes result files, summaries, and reports from optimization runs.
 - save_parameter_summary: writes parameter-space summary metadata for runs.
 
 ### Experiment Runners
-- run_patch_size_experiments.py: Batch runner for patch-size sensitivity experiments across seeds/ecosystems.
-- run_multi_seed_optimization.py: Batch runner for seed robustness analysis for one ecosystem setup.
+- **run_patch_size_experiments.py**: Batch runner for patch-size sensitivity experiments across seeds/ecosystems. Imports `run_optimization_instance` from `resto_anom`.
+- **run_multi_seed_optimization.py**: Batch runner for seed robustness analysis for one ecosystem setup. Imports `run_optimization_instance` from `resto_anom`.
 
 ### Analysis and Visualization
 - visualisations.py: Main plotting and analysis utilities (selection frequency maps, Pareto plots, parallel coordinates, patch-size comparison grids, etc.).
@@ -200,3 +213,46 @@ Codebase simplification — reduced clutter and consolidated duplicated logic.
 
 #### MDMO_Aug25.py — legacy marker
 - Added a clearly visible `LEGACY REFERENCE — NOT USED IN PRODUCTION` header to `MDMO_Aug25.py`.
+
+#### resto_anom.py — internal refactoring
+- Lifted `ProgressCallback` from a closure inside the optimization function to a module-level class, with explicit constructor parameters (`n_generations`, `hv_patience`, `hv_min_improvement`, `ref_point`) replacing closed-over variables.
+- Extracted four private helpers from `run_single_scenario_optimization`: `_build_operators`, `_build_algorithm`, `_package_results`, `_print_failure_diagnostics`.
+- Renamed `run_single_scenario_optimization` → `run_optimization_instance` to better reflect its purpose.
+- Removed multi-scenario orchestration functions (`run_one`, `run_scenario_batch`, `run_all_scenarios_optimization`, `build_combined_results`, `finalise_combined_results`) — all moved to the new `run_scenarios.py`.
+- Trimmed top-level imports to only what `resto_anom.py` itself uses.
+
+#### New: run_scenarios.py
+- Created to hold all scenario orchestration logic extracted from `resto_anom.py`.
+- Contains: `run_one`, `run_scenario_batch`, `run_all_scenarios_optimization`, `build_combined_results`, `finalise_combined_results`.
+- Imports `run_optimization_instance` and `_filter_initial_conditions_for_return` from `resto_anom`; `resto_anom` does not import from this module (circular-import-free design).
+
+#### data_loader.py — ecosystem type fix
+- Added `'fg'` as a valid `ecosystem_type` value in `create_ecosystem_mask`, combining forest (codes 12, 13) and grassland (codes 16, 17) into a single mask. Error message updated to list `'fg'` as a valid option.
+
+#### Callers updated
+- `run_multi_seed_optimization.py` and `run_patch_size_experiments.py` updated to import and call `run_optimization_instance` instead of the old `run_single_scenario_optimization`.
+
+#### Further simplification of resto_anom.py
+- Removed unused imports: `email.mime.base`, `pandas`, `rasterio`, `BinaryRandomSampling`, `NonDominatedSorting`, `apply_burden_sharing`, `apply_spatial_clustering`, `_enforce_exact_pixel_count`, `compute_sn_dens`, `perf_counter`, `psutil`, and several `data_loader` symbols.
+- Removed dead instance variables from `RestorationProblem.__init__`: `_t0_wall`, `_eval_n`, `_slow_eval_seconds`, `_proc`.
+- Removed dead timing/debug instrumentation from `_evaluate` (`_debug_count`, `t_eval0`, `mem0`, `t_split`, second `t0`).
+- Removed `_mem_gb()` method (only used by dead instrumentation).
+- Simplified 3-way `Pool()` if/elif/else to a single line.
+- De-duplicated the two `super().__init__()` calls in `RestorationProblem.__init__` into a kwargs-dict pattern.
+- Removed dead locals `abiotic_effect`, `biotic_effect`, `eligible_indices` from `restoration_effect`.
+- Removed commented-out code block (`#weighted_improvements`, etc.) in `restoration_effect`.
+- Removed redundant `import numpy as np` inside `recalculate_landscape_anomaly_with_conversions` and `build_fixed_ref_point`; removed unused `rng = np.random.default_rng(seed)` in `build_fixed_ref_point`.
+- Moved `diagnose_optimization_setup` to new `debug_utils.py`; call site in `run_optimization_instance` uses a deferred import to avoid circular dependency.
+- Extracted `if __name__ == "__main__":` block to new `run_custom.py` for standalone use.
+- Replaced all 3-line `# ===...===` section banners with single-line `# --- Name ---` style.
+
+#### New: debug_utils.py
+- Contains `diagnose_optimization_setup` (moved from `resto_anom.py`), with the dead `if i < 3:` inner loop removed.
+- Uses a deferred `from resto_anom import RestorationProblem` inside the function body to avoid circular imports.
+
+#### New: run_custom.py
+- Standalone script for interactive/custom single-scenario runs; replaces the `if __name__ == "__main__":` block that was in `resto_anom.py`.
+- Edit configuration constants at the top and run directly: `python run_custom.py`.
+
+#### Potential future simplification (not implemented)
+- `conversion_mask()` in `resto_anom.py` is called from exactly one place (`restoration_effect`) with the `conversion_mask_2d` array already constructed at that call site. It could be inlined to eliminate the indirection, but was left as a separate function to preserve readability.
