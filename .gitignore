@@ -7,3 +7,7 @@ results*.pkl
 *.csv
 *.pyc
 *.html
+*.js
+*.css
+*.woff
+DEVELOPMENT_TRACKER.md
