@@ -32,15 +32,20 @@ def create_optimization_report(results, output_dir=".", verbose=True):
     """
     if verbose:
         print("\nCreating comprehensive optimization report...")
+
+    os.makedirs(os.path.join(output_dir, "optimisation_reports"), exist_ok=True)
     
     timestamp = datetime.now().strftime('%d%m')
-    ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem = results.get('scenario_params', {}).get(
+        'ecosystem_label',
+        results.get('initial_conditions', {}).get('ecosystem', 'all')
+    )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
     # Find next available file number
     x = 1
     while True:
-        report_filename = os.path.join(output_dir, f"optimization_report{ecosystem_suffix}_{timestamp}_{x}.json")
+        report_filename = os.path.join(output_dir, f"optimisation_reports/optimization_report{ecosystem_suffix}_{timestamp}_{x}.json")
         if not os.path.exists(report_filename):
             break
         x += 1
@@ -51,6 +56,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
     algorithm_info = results.get('algorithm_info', {})
     problem_info = results.get('problem_info', {})
     objectives = results.get('objectives', np.array([]))
+    objectives_normalized = results.get('objectives_normalized', np.array([]))
     objective_names = results.get('objective_names', [])
     hv_callback = results.get('hv_callback', None)
     
@@ -128,7 +134,11 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                     "reference_point": algorithm_info.get('hv_reference_point', None)
                 },
                 "actual_reason": algorithm_info.get('termination_reason', 'unknown')
-            }
+            },
+            "objective_normalization": algorithm_info.get('objective_normalization', {
+                "enabled": False,
+                "scales": {}
+            })
         },
         
         # =============================================================================
@@ -165,6 +175,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                 "hypervolume": hv_callback.best_hv if hv_callback and hasattr(hv_callback, 'best_hv') else None
             },
             "objective_statistics": {},
+            "objective_statistics_normalized": {},
             "convergence_metrics": {},
             #"decision_patterns": results.get('decision_analysis', {})
         },
@@ -262,7 +273,8 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                 "min": min_val,
                 "max": max_val,
                 "mean": mean_val,
-                "std": std_val
+                "std": std_val,
+                "unique_count": len(np.unique(obj_values))
             }
     
     # Add hypervolume evolution if available
@@ -298,6 +310,27 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                 min_val = max_val = mean_val = std_val = range_span = 0.0
                 
             report["results_summary"]["objective_statistics"][obj_name] = {
+                "min": min_val,
+                "max": max_val,
+                "mean": mean_val,
+                "std": std_val,
+                "range_span": range_span
+            }
+
+    # Add normalized objective statistics if available
+    if len(objectives_normalized) > 0 and len(objectives_normalized.shape) > 1:
+        for i, obj_name in enumerate(objective_names):
+            obj_values = objectives_normalized[:, i]
+            try:
+                min_val = float(obj_values.min())
+                max_val = float(obj_values.max())
+                mean_val = float(obj_values.mean())
+                std_val = float(obj_values.std())
+                range_span = max_val - min_val
+            except (TypeError, ValueError):
+                min_val = max_val = mean_val = std_val = range_span = 0.0
+
+            report["results_summary"]["objective_statistics_normalized"][obj_name] = {
                 "min": min_val,
                 "max": max_val,
                 "mean": mean_val,
@@ -456,11 +489,16 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
     """
     if verbose:
         print("\nCreating evolution tracking report...")
+
+    os.makedirs(os.path.join(output_dir, "evolution_reports"), exist_ok=True)
     
     timestamp = datetime.now().strftime('%d%m')
     
     # Get ecosystem information for filename
-    ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem = results.get('scenario_params', {}).get(
+        'ecosystem_label',
+        results.get('initial_conditions', {}).get('ecosystem', 'all')
+    )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
     # Find next available file number
@@ -468,7 +506,7 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
     while True:
         evolution_filename = os.path.join(
             output_dir,
-            f"evolution_report{ecosystem_suffix}_{timestamp}_{x}.json"
+            f"evolution_reports/evolution_report{ecosystem_suffix}_{timestamp}_{x}.json"
         )
         if not os.path.exists(evolution_filename):
             break
@@ -659,50 +697,130 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
     
     return evolution_filename
 
-def save_results_with_reports(results, output_dir=".", verbose=True):
+def save_results_with_reports(problem_or_results, res=None, initial_conditions=None, scenario_params=None,
+                                        pop_size=None, n_generations=None, total_time=None, hv_value=None,
+                                        ecosystem='unknown', region='unknown', experiment_id=None, random_seed=None,
+                                        output_dir=".", verbose=True, include_reports=True, include_debug=False):
     """
-    Save optimization results with comprehensive reporting in one simple call.
+     Save optimization results with comprehensive reporting.
+
+     Supports two calling styles:
+     1) New style (preferred):
+         save_results_with_reports(results_dict, output_dir=".", verbose=True)
+     2) Legacy style:
+         save_results_with_reports(problem, res, initial_conditions, scenario_params,
+                                            pop_size, n_generations, total_time, hv_value, ...)
     
     Args:
-        results: Results dictionary from optimization
-        output_dir: Directory to save files
-        verbose: Print save status
+        problem_or_results: Problem instance (legacy) or results dict (new style).
+        res: Result object from pymoo (legacy style only).
+        initial_conditions: Initial conditions dictionary (legacy style only).
+        scenario_params: Scenario parameters dictionary (legacy style only).
+        pop_size: Population size (legacy style only).
+        n_generations: Number of generations (legacy style only).
+        total_time: Total execution time (legacy style only).
+        hv_value: Final hypervolume (legacy style only).
+        ecosystem: Name of the ecosystem.
+        region: Name of the region.
+        experiment_id: Unique ID for the experiment run.
+        random_seed: The random seed used.
+        output_dir: Directory to write output files.
+        verbose: Print save status.
+        include_reports: Generate comprehensive optimization report (new style only).
+        include_debug: Generate debug report if available (new style only).
         
     Returns:
-        dict: Dictionary with paths to all generated files
+        dict: Dictionary with paths to all generated files.
     """
-    if verbose:
-        print("\nSaving results with comprehensive reporting...")
+    # New-style call path used by run_single_scenario_optimization.
+    if isinstance(problem_or_results, dict) and res is None:
+        return save_scenario_results(
+            results=problem_or_results,
+            output_dir=output_dir,
+            verbose=verbose,
+            include_reports=include_reports,
+            include_debug=include_debug,
+        )
+
+    problem = problem_or_results
+
+    # Create a comprehensive results dictionary
+    results_data = {
+        'problem': problem,
+        'result_object': res,
+        'initial_conditions': initial_conditions,
+        'scenario_params': scenario_params,
+        'algorithm_info': {
+            'pop_size': pop_size,
+            'n_generations': n_generations,
+            'execution_time': total_time,
+            'timestamp': datetime.now().isoformat(),
+            'random_seed': random_seed,
+            'experiment_id': experiment_id
+        },
+        'hypervolume': hv_value,
+        'objective_names': problem.objective_names,
+        'objectives': res.F,
+        'objectives_normalized': res.F,
+        'decisions': res.X,
+        'n_solutions': len(res.F) if res.F is not None else 0
+    }
     
-    generated_files = {}
-    
-    # Save basic results (pickle + JSON summary)
-    try:
-        basic_files = save_scenario_results(results, output_dir, verbose=False, include_reports=False, include_debug=False)
-        generated_files.update(basic_files)
-    except Exception as e:
-        if verbose: print(f"Warning: Could not save basic results: {e}")
-    
-    # Generate optimization report
-    try:
-        opt_report = create_optimization_report(results, output_dir, verbose=False)
-        generated_files['optimization_report'] = opt_report
-    except Exception as e:
-        if verbose: print(f"Warning: Could not generate optimization report: {e}")
-    
-    # Generate evolution tracking report  
-    try:
-        evolution_report = create_evolution_tracking_report(results, output_dir, verbose=False)
-        generated_files['evolution_report'] = evolution_report
-    except Exception as e:
-        if verbose: print(f"Warning: Could not generate evolution report: {e}")
-    
-    if verbose:
-        print(f"✓ Generated {len(generated_files)} files:")
-        for report_type, filepath in generated_files.items():
-            print(f"  {report_type}: {os.path.basename(filepath)}")
-    
-    return generated_files
+    # Use experiment_id for file naming if available
+    if experiment_id:
+        base_filename = f"{experiment_id}"
+        output_subdir = os.path.join("multi_seed_results", experiment_id)
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_filename = f"results_{ecosystem}_{region}_{timestamp}"
+        output_subdir = "multi_seed_results"
+
+    os.makedirs(output_subdir, exist_ok=True)
+
+    # Save results using the new base filename
+    pickle_path = os.path.join(output_subdir, f"{base_filename}.pkl")
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(results_data, f)
+
+    # Create and save a JSON summary
+    summary = {
+        'experiment_id': experiment_id,
+        'random_seed': random_seed,
+        'ecosystem': ecosystem,
+        'region': region,
+        'scenario_params': scenario_params,
+        'optimization_info': {
+            'pop_size': pop_size,
+            'n_generations': n_generations,
+            'execution_time': total_time,
+            'n_solutions': results_data['n_solutions'],
+            'hypervolume': hv_value
+        },
+        'objective_names': results_data['objective_names'],
+        'objective_stats': {}
+    }
+
+    if results_data['n_solutions'] > 0:
+        for i, name in enumerate(results_data['objective_names']):
+            values = results_data['objectives'][:, i]
+            summary['objective_stats'][name] = {
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values))
+            }
+
+    summary_path = os.path.join(output_subdir, f"summary_{base_filename}.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    print(f"✓ Results saved to {output_subdir}")
+
+    return {
+        'pickle_file': pickle_path,
+        'summary_file': summary_path,
+        'results_df': None # This was added in resto_anom, so we keep it for compatibility
+    }
 
 def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42, verbose=True):
     """
@@ -797,11 +915,17 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     """
     if verbose:
         print("\nSaving scenario results...")
+
+    os.makedirs(os.path.join(output_dir, "results_files"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "summary_files"), exist_ok=True)
     
     timestamp = datetime.now().strftime('%d%m')
     
     # Get ecosystem information for filename
-    ecosystem = results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem = results.get('scenario_params', {}).get(
+        'ecosystem_label',
+        results.get('initial_conditions', {}).get('ecosystem', 'all')
+    )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
     generated_files = {}
@@ -811,7 +935,7 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     while True:
         results_filename = os.path.join(
             output_dir,
-            f"results{ecosystem_suffix}_{timestamp}_{x}.pkl"
+            f"results_files/results{ecosystem_suffix}_{timestamp}_{x}.pkl"
         )
         if not os.path.exists(results_filename):
             break
@@ -822,7 +946,7 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     generated_files['pickle_file'] = results_filename
     
     # Save summary (JSON format) with same numbering as pickle file
-    summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}_{x}.json")
+    summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{timestamp}_{x}.json")
     
     objectives = results['objectives']
     
@@ -862,21 +986,34 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
         except Exception as e:
             if verbose:
                 print(f"  Warning: Could not generate optimization report: {e}")
-    
-    # Generate debug report if requested  
-    if include_debug:
+
         try:
-            debug_filename = create_debug_report(results, output_dir, verbose=False)
-            generated_files['debug_report'] = debug_filename
+            evolution_filename = create_evolution_tracking_report(results, output_dir, verbose=False)
+            generated_files['evolution_report'] = evolution_filename
         except Exception as e:
             if verbose:
-                print(f"  Warning: Could not generate debug report: {e}")
+                print(f"  Warning: Could not generate evolution report: {e}")
+    
+    # Generate debug report if requested
+    if include_debug:
+        debug_report_fn = globals().get('create_debug_report')
+        if callable(debug_report_fn):
+            try:
+                debug_filename = debug_report_fn(results, output_dir, verbose=False)
+                generated_files['debug_report'] = debug_filename
+            except Exception as e:
+                if verbose:
+                    print(f"  Warning: Could not generate debug report: {e}")
+        elif verbose:
+            print("  Warning: create_debug_report is not available; skipping debug report")
     
     if verbose:
         print(f"✓ Complete results saved to: {results_filename}")
         print(f"✓ Summary saved to: {summary_filename}")
         if include_reports and 'optimization_report' in generated_files:
             print(f"✓ Optimization report saved to: {os.path.basename(generated_files['optimization_report'])}")
+        if include_reports and 'evolution_report' in generated_files:
+            print(f"✓ Evolution report saved to: {os.path.basename(generated_files['evolution_report'])}")
         if include_debug and 'debug_report' in generated_files:
             print(f"✓ Debug report saved to: {os.path.basename(generated_files['debug_report'])}")
     
@@ -893,19 +1030,25 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     """
     if verbose:
         print(f"\nSaving combined scenario results...")
+
+    os.makedirs(os.path.join(output_dir, "results_files"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "summary_files"), exist_ok=True)
     
     timestamp = datetime.now().strftime('%d%m')
     
     # Get ecosystem information from first scenario (should be same for all)
     first_scenario_results = next(iter(combined_results['scenarios'].values()))
-    ecosystem = first_scenario_results.get('initial_conditions', {}).get('ecosystem', 'all')
+    ecosystem = first_scenario_results.get('scenario_params', {}).get(
+        'ecosystem_label',
+        first_scenario_results.get('initial_conditions', {}).get('ecosystem', 'all')
+    )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
     # Find next available file number
     x = 1
     while True:
-        results_filename = os.path.join(output_dir, f"results{ecosystem_suffix}_{timestamp}_{x}.pkl")
-        summary_filename = os.path.join(output_dir, f"summary{ecosystem_suffix}_{timestamp}_{x}.json")
+        results_filename = os.path.join(output_dir, f"results_files/results{ecosystem_suffix}_{timestamp}_{x}.pkl")
+        summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{timestamp}_{x}.json")
         if not os.path.exists(results_filename):
             break
         x += 1

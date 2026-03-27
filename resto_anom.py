@@ -49,7 +49,7 @@ from results_saving import (
 )
 # Import patch-based optimization approach
 from patch_approach import (
-    create_patch_mappings_for_restoration_and_conversion,
+    create_patch_mappings,
     PatchRepair,
     PatchAwareSampling,
     aggregate_patch_scores_from_pixel_scores,
@@ -154,7 +154,7 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
     print(f"\nInitializing patch-based approach (patch size: {patch_size}x{patch_size} pixels)...")
     
     # Create patch mappings for restoration and conversion areas
-    patch_mappings = create_patch_mappings_for_restoration_and_conversion(
+    patch_mappings = create_patch_mappings(
         initial_conditions, 
         patch_size=patch_size
     )
@@ -168,7 +168,6 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
     initial_conditions['n_restoration_patches'] = patch_mappings['restoration_patches']['n_patches']
     initial_conditions['n_conversion_patches'] = patch_mappings['conversion_patches']['n_patches']
     
-    print(f"✓ Patch approach initialized:")
     print(f"  Restoration patches: {initial_conditions['n_restoration_patches']}")
     print(f"  Conversion patches: {initial_conditions['n_conversion_patches']}")
     
@@ -614,6 +613,12 @@ class RestorationProblem(ElementwiseProblem):
         n_objectives = len(self.objective_names)
         if n_objectives == 0:
             raise ValueError("No objectives found in initial_conditions")
+
+        # Objective normalization configuration.
+        # Optimization uses normalized objectives in _evaluate; raw objectives are
+        # still computed and can be exported for reporting/interpretation.
+        self.normalize_objectives = bool(scenario_params.get('normalize_objectives', True))
+        self.objective_scales = self._build_objective_scales()
         
         n_restoration_pixels = initial_conditions['n_restoration_pixels']
         n_conversion_pixels = initial_conditions['n_conversion_pixels']
@@ -682,6 +687,82 @@ class RestorationProblem(ElementwiseProblem):
         rss = self._proc.memory_info().rss
         return rss / (1024**3)
 
+    def _build_objective_scales(self):
+        """Build per-objective positive scales for objective normalization."""
+        eps = 1e-12
+        scales = {}
+
+        rest_mask = self.initial_conditions.get("restoration_eligible_mask")
+        conv_mask = self.initial_conditions.get("conversion_eligible_mask")
+
+        for obj_name in self.objective_names:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
+                base = self.initial_conditions[obj_name]
+                if rest_mask is not None:
+                    scale = float(np.nansum(np.abs(base[rest_mask])))
+                else:
+                    scale = float(np.nansum(np.abs(base)))
+            elif obj_name == 'landscape_anomaly':
+                l0 = self.initial_conditions['landscape_anomaly']
+                scale = float(np.nansum(np.abs(l0)))
+            elif obj_name == 'implementation_cost':
+                c = self.initial_conditions['implementation_cost']
+                if rest_mask is not None and conv_mask is not None:
+                    scale = float(np.nansum(np.abs(c[rest_mask])) + np.nansum(np.abs(c[conv_mask])))
+                else:
+                    scale = float(np.nansum(np.abs(c)))
+            else:
+                scale = 1.0
+
+            if (not np.isfinite(scale)) or scale <= eps:
+                scale = 1.0
+            scales[obj_name] = scale
+
+        return scales
+
+    def _normalize_objective_vector(self, raw_objectives):
+        """Normalize raw objective vector using precomputed scales."""
+        if not self.normalize_objectives:
+            return raw_objectives
+
+        normalized = []
+        for i, obj_name in enumerate(self.objective_names):
+            scale = self.objective_scales.get(obj_name, 1.0)
+            normalized.append(float(raw_objectives[i]) / float(scale))
+        return normalized
+
+    def evaluate_raw_objectives(self, x):
+        """Return raw (non-normalized) objective values for a decision vector."""
+        x_restore = x[:self.n_restoration_pixels]
+        x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
+
+        # Conversion objectives only valid when landscape objective is present.
+        if 'landscape_anomaly' not in self.initial_conditions:
+            x_convert = x_convert.copy()
+            x_convert[:] = 0
+
+        updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
+
+        raw_objectives = []
+        for obj_name in self.objective_names:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
+                base = self.initial_conditions[obj_name]
+                mask = self.initial_conditions["restoration_eligible_mask"]
+                obj_value = -np.sum((updated_conditions[obj_name] - base)[mask])
+            elif obj_name == 'landscape_anomaly':
+                l0 = self.initial_conditions["landscape_anomaly"]
+                l1 = updated_conditions["landscape_anomaly"]
+                eps = 1e-12
+                obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
+            elif obj_name == 'implementation_cost':
+                obj_value = updated_conditions[obj_name]
+            else:
+                raise ValueError(f"Unknown objective: {obj_name}")
+
+            raw_objectives.append(float(obj_value))
+
+        return raw_objectives
+
     def _evaluate(self, x, out, *args, **kwargs):
         """
         Evaluate a solution (restoration plan).
@@ -720,80 +801,12 @@ class RestorationProblem(ElementwiseProblem):
         n_converted = np.sum(x_convert)
         n_total_actions = n_restored + n_converted
         
-        # Apply restoration effects to both restoration and conversion decisions
+        # Compute raw objectives then normalize for optimization.
         t0 = time()
-        updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
-        t_effect = time() - t0
-        
-        # inside RestorationProblem._evaluate, after updated_conditions is computed
-
-        a0 = self.initial_conditions["abiotic_anomaly"]
-        b0 = self.initial_conditions["biotic_anomaly"]
-        l0 = self.initial_conditions["landscape_anomaly"] if "landscape_anomaly" in self.initial_conditions else None
-
-        a1 = updated_conditions["abiotic_anomaly"]
-        b1 = updated_conditions["biotic_anomaly"]
-        l1 = updated_conditions["landscape_anomaly"] if "landscape_anomaly" in updated_conditions else None
-
-        # masks for acted pixels
-        shape = self.initial_conditions["shape"]
-        rest_mask = np.zeros(shape, dtype=bool)
-        conv_mask = np.zeros(shape, dtype=bool)
-
-        if np.any(x_restore):
-            idx = self.initial_conditions["restoration_eligible_indices"][x_restore == 1]
-            rr, cc = np.divmod(idx, shape[1])
-            rest_mask[rr, cc] = True
-
-        if np.any(x_convert):
-            idx = self.initial_conditions["conversion_eligible_indices"][x_convert == 1]
-            rr, cc = np.divmod(idx, shape[1])
-            conv_mask[rr, cc] = True
-
-        cost = updated_conditions.get("implementation_cost", np.nan)
-
-        n_rest = int(np.sum(x_restore))
-        n_conv = int(np.sum(x_convert))
-
-        t0 = time()
-        # Calculate objective values (all to minimize) - only for available objectives
-        objectives = []
-        
-        for obj_name in self.objective_names:
-            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
-                # Anomaly objectives: MINIMIZE negative sum (equivalent to MAXIMIZE sum)
-                # Higher anomalies are better, so we want to maximize the sum
-                # NSGA-II minimizes, so we minimize the negative
-                
-                #previous: threshold objective
-                #threshold = 0.0  # or different per objective
-                #pixels_above = np.sum(updated_conditions[obj_name] > threshold)
-                #obj_value = -pixels_above  # Maximize count above threshold
-                
-                #now, trying a different construction which is to maximise improvement relative to the baseline
-                base = self.initial_conditions[obj_name]
-                mask = self.initial_conditions["restoration_eligible_mask"]
-                obj_value = -np.sum((updated_conditions[obj_name] - base)[mask])
-                
-            elif obj_name == 'landscape_anomaly':
-                # Landscape objective: MINIMIZE the actual sum of landscape anomalies
-                # Use the actual values, not just count above threshold
-                #landscape_vals = updated_conditions[obj_name]
-                #obj_value = np.sum(landscape_vals)  # Minimize total landscape impact
-                l0 = self.initial_conditions["landscape_anomaly"]
-                l1 = updated_conditions["landscape_anomaly"]
-                eps = 1e-12
-                obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
- 
-            elif obj_name == 'implementation_cost':
-                # Cost objective: minimize total cost (lower is better)
-                obj_value = updated_conditions[obj_name]
-            else:
-                raise ValueError(f"Unknown objective: {obj_name}")
-            
-            objectives.append(obj_value)
-        
+        raw_objectives = self.evaluate_raw_objectives(x)
+        objectives = self._normalize_objective_vector(raw_objectives)
         out["F"] = objectives
+        out["F_raw"] = raw_objectives
         
         # Constraint: total number of pixels with actions (restore + convert)
         out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
@@ -969,6 +982,26 @@ class PatchRestorationProblem(RestorationProblem):
                     print(f"                    VIOLATION: G={constraint_value}")
         
         out["G"] = [constraint_value]
+
+    def evaluate_raw_objectives(self, x_patches):
+        """Return raw objectives for patch-level decisions via pixel conversion."""
+        from patch_approach import convert_patch_decisions_to_pixels
+
+        x_restore_patches = x_patches[:self.n_restoration_patches]
+        x_convert_patches = x_patches[self.n_restoration_patches:]
+
+        x_restore_pixels = convert_patch_decisions_to_pixels(
+            x_restore_patches,
+            self.restoration_patches,
+            self.n_restoration_pixels
+        )
+        x_convert_pixels = convert_patch_decisions_to_pixels(
+            x_convert_patches,
+            self.conversion_patches,
+            self.n_conversion_pixels
+        )
+        x_pixels = np.concatenate([x_restore_pixels, x_convert_pixels])
+        return super().evaluate_raw_objectives(x_pixels)
 
 
 # =============================================================================
@@ -1563,8 +1596,10 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                 pop_F = result.pop.get("F")
                 pop_X = result.pop.get("X")
                 if pop_F is not None and pop_X is not None:
+                    pop_F_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in pop_X], dtype=float)
                     full_population_data = {
-                        'objectives': pop_F,  # Full population objectives
+                        'objectives': pop_F_raw,  # Raw full population objectives (for reporting)
+                        'objectives_normalized': pop_F,  # Normalized objectives used by optimizer
                         'decisions': pop_X,   # Full population decisions
                         'population_size': len(pop_F)
                     }  
@@ -1573,10 +1608,15 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
             #decision_analysis = analyze_decision_patterns(result.X, initial_conditions)
             #decision_analysis['constraints']['restoration_budget_fraction'] = scenario_params.get('max_restoration_fraction', 0.0)
             
+            objectives_normalized = np.asarray(result.F, dtype=float)
+            objectives_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in result.X], dtype=float)
+
             optimization_results = {
                 'scenario_params': scenario_params,
                 'objective_names' : problem.objective_names,
-                'objectives': result.F,           # Objective values
+                'objectives': objectives_raw,      # Raw objective values (for reporting/interpretation)
+                'objectives_raw': objectives_raw,
+                'objectives_normalized': objectives_normalized,  # Used during optimization
                 'decisions': result.X,            # Decision variables (restoration plans)
                 #'decision_analysis': decision_analysis,  # Analysis of restore/convert patterns
                 'n_solutions': len(result.F),
@@ -1608,6 +1648,10 @@ def run_single_scenario_optimization(initial_conditions, scenario_params, pop_si
                     'hv_min_improvement': hv_min_improvement,
                     'sampling_method': 'adaptive',
                     'repair_operators': ['score_based_repair', 'random_repair'],
+                    'objective_normalization': {
+                        'enabled': bool(problem.normalize_objectives),
+                        'scales': {k: float(v) for k, v in problem.objective_scales.items()}
+                    },
                     'timestamp': datetime.now().isoformat()
                 },
                 'initial_conditions': initial_conditions_filtered,
@@ -1767,7 +1811,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
             sample_fraction=sample_fraction,
             sample_seed=sample_seed,
             ecosystem_lulc_path=lulc_path,
-            landscape_lulc_path=lulc_path
+            landscape_lulc_path=lulc_path,
         )
 
         return run_all_scenarios_optimization(
@@ -1794,7 +1838,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
         sample_fraction=sample_fraction,
         sample_seed=sample_seed,
         ecosystem_lulc_path=lulc_path,
-        landscape_lulc_path=lulc_path
+        landscape_lulc_path=lulc_path,
     )
 
     scenario_combinations = sample_scenario_parameters(n_samples_per_param, random_seed)
@@ -1825,9 +1869,10 @@ if __name__ == "__main__":
 
     # Available ecosystem run modes:
     # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
+    # - 'fg': run one optimisation using forest + grassland pixels
     # - 'all': run three separate optimisations (one per ecosystem)
     # - 'combined': run one optimisation without ecosystem filtering
-    ECOSYSTEM_TO_RUN = "forest"  # change to a single ecosystem if needed
+    ECOSYSTEM_TO_RUN = "fg"  # change to a single ecosystem if needed
 
     # Region used for validation reference in load_initial_conditions
     REGION = "Bern"  # change to 'CH' for Switzerland-wide optimisation
@@ -1844,22 +1889,23 @@ if __name__ == "__main__":
     OBJECTIVES = ["abiotic", "biotic","cost"]# "landscape", "cost"]
     SAMPLE_FRACTION = None
     SAMPLE_SEED = 42
-    POP_SIZE = 20
-    N_GENERATIONS = 30
+    POP_SIZE = 50
+    N_GENERATIONS = 100
     N_JOBS = 12
     RANDOM_SEED = 42
     N_SAMPLES_PER_PARAM = 3
 
     # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
     custom_scenario_params = {
-        "max_restoration_fraction": 0.05,
+        "max_restoration_fraction": 0.1,
         "spatial_clustering": 0,
         "biotic_effect": 0.01,
-        "adjacency_beta": 0.25,  # Tunable adjacency weighting: 0.1 (weak) to 1.0 (strong). Higher values encourage clustering.
+        "abiotic_effect": 0.01,
+        "normalize_objectives": True,
     }
     
     # Patch approach settings (optional - set to enable patch-based optimization)
-    USE_PATCH_APPROACH = True  # Set to True to use patch-based decision vector
+    USE_PATCH_APPROACH = False  # Set to True to use patch-based decision vector
     PATCH_SIZE = 2  # Size of patches in pixels (e.g., 100 = 100x100 patches)
     PATCH_CONSTRAINT_TYPE = 'pixel_count'  # 'pixel_count' (recommended) or 'patch_count'
     PIXEL_TOLERANCE = 0.05  # Tolerance for pixel_count constraint (±5%)
@@ -1895,7 +1941,7 @@ if __name__ == "__main__":
                     sample_fraction=SAMPLE_FRACTION,
                     sample_seed=SAMPLE_SEED,
                     ecosystem=ecosystem_for_loader,
-                    lulc_path=None
+                    lulc_path=None,
                 )
             else:
                 initial_conditions = load_initial_conditions(
@@ -1904,7 +1950,7 @@ if __name__ == "__main__":
                     region=REGION,
                     ecosystem=ecosystem_for_loader,
                     sample_fraction=SAMPLE_FRACTION,
-                    sample_seed=SAMPLE_SEED
+                    sample_seed=SAMPLE_SEED,
                 )
 
                 results = run_single_scenario_optimization(
@@ -1915,6 +1961,7 @@ if __name__ == "__main__":
                     save_results=True,
                     verbose=True,
                     n_jobs=N_JOBS, 
+                    random_seed=RANDOM_SEED,
                     use_repair=True,
                     use_patch_approach=USE_PATCH_APPROACH,
                     patch_size=PATCH_SIZE,

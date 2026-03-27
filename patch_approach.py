@@ -280,7 +280,7 @@ def map_global_to_eligible_indices(global_pixel_indices: np.ndarray,
                     if idx in global_to_eligible])
 
 
-def create_patch_mappings_for_restoration_and_conversion(initial_conditions: Dict,
+def create_patch_mappings(initial_conditions: Dict,
                                                          patch_size: int = 10) -> Dict:
     """Create separate patch systems for restoration and conversion areas."""
     shape = initial_conditions['shape']
