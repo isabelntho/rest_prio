@@ -3,33 +3,18 @@ Visualisations for restoration optimization results
 Load results from pickle file and create visualizations
 """
 
-import pickle
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from matplotlib.colors import ListedColormap
-import sys
 from patch_approach import (
     convert_patch_decisions_to_pixels,
-    create_patch_mappings_for_restoration_and_conversion,
+    create_patch_mappings,
 )
-
-
-def _pickle_load_with_numpy_compat(path):
-    """Load pickle with fallback for numpy module path changes across versions."""
-    try:
-        with open(path, 'rb') as f:
-            return pickle.load(f)
-    except ModuleNotFoundError as exc:
-        if 'numpy._core' not in str(exc):
-            raise
-
-    # Retry with compatibility alias for pickles created in different numpy builds.
-    sys.modules['numpy._core'] = np.core
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+from utils import pickle_load as _pickle_load_with_numpy_compat
 
 
 def _convert_patch_decisions_to_pixel_matrix(decisions, initial_conditions, results=None):
@@ -59,7 +44,7 @@ def _convert_patch_decisions_to_pixel_matrix(decisions, initial_conditions, resu
     if patch_mappings is None:
         for ps in [2, 3, 4, 5, 6, 8, 10, 12, 15, 20]:
             try:
-                candidate = create_patch_mappings_for_restoration_and_conversion(initial_conditions, patch_size=ps)
+                candidate = create_patch_mappings(initial_conditions, patch_size=ps)
                 n_rest_p = candidate["restoration_patches"]["n_patches"]
                 n_conv_p = candidate["conversion_patches"]["n_patches"]
                 if (n_rest_p + n_conv_p) == n_var:
@@ -1487,6 +1472,310 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"✓ Parallel coordinates plot saved to: {save_path}")
+
+
+# =============================================================================
+# PATCH SIZE COMPARISON GRIDS
+# =============================================================================
+# Functions for generating side-by-side comparison plots across multiple
+# patch sizes, given a list of pre-loaded run results (run_data).
+#
+# run_data format:
+#   [{"patch_size": int, "seed": int, "initial_conditions": dict,
+#     "decisions": ndarray, "F": ndarray}, ...]
+# =============================================================================
+
+def _extract_decisions(results):
+    """Get decision matrix from results dict with fallback key names."""
+    if results is None:
+        return None
+    if "decisions" in results:
+        return np.asarray(results["decisions"])
+    if "X" in results:
+        return np.asarray(results["X"])
+    return None
+
+
+def _extract_objectives(results):
+    """Get objective matrix from results dict with fallback key names."""
+    if results is None:
+        return None
+    if "objectives" in results:
+        return np.asarray(results["objectives"])
+    if "F" in results:
+        return np.asarray(results["F"])
+    return None
+
+
+def _build_patch_comparison_frequency_map(decisions, initial_conditions):
+    """Build raster of restoration selection frequency (% across Pareto solutions).
+
+    Handles both pixel-space and patch-space decision vectors.
+    """
+    shape = initial_conditions["shape"]
+    n_rest = int(initial_conditions["n_restoration_pixels"])
+    n_conv = int(initial_conditions.get("n_conversion_pixels", 0))
+    rest_indices = initial_conditions["restoration_eligible_indices"]
+
+    freq_map = np.full(shape, np.nan, dtype=np.float64)
+    if decisions is None or decisions.size == 0:
+        return freq_map
+
+    decisions = np.asarray(decisions)
+    n_var = decisions.shape[1]
+
+    if n_var == (n_rest + n_conv):
+        rest_decisions = decisions[:, :n_rest]
+        freq = np.mean(rest_decisions, axis=0) * 100.0
+    elif n_var == n_rest:
+        freq = np.mean(decisions, axis=0) * 100.0
+    else:
+        patch_mappings = initial_conditions.get("patch_mappings")
+        if patch_mappings is None:
+            raise ValueError(
+                f"Decision vector length does not match pixel space and patch_mappings are missing. "
+                f"Got n_var={n_var}, expected {n_rest + n_conv}."
+            )
+        n_rest_patches = int(patch_mappings["restoration_patches"]["n_patches"])
+        n_conv_patches = int(patch_mappings["conversion_patches"]["n_patches"])
+        expected_patch_var = n_rest_patches + n_conv_patches
+        if n_var != expected_patch_var:
+            raise ValueError(
+                f"Decision vector length matches neither pixel nor patch space. "
+                f"Got n_var={n_var}, expected pixel={n_rest + n_conv}, patch={expected_patch_var}."
+            )
+        rest_pixel_solutions = np.zeros((decisions.shape[0], n_rest), dtype=np.int8)
+        for i in range(decisions.shape[0]):
+            rest_pixel_solutions[i] = convert_patch_decisions_to_pixels(
+                decisions[i, :n_rest_patches],
+                patch_mappings["restoration_patches"],
+                n_rest,
+            )
+        freq = np.mean(rest_pixel_solutions, axis=0) * 100.0
+
+    if len(freq) != len(rest_indices):
+        raise ValueError(
+            f"Selection frequency length does not match restoration index length: "
+            f"freq={len(freq)}, indices={len(rest_indices)}"
+        )
+    flat = freq_map.ravel()
+    flat[rest_indices] = freq
+    return flat.reshape(shape)
+
+
+def _plot_patch_comparison_parallel_coords(ax, F):
+    """Simple parallel coordinates plot for a single run."""
+    if F is None or len(F) == 0:
+        ax.text(0.5, 0.5, "No objective data", ha="center", va="center")
+        ax.set_axis_off()
+        return
+
+    vals = np.column_stack([-F[:, 0], -F[:, 1], F[:, 2]])
+    labels = ["Abiotic improve", "Biotic improve", "Cost"]
+    mins = np.nanmin(vals, axis=0)
+    maxs = np.nanmax(vals, axis=0)
+    spans = np.where((maxs - mins) <= 1e-12, 1.0, maxs - mins)
+    vals_n = (vals - mins) / spans
+
+    x = np.arange(vals_n.shape[1])
+    cost_norm = vals_n[:, 2]
+    cmap = plt.cm.viridis
+    for i in range(vals_n.shape[0]):
+        ax.plot(x, vals_n[i], color=cmap(cost_norm[i]), alpha=0.25, linewidth=1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=10)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Normalized value")
+    ax.set_title("Parallel coordinates")
+    ax.grid(alpha=0.3)
+
+
+def _plot_parallel_coordinates_with_global_scale(ax, F, mins, maxs):
+    """Parallel coordinates normalized with shared limits across patch sizes."""
+    if F is None or len(F) == 0:
+        ax.text(0.5, 0.5, "No objective data", ha="center", va="center")
+        ax.set_axis_off()
+        return
+
+    vals = np.column_stack([-F[:, 0], -F[:, 1], F[:, 2]])
+    labels = ["Abiotic improve", "Biotic improve", "Cost"]
+    spans = np.where((maxs - mins) <= 1e-12, 1.0, maxs - mins)
+    vals_n = (vals - mins) / spans
+
+    x = np.arange(vals_n.shape[1])
+    cost_norm = vals_n[:, 2]
+    cmap = plt.cm.viridis
+    for i in range(vals_n.shape[0]):
+        ax.plot(x, vals_n[i], color=cmap(cost_norm[i]), alpha=0.25, linewidth=1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=10)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Normalized value")
+    ax.grid(alpha=0.3)
+
+
+def create_selection_frequency_grid(run_data, output_dir):
+    """Create one 2x2 selection-frequency grid across patch sizes.
+
+    Parameters
+    ----------
+    run_data : list of dict
+        Each dict must have keys: ``patch_size``, ``decisions``,
+        ``initial_conditions``.
+    output_dir : str
+        Directory where the PNG is saved.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+    im = None
+
+    for ax, item in zip(axes, run_data):
+        freq_map = _build_patch_comparison_frequency_map(
+            item["decisions"], item["initial_conditions"]
+        )
+        im = ax.imshow(freq_map, cmap="viridis", vmin=0, vmax=100)
+        ax.set_title(f"Patch size {item['patch_size']}x{item['patch_size']}")
+        ax.set_axis_off()
+
+    for ax in axes[len(run_data):]:
+        ax.set_axis_off()
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes.tolist(), fraction=0.025, pad=0.02)
+        cbar.set_label("% selected")
+    fig.suptitle("Selection frequency across patch sizes", fontsize=14)
+    fig.tight_layout()
+
+    out_png = os.path.join(output_dir, "selection_frequency_grid.png")
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def create_pareto_front_grid(run_data, output_dir):
+    """Create one 2x2 Pareto-front grid across patch sizes.
+
+    Parameters
+    ----------
+    run_data : list of dict
+        Each dict must have keys: ``patch_size``, ``F``.
+    output_dir : str
+        Directory where the PNG is saved.
+    """
+    all_F = [item["F"] for item in run_data if item["F"] is not None and len(item["F"]) > 0]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+
+    if all_F:
+        F_all = np.vstack(all_F)
+        x_all = -F_all[:, 0]
+        y_all = -F_all[:, 1]
+        cmin, cmax = np.nanmin(F_all[:, 2]), np.nanmax(F_all[:, 2])
+        xlim = (np.nanmin(x_all), np.nanmax(x_all))
+        ylim = (np.nanmin(y_all), np.nanmax(y_all))
+    else:
+        cmin, cmax = 0.0, 1.0
+        xlim = ylim = (0.0, 1.0)
+
+    sc = None
+    for ax, item in zip(axes, run_data):
+        F = item["F"]
+        if F is not None and len(F) > 0:
+            sc = ax.scatter(-F[:, 0], -F[:, 1], c=F[:, 2], cmap="plasma", s=25,
+                            alpha=0.85, vmin=cmin, vmax=cmax)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_xlabel("Abiotic improvement")
+            ax.set_ylabel("Biotic improvement")
+            ax.grid(alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, "No Pareto data", ha="center", va="center")
+            ax.set_axis_off()
+        ax.set_title(f"Patch size {item['patch_size']}x{item['patch_size']}")
+
+    for ax in axes[len(run_data):]:
+        ax.set_axis_off()
+
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=axes.tolist(), fraction=0.025, pad=0.02)
+        cbar.set_label("Cost")
+
+    fig.suptitle("Pareto front across patch sizes", fontsize=14)
+    fig.tight_layout()
+
+    out_png = os.path.join(output_dir, "pareto_front_grid.png")
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def create_parallel_coordinates_grid(run_data, output_dir):
+    """Create one 2x2 parallel-coordinates grid across patch sizes.
+
+    Parameters
+    ----------
+    run_data : list of dict
+        Each dict must have keys: ``patch_size``, ``F``.
+    output_dir : str
+        Directory where the PNG is saved.
+    """
+    all_vals = [
+        np.column_stack([-item["F"][:, 0], -item["F"][:, 1], item["F"][:, 2]])
+        for item in run_data
+        if item["F"] is not None and len(item["F"]) > 0
+    ]
+    if all_vals:
+        vals_all = np.vstack(all_vals)
+        mins = np.nanmin(vals_all, axis=0)
+        maxs = np.nanmax(vals_all, axis=0)
+    else:
+        mins = np.array([0.0, 0.0, 0.0])
+        maxs = np.array([1.0, 1.0, 1.0])
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+
+    for ax, item in zip(axes, run_data):
+        _plot_parallel_coordinates_with_global_scale(ax, item["F"], mins, maxs)
+        ax.set_title(f"Patch size {item['patch_size']}x{item['patch_size']}")
+
+    for ax in axes[len(run_data):]:
+        ax.set_axis_off()
+
+    fig.suptitle("Parallel coordinates across patch sizes", fontsize=14)
+    fig.tight_layout()
+
+    out_png = os.path.join(output_dir, "parallel_coordinates_grid.png")
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def create_patch_size_comparison_grids(run_data, output_dir):
+    """Generate all three 2x2 comparison grid plots for a patch-size sweep.
+
+    Creates selection-frequency, Pareto-front, and parallel-coordinates grids
+    side-by-side across patch sizes and saves them to ``output_dir``.
+
+    Parameters
+    ----------
+    run_data : list of dict
+        List of run result dicts.  Each dict must have keys: ``patch_size``,
+        ``seed``, ``initial_conditions``, ``decisions``, ``F``.
+    output_dir : str
+        Directory where the three PNG files are saved.
+
+    Returns
+    -------
+    list of str
+        Paths to the three saved PNG files.
+    """
+    p1 = create_selection_frequency_grid(run_data, output_dir)
+    p2 = create_pareto_front_grid(run_data, output_dir)
+    p3 = create_parallel_coordinates_grid(run_data, output_dir)
+    return [p1, p2, p3]
+
     
     plt.show()
     return fig

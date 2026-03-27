@@ -13,27 +13,9 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 import os
 import json
 import glob
-import pickle
 from scipy.spatial.distance import cdist
 from sklearn.metrics import jaccard_score
-
-# Custom unpickler to handle missing classes
-class CustomUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        # If the class is not found, return a dummy class
-        try:
-            return super().find_class(module, name)
-        except (AttributeError, ModuleNotFoundError):
-            # Return a dummy class for missing classes
-            return type(name, (), {})
-
-def safe_pickle_load(file_path):
-    """Safely load a pickle file, handling missing classes."""
-    try:
-        with open(file_path, 'rb') as f:
-            return CustomUnpickler(f).load()
-    except Exception as e:
-        raise e
+from utils import pickle_load as safe_pickle_load
 
 # =============================================================================
 # CONFIGURATION

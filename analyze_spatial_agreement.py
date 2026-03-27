@@ -17,27 +17,12 @@ Created: March 2026
 import os
 import json
 import glob
-import pickle
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from patch_approach import convert_patch_results_to_pixel_decisions
-
-
-# Custom unpickler to handle missing classes
-class CustomUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        try:
-            return super().find_class(module, name)
-        except (AttributeError, ModuleNotFoundError):
-            return type(name, (), {})
-
-
-def safe_pickle_load(file_path):
-    """Safely load a pickle file, handling missing classes."""
-    with open(file_path, 'rb') as f:
-        return CustomUnpickler(f).load()
+from utils import pickle_load as safe_pickle_load
 
 
 def analyze_spatial_agreement(ecosystem, file_date, file_start, file_end, 
