@@ -331,7 +331,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
                 print(f"Warning: No canton named 'Bern' found in {kanton_file}")
                 return None
             
-            print(f"✓ Filtered to Bern canton")
+            #print(f"✓ Filtered to Bern canton")
             
             # Load admin shapefile and crop/mask to Bern
             gdf = gpd.read_file(admin_file)
@@ -455,7 +455,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                                 abs(actual.top - expected[3]) < 1000):
                             print(f"Warning: Raster bounds {actual} significantly differ from expected {expected} for region {region}")
                     
-                    print(f"✓ Using {region_ref['description']} as validation reference")
+                    #print(f"✓ Using {region_ref['description']} as validation reference")
                 else:
                     print(f"✓ Using first raster as validation reference for region {region}")
                 
@@ -670,7 +670,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             base_eligible_mask = base_eligible_mask & ~nan_mask
             nan_excluded = np.sum(nan_mask)
             #print(f"  Masking {nan_excluded} NaN pixels from {obj_name}")
-    print(f"  Masked NaN pixels from objective layers")
+    #print(f"  Masked NaN pixels from objective layers")
     # RESTORATION ELIGIBLE MASK: Apply ecosystem mask to eligible pixels (current method)
     restoration_eligible_mask = base_eligible_mask.copy()
     if 'ecosystem_mask' in initial_conditions:
@@ -679,8 +679,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         post_ecosystem_count = np.sum(restoration_eligible_mask)
         ecosystem_excluded = pre_ecosystem_count - post_ecosystem_count
         #print(f"  Ecosystem masking for restoration excluded {ecosystem_excluded} pixels")
-        print(f"  Final restoration eligible pixels for {ecosystem}: {post_ecosystem_count}")
-    
+   
     # CONVERSION ELIGIBLE MASK: Landscape LULC pixels NOT in focal_classes
     conversion_eligible_mask = base_eligible_mask.copy()
     if 'landscape_lulc_data' in initial_conditions:
@@ -702,8 +701,6 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         conversion_eligible_mask = conversion_eligible_mask & not_focal_mask
         post_conversion_count = np.sum(conversion_eligible_mask)
         focal_excluded = pre_conversion_count - post_conversion_count
-        print(f"  Focal class masking for conversion excluded {focal_excluded} pixels")
-        print(f"  Final conversion eligible pixels (non-focal): {post_conversion_count}")
     else:
         print(f"  Warning: No landscape LULC data found, using base mask for conversion")
     
@@ -798,9 +795,9 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     }
     
     total_pixels = shape[0] * shape[1]
-    print(f"✓ Eligibility masks created:")
-    print(f"  Restoration: {initial_conditions['n_restoration_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_restoration_pixels']/total_pixels:.1f}% of raster)")
-    print(f"  Conversion: {initial_conditions['n_conversion_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_conversion_pixels']/total_pixels:.1f}% of raster)")
+    #print(f"✓ Eligibility masks created:")
+    #print(f"  Restoration: {initial_conditions['n_restoration_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_restoration_pixels']/total_pixels:.1f}% of raster)")
+    #print(f"  Conversion: {initial_conditions['n_conversion_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_conversion_pixels']/total_pixels:.1f}% of raster)")
     
     # Load admin regions for burden sharing
     admin_data = load_admin_regions(workspace_dir, region=region)

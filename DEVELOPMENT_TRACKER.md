@@ -55,6 +55,12 @@ import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.mi
 mermaid.initialize({ startOnLoad: true });
 </script>
 
+### Internal Pipeline Detail
+
+For detailed diagrams of how data flows *inside* `resto_anom.py` — including annotated array shapes, the patch vs. pixel operator branch, `restoration_effect()` maths, and the NSGA-II generation cycle — see **[PIPELINE_DIAGRAM.md](PIPELINE_DIAGRAM.md)**.
+
+> **Maintainer note:** if you change `restoration_effect()`, the objective functions, operator classes (`AdaptiveSampling`, `AdaptiveRepair`, `PatchAwareSampling`, `PatchRepair`), or the run-settings passed to `run_optimization_instance()`, update `PIPELINE_DIAGRAM.md` to match.
+
 ## Scripts and Contributions
 
 ### Core Optimization Pipeline

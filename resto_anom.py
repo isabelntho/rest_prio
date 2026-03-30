@@ -434,7 +434,7 @@ class RestorationProblem(ElementwiseProblem):
         # Optimization uses normalized objectives in _evaluate; raw objectives are
         # still computed and can be exported for reporting/interpretation.
         self.normalize_objectives = bool(scenario_params.get('normalize_objectives', True))
-        self.objective_scales = self._build_objective_scales()
+        self.objective_scales = self._compute_normalization_denominators()
         
         n_restoration_pixels = initial_conditions['n_restoration_pixels']
         n_conversion_pixels = initial_conditions['n_conversion_pixels']
@@ -474,7 +474,7 @@ class RestorationProblem(ElementwiseProblem):
             kwargs['elementwise_runner'] = elementwise_runner
         super().__init__(**kwargs)
 
-    def _build_objective_scales(self):
+    def _compute_normalization_denominators(self):
         """Build per-objective positive scales for objective normalization."""
         eps = 1e-12
         scales = {}
