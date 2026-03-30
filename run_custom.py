@@ -6,6 +6,7 @@ Edit the configuration variables below and run directly:
 """
 from resto_anom import run_optimization_instance, main
 from data_loader import load_initial_conditions
+from logger_setup import setup_logger
 
 # Available ecosystem run modes:
 # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
@@ -17,7 +18,7 @@ ECOSYSTEM_TO_RUN = "fg"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = ""
+RUN_LABEL = "test_snapshot"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -29,6 +30,10 @@ SCENARIO_MODE = "custom"
 
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
+
+log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
+if log_path:
+    print(f"Verbose output → {log_path}")
 
 OBJECTIVES = ["abiotic", "biotic", "cost"]
 SAMPLE_FRACTION = None
@@ -121,6 +126,7 @@ for run_label, ecosystem_for_loader in runs:
                 sample_fraction=SAMPLE_FRACTION,
                 sample_seed=SAMPLE_SEED,
             )
+            print(f"✓ Data loaded for {run_label}")
 
             results = run_optimization_instance(
                 initial_conditions=initial_conditions,

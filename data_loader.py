@@ -13,12 +13,15 @@ Functions:
 - load_initial_conditions(): Load and prepare all initial data conditions
 """
 
+import logging
 import os
 import numpy as np
 import tempfile
 import rasterio as rio
 import geopandas as gpd
 from spatial_operations import compute_sn_dens
+
+logger = logging.getLogger("resto_prio")
 
 # =============================================================================
 # ECOSYSTEM DEFINITIONS AND CONSTANTS
@@ -106,10 +109,10 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
                         'bounds': src.bounds
                     }
                     original_path = path
-                print(f"✓ Loaded {lulc_type} LULC raster: {path}")
+                logger.info(f"Loaded {lulc_type} LULC raster: {path}")
                 break
             except Exception as e:
-                print(f"✗ Error loading LULC from {path}: {e}")
+                logger.error(f"Error loading LULC from {path}: {e}")
                 continue
     
     if lulc_data is None:
@@ -302,9 +305,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
         if region == 'CH':
             # Use cantons for burden sharing across Switzerland
             if not os.path.exists(kanton_file):
-                print(os.getcwd())
-                print(os.path.abspath(kanton_file))
-                print(f"Warning: Kanton shapefile not found at {kanton_file}")
+                logger.warning(f"Kanton shapefile not found at {kanton_file} (cwd={os.getcwd()}, abs={os.path.abspath(kanton_file)})")
                 return None
             gdf = gpd.read_file(kanton_file)
             region_col = 'NAME'
@@ -320,7 +321,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
         elif region == 'Bern':
             # Filter to Bern canton and use district-level admin regions
             if not os.path.exists(admin_file):
-                print(f"Warning: Admin shapefile not found at {admin_file}")
+                logger.warning(f"Admin shapefile not found at {admin_file}")
                 return None
             
             # Load kanton shapefile and filter to Bern
@@ -328,7 +329,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
             bern_gdf = kanton_gdf[kanton_gdf['NAME'] == 'Bern'].copy()
             
             if len(bern_gdf) == 0:
-                print(f"Warning: No canton named 'Bern' found in {kanton_file}")
+                logger.warning(f"No canton named 'Bern' found in {kanton_file}")
                 return None
             
             #print(f"✓ Filtered to Bern canton")
@@ -348,11 +349,11 @@ def load_admin_regions(workspace_dir, region='Bern'):
                 'n_regions': len(unique_regions)
             }
         else:
-            print(f"Warning: Unknown region '{region}'. Use 'Bern' or 'CH'")
+            logger.warning(f"Unknown region '{region}'. Use 'Bern' or 'CH'")
             return None
         
     except Exception as e:
-        print(f"Error loading admin shapefile: {e}")
+        logger.error(f"Error loading admin shapefile: {e}")
         return None
 
 # =============================================================================
@@ -379,20 +380,20 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     """
     # Define all possible objectives and their file mappings
     all_objectives = {
-        'abiotic': 'abiotic_condition_anomaly.tif',
-        'biotic': 'biotic_condition_anomaly.tif', 
-        #'abiotic': 'abiotic_idw.tif',
-        #'biotic': 'biotic_idw.tif', 
-        'landscape': 'sn_dens.tif',
-        'cost': 'implementation_cost.tif',
-        'population_proximity': 'population_proximity.tif'
+        'abiotic': 'inputs/abiotic_condition_anomaly.tif',
+        'biotic': 'inputs/biotic_condition_anomaly.tif', 
+        #'abiotic': 'inputs/abiotic_idw.tif',
+        #'biotic': 'inputs/biotic_idw.tif', 
+        'landscape': 'inputs/sn_dens.tif',
+        'cost': 'inputs/implementation_cost.tif',
+        'population_proximity': 'inputs/population_proximity.tif'
     }
     
     # Use all objectives if none specified
     if objectives is None:
         objectives = list(all_objectives.keys())
     
-    print(f"Loading initial conditions for objectives: {objectives}")
+    logger.info(f"Loading initial conditions for objectives: {objectives}")
     
     # Build file paths for selected objectives
     data_files = {}
@@ -415,8 +416,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             missing_files.append(f"  - {objective}: {file_path}")
     
     if missing_files:
-        print(f"\n✗ ERROR: Required data files not found:")
-        print(f"  {workspace_dir}")
+        logger.error(f"Required data files not found in {workspace_dir}: {missing_files}")
         raise FileNotFoundError(f"Missing {len(missing_files)} required data file(s).")
     
     # Get region-specific reference information
@@ -453,11 +453,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                                 abs(actual.bottom - expected[1]) < 1000 and
                                 abs(actual.right - expected[2]) < 1000 and
                                 abs(actual.top - expected[3]) < 1000):
-                            print(f"Warning: Raster bounds {actual} significantly differ from expected {expected} for region {region}")
-                    
-                    #print(f"✓ Using {region_ref['description']} as validation reference")
-                else:
-                    print(f"✓ Using first raster as validation reference for region {region}")
+                            logger.warning(f"Raster bounds {actual} significantly differ from expected {expected} for region {region}")
                 
                 initial_conditions['crs'] = ref['crs']
                 initial_conditions['transform'] = ref['transform']
@@ -489,7 +485,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                         )
                 else:
                     # For landscape_anomaly, just log the difference - will be handled later with resampling
-                    print(f"  Note: landscape_anomaly has different specs - will resample to match reference")
+                    logger.info("landscape_anomaly has different specs - will resample to match reference")
             # Track NaN locations BEFORE replacement
             nan_mask = np.isnan(data)
             nan_masks[objective] = nan_mask
@@ -497,16 +493,16 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             total_pixels = data.size
             
             if nan_count > 0:
-                print(f"✓ Loaded {objective}: {data.shape} ({nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}% NaN)")
+                logger.info(f"Loaded {objective}: {data.shape} ({nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}% NaN)")
                 # Replace NaN with 0 so np.sum() works correctly in objective calculations
                 data = np.nan_to_num(data, nan=0.0)
             else:
-                print(f"✓ Loaded {objective}: {data.shape}")
+                logger.info(f"Loaded {objective}: {data.shape}")
                 
             initial_conditions[objective] = data
     
     # Load LULC rasters - separate datasets for ecosystem masking and landscape calculations
-    print(f"\n--- Loading LULC data for ecosystem: {ecosystem} ---")
+    logger.info(f"Loading LULC data for ecosystem: {ecosystem}")
     try:
         # Load ecosystem LULC for masking
         ecosystem_lulc_data, ecosystem_lulc_meta, ecosystem_lulc_path = load_lulc_raster(
@@ -556,7 +552,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             
             if os.path.exists(landscape_file_path):
                 # Load pre-computed landscape density from file
-                print(f"Loading pre-computed landscape density from: {landscape_file_path}")
+                logger.info(f"Loading pre-computed landscape density from: {landscape_file_path}")
                 
                 with rio.open(landscape_file_path) as src:
                     landscape_data = src.read(1)
@@ -578,7 +574,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                         try:
                             from rasterio.warp import reproject, Resampling
                             
-                            print(f"🔄 Resampling landscape to match reference data...")
+                            logger.info("Resampling landscape to match reference data...")
                             
                             # Create output array with target specifications
                             resampled_data = np.empty(ref['shape'], dtype=landscape_data.dtype)
@@ -595,7 +591,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                             )
                             
                             landscape_data = resampled_data
-                            print(f"✓ Resampled landscape to {landscape_data.shape}")
+                            logger.info(f"Resampled landscape to {landscape_data.shape}")
                             
                         except Exception as resample_error:
                             raise ValueError(
@@ -611,11 +607,11 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 # Convert density to anomaly (higher density = lower anomaly)  
                 landscape_anomaly = 1.0 - landscape_density
                 
-                print(f"✓ Loaded landscape density and converted to anomaly: {landscape_anomaly.shape}")
+                logger.info(f"Loaded landscape density and converted to anomaly: {landscape_anomaly.shape}")
                 
             else:
                 # Fallback to calculation using compute_sn_dens
-                print(f"Landscape file not found ({landscape_file_path}), computing from LULC data...")
+                logger.info(f"Landscape file not found ({landscape_file_path}), computing from LULC data...")
                 
                 # Define focal classes for landscape density calculation
                 focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
@@ -635,7 +631,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 nan_mask_landscape = np.isnan(landscape_anomaly)
                 landscape_anomaly = np.nan_to_num(landscape_anomaly, nan=0.0)
                 
-                print(f"✓ Calculated landscape_anomaly: {landscape_anomaly.shape}")
+                logger.info(f"Calculated landscape_anomaly: {landscape_anomaly.shape}")
             
             # Store in initial conditions (common for both methods)
             initial_conditions['landscape_anomaly'] = landscape_anomaly
@@ -647,14 +643,14 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             
             nan_count = np.sum(nan_mask_landscape)
             total_pixels = landscape_anomaly.size
-            print(f"  ({nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}% NaN)")
+            logger.info(f"landscape_anomaly NaN: {nan_count}/{total_pixels} = {100*nan_count/total_pixels:.1f}%")
             if nan_count > 0:
-                print(f"  → Replaced NaN with 0 (pixels excluded via eligible_mask)")
+                logger.info("Replaced landscape NaN with 0 (pixels excluded via eligible_mask)")
         
     except Exception as e:
-        print(f"✗ Error loading LULC data: {e}")
+        logger.error(f"Error loading LULC data: {e}")
         if ecosystem != 'all':
-            print("Falling back to 'all' ecosystem (no masking)")
+            logger.warning("Falling back to 'all' ecosystem (no masking)")
             ecosystem = 'all'
             ecosystem_mask = np.ones(ref['shape'], dtype=bool)
         else:
@@ -702,7 +698,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         post_conversion_count = np.sum(conversion_eligible_mask)
         focal_excluded = pre_conversion_count - post_conversion_count
     else:
-        print(f"  Warning: No landscape LULC data found, using base mask for conversion")
+        logger.warning("No landscape LULC data found, using base mask for conversion")
     
     # For backward compatibility, use restoration eligible mask as the main eligible_mask
     eligible_mask = restoration_eligible_mask
@@ -763,14 +759,12 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 eligible_mask = restoration_sampled_mask  # For backward compatibility
                 eligible_indices = restoration_sampled_indices
                 
-                print(f"✓ Applied spatially continuous sampling to both restoration and conversion:")
-                print(f"  Rectangle: ({start_row}:{end_row}, {start_col}:{end_col})")
-                print(f"  Restoration sample: {len(restoration_sampled_indices)} pixels")
-                print(f"  Conversion sample: {len(conversion_sampled_indices)} pixels")
+                logger.info(f"Applied spatially continuous sampling: rectangle ({start_row}:{end_row}, {start_col}:{end_col}), "
+                            f"{len(restoration_sampled_indices)} restoration + {len(conversion_sampled_indices)} conversion pixels")
             else:
-                print(f"✗ Warning: No eligible pixels in sample region, using all eligible pixels")
+                logger.warning("No eligible pixels in sample region, using all eligible pixels")
         else:
-            print(f"✗ Warning: Sample size too small ({n_sample_target} pixels), using all eligible pixels")
+            logger.warning(f"Sample size too small ({n_sample_target} pixels), using all eligible pixels")
     
     # Store both eligible masks and their indices
     initial_conditions['eligible_mask'] = eligible_mask  # For backward compatibility (restoration mask)
@@ -803,6 +797,6 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     admin_data = load_admin_regions(workspace_dir, region=region)
     initial_conditions['admin_data'] = admin_data
     
-    print(f"✓ Data preparation complete: {initial_conditions['n_restoration_pixels']} restoration + {initial_conditions['n_conversion_pixels']} conversion eligible pixels")
+    logger.info(f"Data preparation complete: {initial_conditions['n_restoration_pixels']} restoration + {initial_conditions['n_conversion_pixels']} conversion eligible pixels")
     
     return initial_conditions

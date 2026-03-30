@@ -1,6 +1,9 @@
 """Debug and diagnostic utilities for restoration optimization."""
 
+import logging
 import numpy as np
+
+logger = logging.getLogger("resto_prio")
 
 
 def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10):
@@ -14,7 +17,7 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
     """
     from resto_anom import RestorationProblem
 
-    print("\n=== Quick problem diagnostics ===")
+    logger.info("=== Quick problem diagnostics ===")
 
     problem = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)
 
@@ -40,13 +43,12 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         else:
             infeasible_count += 1
 
-    print(f"\n   Summary: {feasible_count}/{n_samples} feasible, {infeasible_count}/{n_samples} infeasible")
+    logger.info(f"Summary: {feasible_count}/{n_samples} feasible, {infeasible_count}/{n_samples} infeasible")
 
     if feasible_count > 0:
-        print(f"   ✓ Feasible solutions exist, Objectives show improvement with restoration")
+        logger.info("Feasible solutions exist; objectives show improvement with restoration")
     else:
-        print(f"   ✗ WARNING: No feasible solutions found in {n_samples} samples!")
-        print(f"   → Check if max_action_pixels constraint is too restrictive")
+        logger.warning(f"No feasible solutions found in {n_samples} samples! Check if max_action_pixels constraint is too restrictive")
 
     issues = []
     if out_none['F'][0] == 0:
@@ -55,15 +57,14 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         issues.append("   ✗ NaN detected in objectives - data contains unmasked NaN values")
 
     if not issues:
-        print("   ✓ No obvious setup issues detected")
+        logger.info("No obvious setup issues detected")
     else:
         for issue in issues:
-            print(issue)
+            logger.warning(issue)
 
-    print(f"\n OBJECTIVE SENSITIVITY TO RESTORATION AMOUNT:")
-    print(f"   Baseline objectives (no restoration):")
-    for j, obj_name in enumerate(problem.objective_names):
-        print(f"      {obj_name}: {out_none['F'][j]:.6f}")
+    logger.info("OBJECTIVE SENSITIVITY TO RESTORATION AMOUNT:")
+    baseline_parts = ", ".join(f"{obj_name}={out_none['F'][j]:.6f}" for j, obj_name in enumerate(problem.objective_names))
+    logger.info(f"  Baseline objectives (no restoration): {baseline_parts}")
 
     test_fractions = [0.05, 0.10, 0.15, 0.20]
 
@@ -89,12 +90,11 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
                     n_improved += 1
 
             avg_improvement = (total_improvement / n_improved) if n_improved > 0 else 0.0
-            print(f"   {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {avg_improvement*100:>6.2f}%")
+            logger.info(f"  {frac*100:>5.1f}% restored ({n_restore:>6} pixels): Avg improvement = {avg_improvement*100:>6.2f}%")
 
             if frac == test_fractions[0]:
-                print(f"      Per-objective details:")
-                for j, obj_name in enumerate(problem.objective_names):
-                    baseline_val = out_none['F'][j]
-                    restored_val = out['F'][j]
-                    change = restored_val - baseline_val
-                    print(f"         {obj_name}: {baseline_val:.6f} → {restored_val:.6f} (Δ={change:.6f})")
+                per_obj = ", ".join(
+                    f"{obj_name}: {out_none['F'][j]:.6f} -> {out['F'][j]:.6f} (D={out['F'][j]-out_none['F'][j]:.6f})"
+                    for j, obj_name in enumerate(problem.objective_names)
+                )
+                logger.info(f"    Per-objective: {per_obj}")

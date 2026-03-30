@@ -1369,7 +1369,10 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             print("  WARNING: max_action_pixels is 0! No actions possible.")
         if not skip_diagnostics:
             from debug_utils import diagnose_optimization_setup
+            from logger_setup import setup_logger
+            setup_logger()  # no-op if already configured by the entry-point script
             diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10)
+            print("✓ Optimisation setup verified.")
 
     # --- 5. Build operators ---
     sampling, repair = _build_operators(

@@ -941,7 +941,7 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     # Save complete results (pickle format)
     results_filename = os.path.join(
         output_dir,
-        f"results_files/res_{ecosystem_suffix}_{run_timestamp}{label_suffix}.pkl"
+        f"results_files/res{ecosystem_suffix}_{run_timestamp}{label_suffix}.pkl"
     )
     print(f"  Saving to: {results_filename}")
     with open(results_filename, 'wb') as f:
