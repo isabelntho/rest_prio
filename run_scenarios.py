@@ -51,6 +51,8 @@ def run_one(initial_conditions, scenario_params, run_settings):
         patch_constraint_type=run_settings.get("patch_constraint_type", "pixel_count"),
         pixel_tolerance=run_settings.get("pixel_tolerance", 0.05),
         output_dir=run_settings.get("output_dir", "."),
+        run_label=run_settings.get("run_label", ""),
+        run_config=run_settings.get("run_config", None),
     )
 
 

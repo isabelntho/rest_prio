@@ -14,6 +14,11 @@ from data_loader import load_initial_conditions
 # - 'combined': run one optimisation without ecosystem filtering
 ECOSYSTEM_TO_RUN = "fg"
 
+# Short human-readable label describing what this run is testing.
+# Used in output filenames and the run_registry.jsonl log.
+# Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
+RUN_LABEL = ""
+
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
 
@@ -48,6 +53,31 @@ USE_PATCH_APPROACH = True
 PATCH_SIZE = 2
 PATCH_CONSTRAINT_TYPE = 'pixel_count'
 PIXEL_TOLERANCE = 0.05
+
+# Set to True to save per-generation population snapshots for animation
+# Output: intermediate_results/X_history_{timestamp}.npz  shape=(n_gens, pop_size, n_var) int8
+SAVE_SNAPSHOTS = True
+
+# Snapshot of the full configuration block — written to run_registry.jsonl alongside results.
+run_config = {
+    "ecosystem": ECOSYSTEM_TO_RUN,
+    "region": REGION,
+    "scenario_mode": SCENARIO_MODE,
+    "objectives": OBJECTIVES,
+    "sample_fraction": SAMPLE_FRACTION,
+    "sample_seed": SAMPLE_SEED,
+    "pop_size": POP_SIZE,
+    "n_generations": N_GENERATIONS,
+    "n_jobs": N_JOBS,
+    "random_seed": RANDOM_SEED,
+    "n_samples_per_param": N_SAMPLES_PER_PARAM,
+    "use_patch_approach": USE_PATCH_APPROACH,
+    "patch_size": PATCH_SIZE,
+    "patch_constraint_type": PATCH_CONSTRAINT_TYPE,
+    "pixel_tolerance": PIXEL_TOLERANCE,
+    "save_snapshots": SAVE_SNAPSHOTS,
+    "custom_scenario_params": custom_scenario_params,
+}
 
 if ECOSYSTEM_TO_RUN == "all":
     runs = [
@@ -106,6 +136,9 @@ for run_label, ecosystem_for_loader in runs:
                 patch_size=PATCH_SIZE,
                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                 pixel_tolerance=PIXEL_TOLERANCE,
+                save_snapshots=SAVE_SNAPSHOTS,
+                run_label=RUN_LABEL,
+                run_config=run_config,
             )
 
         if results is not None:

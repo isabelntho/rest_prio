@@ -830,6 +830,14 @@ class HVCallback:
         self.f_std_history = []   # Std of F per generation
         self.f_min_history = []   # Min of F per generation  
         self.f_max_history = []   # Max of F per generation
+
+        # X snapshot buffering (populated only when snapshot_dir is set)
+        self.snapshot_dir = None       # set by ProgressCallback when save_snapshots=True
+        self.X_batch = []              # in-memory buffer of int8 arrays
+        self.batch_files = []          # paths of flushed batch .npz files
+        self.batch_size = 10           # flush every N generations
+        self._n_generations_est = 100  # updated by ProgressCallback for memory estimate
+        self._x_memory_warned = False  # print estimate only once
     
     def __call__(self, algorithm):
         """
@@ -852,7 +860,23 @@ class HVCallback:
                 self.f_std_history.append(f_std.tolist())
                 self.f_min_history.append(f_min.tolist())
                 self.f_max_history.append(f_max.tolist())
-                
+
+                # Capture full population X snapshot
+                if self.snapshot_dir is not None:
+                    X_pop = algorithm.pop.get("X")
+                    if X_pop is not None:
+                        if not self._x_memory_warned and algorithm.n_gen == 1:
+                            batch_mb = self.batch_size * X_pop.shape[0] * X_pop.shape[1] / 1e6
+                            total_mb = self._n_generations_est * X_pop.shape[0] * X_pop.shape[1] / 1e6
+                            print(f"   X snapshots: {X_pop.shape[1]} vars × {X_pop.shape[0]} pop, "
+                                  f"batch RAM ~{batch_mb:.0f} MB, est. total on disk ~{total_mb:.0f} MB")
+                            if total_mb > 1000:
+                                print(f"   Warning: estimated X_history size exceeds 1 GB — consider reduce n_generations")
+                            self._x_memory_warned = True
+                        self.X_batch.append(X_pop.astype(np.int8))
+                        if len(self.X_batch) >= self.batch_size:
+                            self._flush_batch()
+
                 # Calculate hypervolume
                 try:
                     # Create reference point (worst case for each objective)
@@ -889,6 +913,17 @@ class HVCallback:
                         print(f"   Warning: Hypervolume calculation failed: {e}")
                     self.hv_history.append(0.0)
 
+    def _flush_batch(self):
+        """Stack the in-memory X buffer and write it to a temporary .npz file."""
+        if not self.X_batch:
+            return
+        batch_arr = np.stack(self.X_batch, axis=0)  # (batch_size, pop_size, n_var) int8
+        batch_idx = len(self.batch_files)
+        batch_path = os.path.join(self.snapshot_dir, f"X_batch_{batch_idx:04d}.npz")
+        np.savez(batch_path, X=batch_arr)
+        self.batch_files.append(batch_path)
+        self.X_batch.clear()
+
 
 class ProgressCallback:
     """
@@ -901,7 +936,8 @@ class ProgressCallback:
     """
 
     def __init__(self, verbose=True, n_generations=100,
-                 hv_patience=15, hv_min_improvement=1e-6, ref_point=None):
+                 hv_patience=15, hv_min_improvement=1e-6, ref_point=None,
+                 save_snapshots=False, snapshot_dir=None):
         """
         Args:
             verbose: Print progress every 10 generations.
@@ -909,6 +945,8 @@ class ProgressCallback:
             hv_patience: Patience parameter forwarded to HVCallback.
             hv_min_improvement: Min improvement threshold forwarded to HVCallback.
             ref_point: Fixed hypervolume reference point forwarded to HVCallback.
+            save_snapshots: If True, capture full population X at every generation.
+            snapshot_dir: Directory to write temporary batch .npz files.
         """
         self.verbose = verbose
         self.n_generations = n_generations
@@ -919,6 +957,10 @@ class ProgressCallback:
             verbose=verbose,
             ref_point=ref_point,
         )
+        if save_snapshots and snapshot_dir is not None:
+            os.makedirs(snapshot_dir, exist_ok=True)
+            self.hv_callback.snapshot_dir = snapshot_dir
+            self.hv_callback._n_generations_est = n_generations
 
     def __call__(self, algorithm):
         if self.start_time is None:
@@ -1064,7 +1106,8 @@ def _build_algorithm(problem, sampling, repair, pop_size, n_generations):
 
 def _package_results(result, problem, initial_conditions, scenario_params, callback,
                      use_patch_approach, pop_size, n_generations, hv_patience,
-                     hv_min_improvement, save_results, output_dir, verbose):
+                     hv_min_improvement, save_results, output_dir, verbose,
+                     save_snapshots=False, run_label="", run_config=None):
     """
     Assemble the optimization results dict and optionally save to disk.
 
@@ -1157,13 +1200,41 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
         'initial_conditions': initial_conditions_filtered,
         'hv_callback': callback.hv_callback,
         'full_population': full_population_data,
+        'run_label': run_label,
+        'run_config': run_config,
     }
 
     if use_patch_approach and 'patch_mappings' in initial_conditions:
         optimization_results['patch_mappings'] = initial_conditions['patch_mappings']
 
+    # Assemble X_history .npz from batched snapshots
+    if save_snapshots:
+        hv_cb = callback.hv_callback
+        hv_cb._flush_batch()  # flush any remaining buffer
+        if hv_cb.batch_files:
+            try:
+                arrays = [np.load(p)['X'] for p in hv_cb.batch_files]
+                X_history = np.concatenate(arrays, axis=0)  # (n_gens, pop_size, n_var)
+                os.makedirs(os.path.join(output_dir, 'intermediate_results'), exist_ok=True)
+                timestamp = datetime.now().strftime('%d%m_%H%M')
+                x_history_path = os.path.join(
+                    output_dir, 'intermediate_results', f'X_history_{timestamp}.npz'
+                )
+                np.savez_compressed(x_history_path, X=X_history)
+                for p in hv_cb.batch_files:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                optimization_results['X_history_path'] = x_history_path
+                if verbose:
+                    print(f"\u2713 X_history saved: {X_history.shape} → {x_history_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Could not assemble X_history: {e}")
+
     if save_results:
-        save_results_with_reports(optimization_results, output_dir=output_dir, verbose=verbose)
+        save_results_with_reports(optimization_results, output_dir=output_dir, verbose=verbose, run_label=run_label)
 
     return optimization_results
 
@@ -1219,7 +1290,8 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      hv_min_improvement=1e-6, n_jobs=None, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
-                                     output_dir="."):
+                                     output_dir=".", save_snapshots=False,
+                                     run_label="", run_config=None):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
@@ -1343,12 +1415,17 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         print(f"Starting optimisation at {datetime.now():%H:%M}...")
 
     try:
+        snap_dir = None
+        if save_snapshots:
+            snap_dir = os.path.join(output_dir, 'intermediate_results', '_x_snapshot_batches')
         callback = ProgressCallback(
             verbose=verbose,
             n_generations=n_generations,
             hv_patience=hv_patience,
             hv_min_improvement=hv_min_improvement,
             ref_point=fixed_ref,
+            save_snapshots=save_snapshots,
+            snapshot_dir=snap_dir,
         )
         result = minimize(
             problem, algorithm, termination,
@@ -1360,6 +1437,8 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                 result, problem, initial_conditions, scenario_params, callback,
                 use_patch_approach, pop_size, n_generations, hv_patience,
                 hv_min_improvement, save_results, output_dir, verbose,
+                save_snapshots=save_snapshots,
+                run_label=run_label, run_config=run_config,
             )
         else:
             if verbose:

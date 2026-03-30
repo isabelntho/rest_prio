@@ -262,3 +262,37 @@ Codebase simplification — reduced clutter and consolidated duplicated logic.
 
 #### Potential future simplification (not implemented)
 - `conversion_mask()` in `resto_anom.py` is called from exactly one place (`restoration_effect`) with the `conversion_mask_2d` array already constructed at that call site. It could be inlined to eliminate the indirection, but was left as a separate function to preserve readability.
+
+### 2026-03-30
+
+Added per-generation population snapshot capture to support visualisation of how spatial decisions evolve across the NSGA-II run.
+
+#### Design decisions
+- Captures the full population decision matrix `X` (shape `(pop_size, n_var)`, stored as `int8`) at every generation.
+- Streams snapshots to temporary batch `.npz` files every 10 generations to bound peak RAM usage (≤ `10 × pop_size × n_var × 1 byte` in memory at any time, ~172 MB for the current landscape at `n_var ≈ 362,600`).
+- At the end of optimisation, all batch files are concatenated into a single compressed `intermediate_results/X_history_{timestamp}.npz` (shape `(n_gens, pop_size, n_var) int8`) and the temporary batch files deleted.
+- Feature is opt-in: `save_snapshots=False` by default so existing callers are unaffected.
+- Estimated total on-disk size for 100 generations: ~115 MB uncompressed → ~10–15 MB compressed.
+
+#### Changes — resto_anom.py (only file modified)
+- `HVCallback.__init__`: added `snapshot_dir`, `X_batch`, `batch_files`, `batch_size`, `_n_generations_est`, `_x_memory_warned` fields.
+- `HVCallback.__call__`: after F-stats block, appends `X.astype(np.int8)` to buffer each generation; calls `_flush_batch()` when buffer reaches `batch_size`; prints one-time RAM/disk estimate at generation 1.
+- `HVCallback._flush_batch`: new method — stacks buffer, saves `X_batch_NNNN.npz` under `snapshot_dir`, clears buffer.
+- `ProgressCallback.__init__`: added `save_snapshots=False` and `snapshot_dir=None` parameters; when `save_snapshots=True`, creates the batch directory and activates snapshotting on `hv_callback`.
+- `_package_results`: added `save_snapshots=False` parameter; when True, flushes remaining buffer, concatenates batch files, saves `intermediate_results/X_history_{timestamp}.npz`, removes batch files, and adds `'X_history_path'` to the results dict.
+- `run_optimization_instance`: added `save_snapshots=False` parameter; creates the temporary batch directory path and wires `save_snapshots` through to `ProgressCallback` and `_package_results`.
+
+#### Usage
+```python
+results = run_optimization_instance(
+    initial_conditions=initial_conditions,
+    scenario_params=scenario_params,
+    save_snapshots=True,
+    output_dir="./results_files",
+)
+# Load afterwards
+import numpy as np
+X = np.load(results['X_history_path'])['X']  # (n_gens, pop_size, n_var) int8
+# Selection frequency map at generation g:
+freq = X[g].sum(axis=0)  # how many solutions selected each variable
+```

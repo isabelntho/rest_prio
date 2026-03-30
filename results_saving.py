@@ -10,6 +10,7 @@ Created: January 2026
 import os
 import json
 import pickle
+import subprocess
 import numpy as np
 from datetime import datetime
 try:
@@ -17,7 +18,31 @@ try:
 except ImportError:
     pass
 
-def create_optimization_report(results, output_dir=".", verbose=True):
+
+def _get_git_hash():
+    """Return short git commit hash for the current repo, 'no_git' if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip() if result.returncode == 0 else "no_git"
+    except Exception:
+        return "no_git"
+
+
+def _append_to_registry(entry, output_dir="."):
+    """Append a single-line JSON entry to run_registry.jsonl in output_dir.
+    Write failures are silently ignored so they never break a run.
+    """
+    registry_path = os.path.join(output_dir, "run_registry.jsonl")
+    try:
+        with open(registry_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+def create_optimization_report(results, output_dir=".", verbose=True, run_label="", run_timestamp=None):
     """
     Create a comprehensive optimization report including problem definition,
     algorithm details, and evolution tracking for sharing with colleagues.
@@ -26,6 +51,9 @@ def create_optimization_report(results, output_dir=".", verbose=True):
         results: Results dictionary from optimization
         output_dir: Directory to save report
         verbose: Print save status
+        run_label: Human-readable label for this run
+        run_timestamp: Timestamp string shared across all files of this run (YYYYMMDD_HHMM).
+                       Generated fresh if not provided.
         
     Returns:
         str: Path to the generated report file
@@ -35,20 +63,16 @@ def create_optimization_report(results, output_dir=".", verbose=True):
 
     os.makedirs(os.path.join(output_dir, "optimisation_reports"), exist_ok=True)
     
-    timestamp = datetime.now().strftime('%d%m')
+    timestamp = run_timestamp or datetime.now().strftime('%Y%m%d_%H%M')
+    run_label_slug = run_label.replace(" ", "_") if run_label else ""
+    label_suffix = f"_{run_label_slug}" if run_label_slug else ""
     ecosystem = results.get('scenario_params', {}).get(
         'ecosystem_label',
         results.get('initial_conditions', {}).get('ecosystem', 'all')
     )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
-    # Find next available file number
-    x = 1
-    while True:
-        report_filename = os.path.join(output_dir, f"optimisation_reports/optimization_report{ecosystem_suffix}_{timestamp}_{x}.json")
-        if not os.path.exists(report_filename):
-            break
-        x += 1
+    report_filename = os.path.join(output_dir, f"optimisation_reports/opt_{ecosystem_suffix}_{timestamp}{label_suffix}.json")
     
     # Extract key information from results
     initial_conditions = results.get('initial_conditions', {})
@@ -66,12 +90,13 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             "created_timestamp": datetime.now().isoformat(),
             "report_type": "optimization_setup_and_results",
             "ecosystem": ecosystem,
+            "run_label": run_label,
+            "git_hash": _get_git_hash(),
             "optimization_timestamp": algorithm_info.get('timestamp', 'unknown')
         },
         
-        # =============================================================================
-        # PROBLEM DEFINITION
-        # =============================================================================
+        # ===== PROBLEM DEFINITION =====
+        
         "problem_definition": {
             "problem_type": "multi_objective_restoration_optimization",
             "optimization_framework": "pymoo_nsga2",
@@ -109,9 +134,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             }
         },
         
-        # =============================================================================
-        # ALGORITHM CONFIGURATION
-        # =============================================================================
+        # ===== ALGORITHM CONFIGURATION =====
         "algorithm_configuration": {
             "algorithm_name": "NSGA-II",
             "population_size": algorithm_info.get('pop_size', 50),
@@ -141,9 +164,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             })
         },
         
-        # =============================================================================
-        # SCENARIO PARAMETERS
-        # =============================================================================
+        # ===== SCENARIO PARAMETERS =====
         "scenario_parameters": {
             "restoration_effects": {
                 "abiotic_effect": scenario_params.get('abiotic_effect', 0.01),
@@ -161,14 +182,10 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             }
         },
         
-        # =============================================================================
-        # OPTIMIZATION EVOLUTION
-        # =============================================================================
+        # ===== OPTIMIZATION EVOLUTION =====
         "optimization_evolution": {},
         
-        # =============================================================================
-        # FINAL RESULTS SUMMARY  
-        # =============================================================================
+        # ===== FINAL RESULTS SUMMARY =====
         "results_summary": {
             "pareto_solutions": {
                 "count": len(objectives) if len(objectives.shape) > 1 else 0,
@@ -179,9 +196,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             "convergence_metrics": {},
             #"decision_patterns": results.get('decision_analysis', {})
         },
-        # =============================================================================
-        # POPULATION DIAGNOSTICS
-        # =============================================================================
+        # ===== POPULATION DIAGNOSTICS =====
         "population_diagnostics": {}
     }
     
@@ -338,9 +353,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
                 "range_span": range_span
             }
     
-        # =============================================================================
-    # ADD FULL POPULATION DIAGNOSTICS
-    # =============================================================================
+    # ===== FULL POPULATION DIAGNOSTICS =====
     # Add full population diagnostics if available
     full_population = results.get('full_population', None)
     if full_population is not None and 'objectives' in full_population:
@@ -451,9 +464,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
             sensitivity_analysis["conversion_sensitivity"] = conversion_sensitivities
         
         report["population_diagnostics"]["lulc_transition_sensitivity"] = sensitivity_analysis
-    # =============================================================================
-    # END OF DIAGNOSTIC ADDITIONS
-    # =============================================================================
+    # ===== END OF DIAGNOSTIC ADDITIONS =====
 
     # Save report
     with open(report_filename, 'w') as f:
@@ -474,7 +485,7 @@ def create_optimization_report(results, output_dir=".", verbose=True):
     
     return report_filename
 
-def create_evolution_tracking_report(results, output_dir=".", verbose=True):
+def create_evolution_tracking_report(results, output_dir=".", verbose=True, run_label="", run_timestamp=None):
     """
     Create a detailed report tracking optimization evolution over generations.
     Useful for understanding convergence patterns and algorithm behavior.
@@ -483,6 +494,9 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
         results: Results dictionary from optimization
         output_dir: Directory to save report
         verbose: Print save status
+        run_label: Human-readable label for this run
+        run_timestamp: Timestamp string shared across all files of this run (YYYYMMDD_HHMM).
+                       Generated fresh if not provided.
         
     Returns:
         str: Path to the generated evolution report file
@@ -492,7 +506,9 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
 
     os.makedirs(os.path.join(output_dir, "evolution_reports"), exist_ok=True)
     
-    timestamp = datetime.now().strftime('%d%m')
+    timestamp = run_timestamp or datetime.now().strftime('%Y%m%d_%H%M')
+    run_label_slug = run_label.replace(" ", "_") if run_label else ""
+    label_suffix = f"_{run_label_slug}" if run_label_slug else ""
     
     # Get ecosystem information for filename
     ecosystem = results.get('scenario_params', {}).get(
@@ -501,16 +517,10 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
     )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
-    # Find next available file number
-    x = 1
-    while True:
-        evolution_filename = os.path.join(
-            output_dir,
-            f"evolution_reports/evolution_report{ecosystem_suffix}_{timestamp}_{x}.json"
-        )
-        if not os.path.exists(evolution_filename):
-            break
-        x += 1
+    evolution_filename = os.path.join(
+        output_dir,
+        f"evolution_reports/evo_{ecosystem_suffix}_{timestamp}{label_suffix}.json"
+    )
     
     # Extract evolution data
     hv_callback = results.get('hv_callback', None)
@@ -700,7 +710,8 @@ def create_evolution_tracking_report(results, output_dir=".", verbose=True):
 def save_results_with_reports(problem_or_results, res=None, initial_conditions=None, scenario_params=None,
                                         pop_size=None, n_generations=None, total_time=None, hv_value=None,
                                         ecosystem='unknown', region='unknown', experiment_id=None, random_seed=None,
-                                        output_dir=".", verbose=True, include_reports=True, include_debug=False):
+                                        output_dir=".", verbose=True, include_reports=True, include_debug=False,
+                                        run_label=""):
     """
      Save optimization results with comprehensive reporting.
 
@@ -740,6 +751,7 @@ def save_results_with_reports(problem_or_results, res=None, initial_conditions=N
             verbose=verbose,
             include_reports=include_reports,
             include_debug=include_debug,
+            run_label=run_label,
         )
 
     problem = problem_or_results
@@ -834,7 +846,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
     """
     from resto_anom import define_scenario_parameters, sample_scenario_parameters
     
-    timestamp = datetime.now().strftime('%d%m')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     
     # Get parameter ranges and sampled values
     param_ranges = define_scenario_parameters()
@@ -880,13 +892,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
             'parameters': combo
         })
     
-    # Save to JSON with incremental numbering
-    x = 1
-    while True:
-        summary_filename = os.path.join(output_dir, f"parameter_summary_{timestamp}_{x}.json")
-        if not os.path.exists(summary_filename):
-            break
-        x += 1
+    summary_filename = os.path.join(output_dir, f"parameter_summary_{timestamp}.json")
     
     with open(summary_filename, 'w') as f:
         json.dump(param_summary, f, indent=2)
@@ -899,7 +905,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
     
     return summary_filename
 
-def save_scenario_results(results, output_dir=".", verbose=True, include_reports=True, include_debug=False):
+def save_scenario_results(results, output_dir=".", verbose=True, include_reports=True, include_debug=False, run_label=""):
     """
     Save single scenario optimization results to files with optional comprehensive reporting.
     
@@ -919,7 +925,9 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     os.makedirs(os.path.join(output_dir, "results_files"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "summary_files"), exist_ok=True)
     
-    timestamp = datetime.now().strftime('%d%m')
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    run_label_slug = run_label.replace(" ", "_") if run_label else ""
+    label_suffix = f"_{run_label_slug}" if run_label_slug else ""
     
     # Get ecosystem information for filename
     ecosystem = results.get('scenario_params', {}).get(
@@ -931,22 +939,17 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     generated_files = {}
     
     # Save complete results (pickle format)
-    x = 1
-    while True:
-        results_filename = os.path.join(
-            output_dir,
-            f"results_files/results{ecosystem_suffix}_{timestamp}_{x}.pkl"
-        )
-        if not os.path.exists(results_filename):
-            break
-        x += 1
+    results_filename = os.path.join(
+        output_dir,
+        f"results_files/res_{ecosystem_suffix}_{run_timestamp}{label_suffix}.pkl"
+    )
     print(f"  Saving to: {results_filename}")
     with open(results_filename, 'wb') as f:
         pickle.dump(results, f)
     generated_files['pickle_file'] = results_filename
     
-    # Save summary (JSON format) with same numbering as pickle file
-    summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{timestamp}_{x}.json")
+    # Save summary (JSON format)
+    summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{run_timestamp}{label_suffix}.json")
     
     objectives = results['objectives']
     
@@ -955,6 +958,7 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     objective_names = results['objective_names']
     
     summary = {
+        'run_label': run_label,
         'ecosystem': ecosystem,
         'scenario_params': results['scenario_params'],
         'optimization_info': {
@@ -981,14 +985,20 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     # Generate comprehensive optimization report if requested
     if include_reports:
         try:
-            report_filename = create_optimization_report(results, output_dir, verbose=False)
+            report_filename = create_optimization_report(
+                results, output_dir, verbose=False,
+                run_label=run_label, run_timestamp=run_timestamp,
+            )
             generated_files['optimization_report'] = report_filename
         except Exception as e:
             if verbose:
                 print(f"  Warning: Could not generate optimization report: {e}")
 
         try:
-            evolution_filename = create_evolution_tracking_report(results, output_dir, verbose=False)
+            evolution_filename = create_evolution_tracking_report(
+                results, output_dir, verbose=False,
+                run_label=run_label, run_timestamp=run_timestamp,
+            )
             generated_files['evolution_report'] = evolution_filename
         except Exception as e:
             if verbose:
@@ -1016,10 +1026,31 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
             print(f"✓ Evolution report saved to: {os.path.basename(generated_files['evolution_report'])}")
         if include_debug and 'debug_report' in generated_files:
             print(f"✓ Debug report saved to: {os.path.basename(generated_files['debug_report'])}")
-    
+
+    # Append a compact entry to the project-level run registry
+    algorithm_info = results.get('algorithm_info', {})
+    registry_entry = {
+        "run_id": f"{run_timestamp}{label_suffix}_{ecosystem}",
+        "run_label": run_label,
+        "timestamp": run_timestamp,
+        "git_hash": _get_git_hash(),
+        "ecosystem": ecosystem,
+        "objectives": results.get('objective_names', []),
+        "algorithm": {
+            "pop_size": algorithm_info.get('pop_size'),
+            "n_generations": algorithm_info.get('n_generations'),
+            "actual_generations": algorithm_info.get('actual_generations'),
+            "random_seed": algorithm_info.get('random_seed'),
+            "use_patch_approach": results.get('problem_info', {}).get('is_patch_based'),
+        },
+        "scenario_params": results.get('scenario_params', {}),
+        "files": generated_files,
+    }
+    _append_to_registry(registry_entry, output_dir=output_dir)
+
     return generated_files
 
-def save_combined_results(combined_results, output_dir=".", verbose=True):
+def save_combined_results(combined_results, output_dir=".", verbose=True, run_label=""):
     """
     Save combined multi-scenario results.
     
@@ -1034,7 +1065,9 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     os.makedirs(os.path.join(output_dir, "results_files"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "summary_files"), exist_ok=True)
     
-    timestamp = datetime.now().strftime('%d%m')
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    run_label_slug = run_label.replace(" ", "_") if run_label else ""
+    label_suffix = f"_{run_label_slug}" if run_label_slug else ""
     
     # Get ecosystem information from first scenario (should be same for all)
     first_scenario_results = next(iter(combined_results['scenarios'].values()))
@@ -1044,14 +1077,8 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     )
     ecosystem_suffix = f"_{ecosystem}" if ecosystem != 'all' else ""
     
-    # Find next available file number
-    x = 1
-    while True:
-        results_filename = os.path.join(output_dir, f"results_files/results{ecosystem_suffix}_{timestamp}_{x}.pkl")
-        summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{timestamp}_{x}.json")
-        if not os.path.exists(results_filename):
-            break
-        x += 1
+    results_filename = os.path.join(output_dir, f"results_files/results{ecosystem_suffix}_{run_timestamp}{label_suffix}.pkl")
+    summary_filename = os.path.join(output_dir, f"summary_files/summary{ecosystem_suffix}_{run_timestamp}{label_suffix}.json")
     print(f"  Saving combined results to: {results_filename}")
     with open(results_filename, 'wb') as f:
         pickle.dump(combined_results, f)
@@ -1104,3 +1131,25 @@ def save_combined_results(combined_results, output_dir=".", verbose=True):
     if verbose:
         print(f"✓ Combined results saved to: {results_filename}")
         print(f"✓ Combined summary saved to: {summary_filename}")
+
+    # Append a compact entry to the project-level run registry
+    algorithm_info = combined_results.get('algorithm_info', {})
+    registry_entry = {
+        "run_id": f"{run_timestamp}{label_suffix}_{ecosystem}_combined",
+        "run_label": run_label,
+        "timestamp": run_timestamp,
+        "git_hash": _get_git_hash(),
+        "ecosystem": ecosystem,
+        "n_scenarios_run": combined_results.get('n_scenarios_run'),
+        "algorithm": {
+            "pop_size": algorithm_info.get('pop_size'),
+            "n_generations": algorithm_info.get('n_generations'),
+            "n_samples_per_param": combined_results.get('n_samples_per_param'),
+            "random_seed": combined_results.get('random_seed'),
+        },
+        "files": {
+            "pickle_file": results_filename,
+            "summary_file": summary_filename,
+        },
+    }
+    _append_to_registry(registry_entry, output_dir=output_dir)
