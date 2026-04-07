@@ -532,28 +532,41 @@ class PatchRepair(Repair):
                 pid: len(pixels)
                 for pid, pixels in patch_mappings['conversion_patches']['patch_to_pixels'].items()
             }
+        self.repair_log = []  # Per-generation bit-diff diagnostics
+        self._total_calls = 0
     
     def _do(self, problem, X, **kwargs):
         import numpy as np
-        
+
         if not hasattr(problem, 'n_restoration_patches'):
             # Fallback for non-patch problems
             return X
-        
+
+        X_in = X.copy()  # snapshot before repair for bit-diff
         n_restoration_patches = problem.n_restoration_patches
-        
+
         # X is 2D array: (population_size, n_var)
         for i in range(len(X)):
             if self.constraint_type == 'patch_count':
                 X[i] = enforce_patch_count(X[i], self.target_value)
-            
+
             elif self.constraint_type == 'pixel_count':
                 X[i] = self._enforce_pixel_count(
-                    X[i], 
+                    X[i],
                     n_restoration_patches,
                     self.target_value
                 )
-        
+
+        # Record bit-diff diagnostics
+        diffs = np.sum(X_in != X, axis=1)  # (pop_size,)
+        self._total_calls += 1
+        self.repair_log.append({
+            'generation': self._total_calls,
+            'mean_bits_changed': float(np.mean(diffs)),
+            'std_bits_changed': float(np.std(diffs)),
+            'max_bits_changed': int(np.max(diffs)),
+        })
+
         return X
     
     def _enforce_pixel_count(self, patch_decisions, n_restoration_patches, target_pixels):

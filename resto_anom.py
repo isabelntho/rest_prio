@@ -23,10 +23,9 @@ from pymoo.optimize import minimize
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.termination import get_termination
 from pymoo.operators.crossover.hux import HUX
-from pymoo.operators.mutation.bitflip import BitflipMutation
 from pymoo.indicators.hv import HV
 
-from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array
+from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation
 from data_loader import load_initial_conditions
 from results_saving import save_results_with_reports
 from patch_approach import (
@@ -908,10 +907,20 @@ class HVCallback:
                             print(f"   Early stopping: No HV improvement for {self.patience} generations")
                     
                 except Exception as e:
-                    # If hypervolume calculation fails, just continue
-                    if self.verbose and algorithm.n_gen == 1:
-                        print(f"   Warning: Hypervolume calculation failed: {e}")
-                    self.hv_history.append(0.0)
+                    # Always append so hv_history stays length-aligned with mutation_log
+                    self.hv_history.append(float('nan'))
+                    if self.verbose:
+                        print(f"   Warning: HV calculation failed at gen {algorithm.n_gen}: {e}")
+            else:
+                # F is None or empty — keep hv_history length-aligned
+                if self.verbose:
+                    print(f"   Warning: HVCallback skipped at gen {algorithm.n_gen}: pop F unavailable")
+                self.hv_history.append(float('nan'))
+        else:
+            # pop unavailable — keep hv_history length-aligned
+            if self.verbose:
+                print(f"   Warning: HVCallback skipped at gen {getattr(algorithm, 'n_gen', '?')}: pop unavailable")
+            self.hv_history.append(float('nan'))
 
     def _flush_batch(self):
         """Stack the in-memory X buffer and write it to a temporary .npz file."""
@@ -972,6 +981,11 @@ class ProgressCallback:
         # Expose current generation to the problem for constraint logging.
         if hasattr(algorithm, 'problem'):
             algorithm.problem.current_gen = algorithm.n_gen
+
+        # Sync generation counter to mutation operator for its log.
+        if hasattr(algorithm, 'mating') and hasattr(algorithm.mating, 'mutation'):
+            if hasattr(algorithm.mating.mutation, '_current_gen'):
+                algorithm.mating.mutation._current_gen = algorithm.n_gen
 
         gen = algorithm.n_gen
         elapsed = (datetime.now() - self.start_time).total_seconds()
@@ -1097,7 +1111,7 @@ def _build_algorithm(problem, sampling, repair, pop_size, n_generations):
         pop_size=pop_size,
         sampling=sampling,
         crossover=HUX(),
-        mutation=BitflipMutation(prob=0.1),
+        mutation=InstrumentedBitflipMutation(prob=1.0 / max(problem.n_var, 1)),
         repair=repair,
     )
     termination = get_termination("n_gen", n_generations)
@@ -1203,6 +1217,17 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
         'run_label': run_label,
         'run_config': run_config,
     }
+
+    # Attach operator diagnostics from repair and mutation
+    _algo = getattr(result, 'algorithm', None)
+    _repair = getattr(_algo, 'repair', None) if _algo is not None else None
+    if _repair is not None and hasattr(_repair, 'repair_log'):
+        optimization_results['repair_diagnostics'] = _repair.repair_log
+    _mutation = None
+    if _algo is not None and hasattr(_algo, 'mating') and hasattr(_algo.mating, 'mutation'):
+        _mutation = _algo.mating.mutation
+    if _mutation is not None and hasattr(_mutation, 'flip_log'):
+        optimization_results['mutation_diagnostics'] = _mutation.flip_log
 
     if use_patch_approach and 'patch_mappings' in initial_conditions:
         optimization_results['patch_mappings'] = initial_conditions['patch_mappings']

@@ -13,6 +13,7 @@ import numpy as np
 from scipy import ndimage
 from pymoo.core.repair import Repair
 from pymoo.core.sampling import Sampling
+from pymoo.operators.mutation.bitflip import BitflipMutation
 import rasterio
 from scipy.ndimage import generic_filter
 
@@ -402,10 +403,12 @@ class AdaptiveRepair(Repair):
         # Initialize repair logging
         self.call_log = []  # Store repair events: {'generation': int, 'type': str, 'individuals_repaired': int}
         self.total_calls = 0
+        self.repair_log = []  # Per-generation bit-diff diagnostics
     
     def _do(self, problem, X, **kwargs):
         X_repaired = np.zeros_like(X)
-        
+        X_in = X.copy()  # snapshot before any repair, for bit-diff
+
         score_repairs = 0
         random_repairs = 0
         individuals_repaired = 0
@@ -476,7 +479,17 @@ class AdaptiveRepair(Repair):
                 'score_repairs': score_repairs,
                 'random_repairs': random_repairs
             })
-        
+
+        # Record bit-diff diagnostics
+        diffs = np.sum(X_in != X_repaired, axis=1)  # (pop_size,)
+        self.repair_log.append({
+            'generation': generation,
+            'mean_bits_changed': float(np.mean(diffs)),
+            'std_bits_changed': float(np.std(diffs)),
+            'max_bits_changed': int(np.max(diffs)),
+            'fraction_repaired': float(individuals_repaired / max(len(X), 1)),
+        })
+
         return X_repaired
     
     def _compute_adjacency_scores(self, x_restore):
@@ -622,3 +635,52 @@ class AdaptiveRepair(Repair):
         x[:n_pixels] = x_restore
         x[n_pixels:] = x_convert
         return x
+
+
+# =============================================================================
+# INSTRUMENTED MUTATION OPERATOR
+# =============================================================================
+
+class InstrumentedBitflipMutation(BitflipMutation):
+    """
+    BitflipMutation wrapper that records how many bits it flips each generation.
+
+    Attributes
+    ----------
+    flip_log : list of dict
+        One entry per generation::
+
+            {
+              'generation': int,
+              'mean_raw_flips': float,   # avg bits flipped before repair
+              'std_raw_flips': float,
+              'total_raw_flips': int,
+            }
+
+    Usage
+    -----
+    mutation = InstrumentedBitflipMutation(prob=1/n_var)
+    # After optimization:
+    flip_log = mutation.flip_log
+    """
+
+    def __init__(self, prob=0.1, **kwargs):
+        super().__init__(prob=prob, **kwargs)
+        self.flip_log = []
+        self._current_gen = 0
+
+    def _do(self, problem, X, **kwargs):
+        X_before = X.copy()
+        X_after = super()._do(problem, X, **kwargs)
+
+        flips_per_ind = np.sum(X_before != X_after, axis=1)  # (pop_size,)
+        # Use _current_gen + 1 so the label matches the 1-based generation counter
+        # used by the repair operators.  ProgressCallback own sync overwrites
+        # _current_gen before each call, so we must NOT increment here.
+        self.flip_log.append({
+            'generation': self._current_gen + 1,
+            'mean_raw_flips': float(np.mean(flips_per_ind)),
+            'std_raw_flips': float(np.std(flips_per_ind)),
+            'total_raw_flips': int(np.sum(flips_per_ind)),
+        })
+        return X_after
