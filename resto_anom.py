@@ -84,7 +84,7 @@ def build_repair_scores(initial_conditions, scenario_params):
     b0 = initial_conditions["biotic_anomaly"][elig]
 
     wshape = scenario_params.get("anomaly_weight_shape", "exponential")
-    wscale = scenario_params.get("anomaly_weight_scale", 1.0)
+    wscale = scenario_params.get("anomaly_weight_scale", 0.5)  # 0.5 spreads score signal across more mildly-degraded pixels vs. old default of 1.0
 
     wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
     wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
@@ -336,20 +336,15 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
                 neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
                 neighbor_mask = neighbor_mask & ~action_mask  # Exclude direct action cells
                 
-                # Apply reduced improvement to neighbors with anomaly weighting
+                # Apply flat spillover improvement to neighbors (no anomaly weighting)
+                # Neighbours benefit unconditionally from proximity to restored cells,
+                # regardless of their own anomaly value. This gives the optimizer a
+                # spatial continuity incentive that would otherwise be lost when
+                # neighbouring cells have near-zero or positive anomaly.
                 neighbor_improvement = improvement * effect_params['neighbor_effect_decay']
                 
-                # Calculate weights for neighbor pixels based on their baseline anomaly
-                neighbor_baseline_anomalies = original_values[neighbor_mask]
-                neighbor_weights = anomaly_improvement_weight(
-                    neighbor_baseline_anomalies, shape=weight_shape, scale=weight_scale
-                )
-                
-                # Apply weighted neighbor improvement
-                weighted_neighbor_improvements = neighbor_improvement * neighbor_weights
-                
                 updated_values[neighbor_mask] = (
-                    original_values[neighbor_mask] + weighted_neighbor_improvements
+                    original_values[neighbor_mask] + neighbor_improvement
                 )
         
         # Only apply changes to appropriate eligible pixels based on objective type

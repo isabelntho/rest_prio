@@ -427,8 +427,8 @@ class AdaptiveRepair(Repair):
                 current_total = np.sum(x[:n_pixels]) + np.sum(x[n_pixels:])
                 target = self.max_restored_pixels
                 
-                # Only repair if count is >20% off target (preserve diversity for small differences)
-                tolerance = max(target * 0.2, 100)  # 20% tolerance or at least 100 pixels
+                # Only repair if count is >10% off target (preserve diversity for small differences)
+                tolerance = max(target * 0.1, 5)  # 10% tolerance or at least 5 pixels
                 
                 if abs(current_total - target) > tolerance:
                     individuals_repaired += 1

@@ -186,6 +186,24 @@ Improved the patch-based optimization
 - Added compatibility handling for older/newer numpy pickle module paths.
 - Added patch-space-to-pixel-space conversion in visualization functions to prevent decision-shape mismatches.
 
+### 2026-04-08
+
+Diagnosis and targeted fixes for three optimization pipeline issues: all solutions appearing Pareto-optimal, salt-and-pepper spatial patterns in selected pixels, and mismatch between high-priority areas identified by weighted-sum analysis and those selected by the optimizer.
+
+#### spatial_operations.py
+
+- `AdaptiveRepair._do()`: reduced repair tolerance from 20% → 10% of target pixel count (minimum floor 100 → 5 pixels).
+  - Previous behaviour: solutions within ±20% of budget were passed through unrepaired, meaning the effective budget varied widely across the population. A solution with 80% of budget pixels always dominates one with 120% on cost, making every member of the population trivially non-dominated regardless of ecological trade-offs. Tighter enforcement ensures all evaluated solutions operate at comparable budgets, so the Pareto front reflects genuine objective trade-offs.
+
+#### resto_anom.py
+
+- `restoration_effect()`: removed `anomaly_improvement_weight` from the neighbor cell calculation; replaced with a flat spillover improvement (`original_values[neighbor_mask] + neighbor_improvement`).
+  - Previous behaviour: neighbor improvement was multiplied by `anomaly_improvement_weight` of each neighbor's baseline anomaly. Because neighbors of restored cells are often near-zero or positive anomaly, the weight approached 0 and the actual neighbor benefit was negligible. With no spatial continuity incentive in the objective function and `spatial_clustering=0`, the optimizer treated adjacent and distant pixels identically, producing salt-and-pepper solutions. Flat spillover gives the optimizer a genuine reason to favour spatially contiguous selections.
+- `build_repair_scores()`: changed default `anomaly_weight_scale` fallback from `1.0` → `0.5`.
+  - Previous behaviour: with `scale=1.0` and `gamma=3`, mildly degraded pixels (anomaly ≈ −0.1) received scores of ≈ 9 × 10⁻⁵, near-zero and essentially indistinguishable. Score-based repair and sampling had almost no spatial signal to guide selection across most of the landscape. Halving the scale spreads the score distribution over a broader range of degradation values without flattening it, giving the repair operator meaningful guidance for mildly degraded pixels. This default can be overridden via `scenario_params["anomaly_weight_scale"]`.
+
+> **Note:** the neighbour logic in `restoration_effect()` has changed — `PIPELINE_DIAGRAM.md` should be updated to reflect that neighbours now receive a flat spillover improvement rather than an anomaly-weighted one.
+
 ## Notes for Future Updates
 - Add one dated section per work session.
 - Keep entries short: what changed, why, and any downstream impact.

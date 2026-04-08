@@ -18,7 +18,7 @@ ECOSYSTEM_TO_RUN = "fg"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "test_snapshot"
+RUN_LABEL = "ud_repairTol_neighbourEffect"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
