@@ -20,10 +20,11 @@ from multiprocessing import Pool
 
 from pymoo.core.problem import ElementwiseProblem, StarmapParallelization
 from pymoo.optimize import minimize
-from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.algorithms.moo.nsga3 import NSGA3
 from pymoo.termination import get_termination
 from pymoo.operators.crossover.hux import HUX
 from pymoo.indicators.hv import HV
+from pymoo.util.ref_dirs import get_reference_directions
 
 from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation
 from data_loader import load_initial_conditions
@@ -336,15 +337,17 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
                 neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
                 neighbor_mask = neighbor_mask & ~action_mask  # Exclude direct action cells
                 
-                # Apply flat spillover improvement to neighbors (no anomaly weighting)
-                # Neighbours benefit unconditionally from proximity to restored cells,
-                # regardless of their own anomaly value. This gives the optimizer a
-                # spatial continuity incentive that would otherwise be lost when
-                # neighbouring cells have near-zero or positive anomaly.
                 neighbor_improvement = improvement * effect_params['neighbor_effect_decay']
-                
+
+                neighbor_baseline_anomalies = original_values[neighbor_mask]
+                neighbor_weights = anomaly_improvement_weight(
+                    neighbor_baseline_anomalies, shape=weight_shape, scale=weight_scale
+                )
+
+                # Apply weighted neighbor improvement
+                weighted_neighbor_improvements = neighbor_improvement * neighbor_weights
                 updated_values[neighbor_mask] = (
-                    original_values[neighbor_mask] + neighbor_improvement
+                    original_values[neighbor_mask] + weighted_neighbor_improvements
                 )
         
         # Only apply changes to appropriate eligible pixels based on objective type
@@ -1093,17 +1096,28 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
     return sampling, repair
 
 
-def _build_algorithm(problem, sampling, repair, pop_size, n_generations):
+def _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_partitions=8):
     """
-    Construct the NSGA2 algorithm and generation-based termination criterion.
+    Construct the NSGA-III algorithm and generation-based termination criterion.
+
+    NSGA-III uses structured reference directions (Das-Dennis simplex lattice)
+    instead of crowding distance for diversity preservation. This restores
+    selection pressure in 3-objective space where NSGA-II degenerates because
+    nearly all solutions end up on rank 0.
+
+    With n_partitions=8 and 3 objectives, 45 reference directions are generated.
+    pop_size is ignored — NSGA-III sets population size equal to the number of
+    reference directions (45 in the default case).
 
     Returns
     -------
     tuple
         (algorithm, termination)
     """
-    algorithm = NSGA2(
-        pop_size=pop_size,
+    n_obj = problem.n_obj
+    ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_partitions)
+    algorithm = NSGA3(
+        ref_dirs=ref_dirs,
         sampling=sampling,
         crossover=HUX(),
         mutation=InstrumentedBitflipMutation(prob=1.0 / max(problem.n_var, 1)),
@@ -1311,14 +1325,15 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
                                      output_dir=".", save_snapshots=False,
-                                     run_label="", run_config=None):
+                                     run_label="", run_config=None,
+                                     n_partitions=8):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
     Args:
         initial_conditions: Initial objective conditions
         scenario_params: Dict with scenario parameters
-        pop_size: Population size for NSGA-II
+        pop_size: Ignored — NSGA-III population size is determined by n_partitions (kept for API compatibility)
         n_generations: Number of optimization generations
         save_results: Whether to save results to files
         verbose: Print progress information
@@ -1335,6 +1350,9 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             - 'patch_count': Constrain number of patches
         pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
         output_dir: Directory to save results (default: current directory)
+        n_partitions: Number of partitions for NSGA-III Das-Dennis reference directions.
+            Controls population size: n_partitions=8 → 45 ref dirs (≈ pop of 45).
+            Increase to explore more of the objective space at the cost of more evaluations.
 
     Returns:
         dict: Optimization results, or None if optimization failed.
@@ -1410,7 +1428,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     )
 
     # --- 7. Build algorithm ---
-    algorithm, termination = _build_algorithm(problem, sampling, repair, pop_size, n_generations)
+    algorithm, termination = _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_partitions)
 
     # --- 8. Initial sampling quality check (patch mode only) ---
     if use_patch_approach and verbose:

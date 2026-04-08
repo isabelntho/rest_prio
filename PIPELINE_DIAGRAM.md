@@ -2,7 +2,7 @@
 
 Three diagrams documenting how data flows through `resto_anom.py`: the overall module
 pipeline, the per-solution array transformations inside `_evaluate()` / `restoration_effect()`,
-and the NSGA-II generational loop.
+and the NSGA-III generational loop.
 
 **Maintainer note:** update these diagrams when changing `restoration_effect()`,
 objectives, operator classes, or run-settings in `run_optimization_instance()`.
@@ -42,7 +42,7 @@ flowchart TD
 
     REF --> ALGO["_build_algorithm()<br/>NSGA2(sampling, HUX crossover,<br/>BitFlip mutation prob=0.1, repair)<br/>+ get_termination('n_gen', n_generations)"]
 
-    ALGO --> OPT["minimize() — NSGA-II loop<br/>(see Diagram 3)"]
+    ALGO --> OPT["minimize() — NSGA-III loop<br/>(see Diagram 3)"]
 
     OPT --> PKG["_package_results()<br/>objectives_raw [n_sol × n_obj]<br/>objectives_normalized [n_sol × n_obj]<br/>decisions [n_sol × n_var binary]<br/>HV history, population statistics, algo_info"]
 
@@ -76,7 +76,7 @@ flowchart TD
 
     WGT --> DIR["Direct effect on action cells<br/>updated[action_mask] = baseline + effect × weight"]
 
-    DIR --> NBR["Neighbour effect<br/>binary_dilation(action_mask, circular kernel radius r)<br/>→ neighbour_mask  (action cells excluded)<br/>updated[neighbour_mask] += effect × decay × weight_nbr"]
+    NBR --> EMASK["Neighbour effect (flat spillover — 2026-04-08)<br/>binary_dilation(action_mask, circular kernel radius r)<br/>→ neighbour_mask  (action cells excluded)<br/>updated[neighbour_mask] += effect × decay<br/>(no anomaly weighting on neighbours: flat benefit regardless of neighbour anomaly value)"]
 
     NBR --> EMASK["Mask back to restoration_eligible_mask<br/>(changes outside eligible area reverted)"]
 
@@ -100,13 +100,13 @@ flowchart TD
 
 ---
 
-## Diagram 3 — NSGA-II generational loop
+## Diagram 3 — NSGA-III generational loop
 
 <pre class="mermaid">
 flowchart TD
 
     subgraph INIT["Initialisation"]
-        SAMP["Sampling.do(problem, pop_size)<br/>PIXEL — AdaptiveSampling<br/>  random select max_action_pixels from eligible pixels<br/>  optional spatial clustering / burden-sharing<br/>PATCH — PatchAwareSampling<br/>  score-guided patch selection (score_temperature, random_share)<br/>  target pixel count enforced within tolerance<br/>→ population [pop_size × n_var binary]"]
+        SAMP["Sampling.do(problem, pop_size)<br/>PIXEL — AdaptiveSampling<br/>  random select max_action_pixels from eligible pixels<br/>  optional spatial clustering / burden-sharing<br/>PATCH — PatchAwareSampling<br/>  score-guided patch selection (score_temperature, random_share)<br/>  target pixel count enforced within tolerance<br/>→ population [n_ref_dirs × n_var binary]<br/>  (n_ref_dirs = 45 for n_partitions=8, 3 objectives)"]
         IREPAIR["Initial repair pass<br/>PIXEL — AdaptiveRepair: exact pixel count enforced by score<br/>PATCH — PatchRepair: whole-patch add/remove by score"]
         SAMP --> IREPAIR
     end
@@ -115,7 +115,7 @@ flowchart TD
 
     EVAL0 --> GL["=== GENERATION LOOP ==="]
 
-    GL --> SEL["NSGA-II tournament selection<br/>fast non-dominated sort + crowding distance<br/>→ parent pairs [pop_size/2 × 2 × n_var binary]"]
+    GL --> SEL["NSGA-III reference-direction-based selection<br/>Das-Dennis structured ref dirs (n_partitions=8 → 45 dirs)<br/>association: each solution assigned to nearest ref dir<br/>→ parent pairs selected by ref-dir niche count"]
 
     SEL --> CROSS["HUX crossover<br/>swap complementary half-bits between parents<br/>→ offspring [pop_size × n_var binary]"]
 
@@ -125,7 +125,7 @@ flowchart TD
 
     REP --> EVALO["Evaluate offspring<br/>_evaluate() per individual  (see Diagram 2)<br/>parallelised via Pool.starmap when n_jobs > 1<br/>→ F [n_obj], G [1]"]
 
-    EVALO --> NSORT["NSGA-II survival selection<br/>merge parent + offspring  [2 × pop_size solutions]<br/>fast non-dominated sort → rank<br/>crowding distance within rank → prune to pop_size"]
+    EVALO --> NSORT["NSGA-III survival selection<br/>merge parent + offspring  [2 × n_ref_dirs solutions]<br/>fast non-dominated sort → rank<br/>reference-direction niche preservation → prune to n_ref_dirs"]
 
     NSORT --> HVCB["ProgressCallback / HVCallback<br/>HV(Pareto front F, fixed ref_point) → hv_history<br/>track f_mean / f_std / f_min / f_max per generation<br/>no HV improvement for hv_patience generations → converged = True"]
 

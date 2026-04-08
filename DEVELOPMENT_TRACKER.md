@@ -202,7 +202,22 @@ Diagnosis and targeted fixes for three optimization pipeline issues: all solutio
 - `build_repair_scores()`: changed default `anomaly_weight_scale` fallback from `1.0` → `0.5`.
   - Previous behaviour: with `scale=1.0` and `gamma=3`, mildly degraded pixels (anomaly ≈ −0.1) received scores of ≈ 9 × 10⁻⁵, near-zero and essentially indistinguishable. Score-based repair and sampling had almost no spatial signal to guide selection across most of the landscape. Halving the scale spreads the score distribution over a broader range of degradation values without flattening it, giving the repair operator meaningful guidance for mildly degraded pixels. This default can be overridden via `scenario_params["anomaly_weight_scale"]`.
 
-> **Note:** the neighbour logic in `restoration_effect()` has changed — `PIPELINE_DIAGRAM.md` should be updated to reflect that neighbours now receive a flat spillover improvement rather than an anomaly-weighted one.
+> **Reverted (same session):** The flat spillover change to `restoration_effect()` was reverted — see below.
+
+#### Switch from NSGA-II to NSGA-III — resto_anom.py
+
+Root cause identified: with 3 objectives and a population of 50, NSGA-II's fast non-dominated sort places virtually all solutions on rank 0 (expected behaviour for many-objective problems). This collapses selection pressure entirely to crowding distance, making the algorithm unable to distinguish genuinely better solutions from random ones — explaining both the salt-and-pepper spatial patterns and the mismatch with weighted-sum priority areas.
+
+- Replaced `NSGA2` import with `NSGA3` from `pymoo.algorithms.moo.nsga3`; added `get_reference_directions` from `pymoo.util.ref_dirs`.
+- `_build_algorithm()`: now accepts `n_partitions` parameter; generates Das-Dennis reference directions (`get_reference_directions("das-dennis", n_obj, n_partitions=n_partitions)`) and passes them to `NSGA3`. All other constructor arguments (`sampling`, `crossover=HUX()`, `mutation`, `repair`) unchanged. Population size is no longer set explicitly — NSGA-III determines it from the number of reference directions.
+- `run_optimization_instance()`: added `n_partitions=8` parameter (default). With 3 objectives and `n_partitions=8`, 45 reference directions are generated → effective population of 45, close to the previous `POP_SIZE=50`. The `pop_size` parameter is retained for API compatibility but is ignored by NSGA-III. Docstring updated accordingly.
+
+> **Note:** `PIPELINE_DIAGRAM.md` Diagram 3 references the NSGA-II generational loop — update to reflect NSGA-III and reference-direction-based selection.
+
+#### Revert: restore anomaly-weighted neighbour logic in resto_anom.py
+
+- `restoration_effect()`: reverted the flat spillover change from earlier this session; restored the original anomaly-weighted neighbour improvement (`neighbor_weights = anomaly_improvement_weight(neighbor_baseline_anomalies, ...)`; `updated_values[neighbor_mask] = original_values[neighbor_mask] + neighbor_improvement * neighbor_weights`).
+  - Reason: flat spillover caused both objectives (abiotic and biotic) to move together on every restored pixel, because `updated_values` feeds both objectives identically. This collapsed objective independence and produced highly correlated solutions. The original anomaly-weighted logic differentiates neighbours by their own anomaly type and magnitude, preserving the trade-off structure that NSGA-III needs to spread solutions across reference directions. Now that NSGA-III is in place, selection pressure is restored and the weighted neighbour logic is no longer the bottleneck for spatial coherence.
 
 ## Notes for Future Updates
 - Add one dated section per work session.
