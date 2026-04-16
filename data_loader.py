@@ -361,7 +361,8 @@ def load_admin_regions(workspace_dir, region='Bern'):
 # =============================================================================
 
 def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosystem='all', 
-                            sample_fraction=None, sample_seed=42, ecosystem_lulc_path=None, landscape_lulc_path=None):
+                            sample_fraction=None, sample_seed=42, ecosystem_lulc_path=None, landscape_lulc_path=None,
+                            aggregation_factor=None):
     """
     Args:
         workspace_dir: Directory containing input data files (.tif)
@@ -375,6 +376,10 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         sample_seed: Random seed for reproducible sampling (default: 42)
         ecosystem_lulc_path: Path to LULC raster file for ecosystem masking. If None, uses default paths
         landscape_lulc_path: Path to LULC raster file for landscape calculations. If None, uses default paths
+        aggregation_factor: Integer block-aggregation factor applied to all arrays before optimization
+                           (e.g., 2 halves resolution in each dimension, reducing pixels by ~4x).
+                           Objective arrays are block-averaged; eligibility masks use any-eligible logic.
+                           None or 1 disables aggregation.
     Returns:
         dict: Initial conditions for specified objectives and ecosystem
     """
@@ -385,7 +390,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         #'abiotic': 'inputs/abiotic_idw.tif',
         #'biotic': 'inputs/biotic_idw.tif', 
         'landscape': 'inputs/sn_dens.tif',
-        'cost': 'inputs/implementation_cost.tif',
+        'cost': 'inputs/implementation_cost_corrected.tif',
         'population_proximity': 'inputs/population_proximity.tif'
     }
     
@@ -706,7 +711,86 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     # You might want to exclude certain areas, e.g.:
     # eligible_mask = (initial_conditions['implementation_cost'] < 8000) & \\
     #                 (initial_conditions['abiotic_anomaly'] > 0.1)
-    
+
+    # -------------------------------------------------------------------------
+    # Spatial aggregation (block coarsening)
+    # -------------------------------------------------------------------------
+    if aggregation_factor is not None and aggregation_factor > 1:
+        f = int(aggregation_factor)
+        h, w = initial_conditions['shape']
+        # Trim to dimensions divisible by f (crop bottom/right)
+        h_trim = (h // f) * f
+        w_trim = (w // f) * f
+
+        def _block_mean(arr, nan_mask):
+            """Block-average a float array, respecting original NaN locations."""
+            a = arr[:h_trim, :w_trim].astype(float)
+            # Restore NaN before averaging to avoid zero-fill bias
+            a[nan_mask[:h_trim, :w_trim]] = np.nan
+            a = a.reshape(h_trim // f, f, w_trim // f, f)
+            result = np.nanmean(a, axis=(1, 3))
+            return result
+
+        def _block_any(mask):
+            """Coarsen a boolean mask using any-eligible logic."""
+            m = mask[:h_trim, :w_trim].reshape(h_trim // f, f, w_trim // f, f)
+            return m.any(axis=(1, 3))
+
+        # Aggregate objective arrays
+        obj_keys = list(nan_masks.keys())  # e.g. abiotic_anomaly, implementation_cost, ...
+        for key in obj_keys:
+            if key in initial_conditions:
+                initial_conditions[key] = _block_mean(initial_conditions[key], nan_masks[key])
+                # Update nan_mask to coarse grid
+                nan_masks[key] = np.isnan(initial_conditions[key])
+                # Re-zero NaN so downstream sum() calls work
+                initial_conditions[key] = np.nan_to_num(initial_conditions[key], nan=0.0)
+
+        # Aggregate boolean masks
+        restoration_eligible_mask = _block_any(restoration_eligible_mask)
+        conversion_eligible_mask  = _block_any(conversion_eligible_mask)
+        eligible_mask             = _block_any(eligible_mask)
+        if 'ecosystem_mask' in initial_conditions:
+            initial_conditions['ecosystem_mask'] = _block_any(initial_conditions['ecosystem_mask'])
+
+        # Update shape and geotransform
+        new_shape = (h_trim // f, w_trim // f)
+        initial_conditions['shape'] = new_shape
+        shape = new_shape
+        t = initial_conditions['transform']
+        from rasterio.transform import Affine
+        initial_conditions['transform'] = Affine(t.a * f, t.b, t.c, t.d, t.e * f, t.f)
+
+        logger.info(f"Applied {f}x spatial aggregation: {(h, w)} → {new_shape} "
+                    f"({new_shape[0]*new_shape[1]} pixels)")
+
+        # Save aggregated objective rasters to inputs/ for inspection
+        coarse_crs = initial_conditions['crs']
+        coarse_transform = initial_conditions['transform']
+        for key, orig_path in data_files.items():
+            if key not in initial_conditions:
+                continue
+            arr = initial_conditions[key]
+            stem, ext = os.path.splitext(os.path.basename(orig_path))
+            out_path = os.path.join(os.path.dirname(orig_path), f"{stem}_agg{f}{ext}")
+            with rio.open(
+                out_path, 'w',
+                driver='GTiff',
+                height=arr.shape[0],
+                width=arr.shape[1],
+                count=1,
+                dtype=arr.dtype,
+                crs=coarse_crs,
+                transform=coarse_transform,
+            ) as dst:
+                out_arr = arr.copy().astype(float)
+                # Restore nodata where nan_mask indicates original NaN
+                if key in nan_masks:
+                    coarse_nan = nan_masks[key]
+                    out_arr[coarse_nan] = np.nan
+                dst.write(out_arr, 1)
+            logger.info(f"Saved aggregated raster: {out_path}")
+
     # Apply spatial sampling if requested
     eligible_indices = np.where(eligible_mask.flatten())[0]
     

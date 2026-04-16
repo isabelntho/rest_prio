@@ -18,7 +18,7 @@ ECOSYSTEM_TO_RUN = "fg"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "nsga3"
+RUN_LABEL = "cost_corrected_noWS"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -43,21 +43,28 @@ N_GENERATIONS = 100
 N_JOBS = 12
 RANDOM_SEED = 42
 N_SAMPLES_PER_PARAM = 3
+WARM_SEEDING = False
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
 custom_scenario_params = {
-    "max_restoration_fraction": 0.1,
+    "max_restoration_fraction": 0.05,
     "spatial_clustering": 0,
     "biotic_effect": 0.01,
     "abiotic_effect": 0.01,
     "normalize_objectives": True,
+    "patch_score_temperature": 2.0,
+    "patch_repair_top_k": 100,
 }
 
 # Patch approach settings
 USE_PATCH_APPROACH = True
 PATCH_SIZE = 2
 PATCH_CONSTRAINT_TYPE = 'pixel_count'
-PIXEL_TOLERANCE = 0.05
+PIXEL_TOLERANCE = 0.15
+
+# Spatial aggregation: block-coarsen all input rasters by this integer factor before optimisation.
+# 2 = halve resolution in each dimension (~4x fewer pixels). Set to None or 1 to disable.
+AGGREGATION_FACTOR = None
 
 # Set to True to save per-generation population snapshots for animation
 # Output: intermediate_results/X_history_{timestamp}.npz  shape=(n_gens, pop_size, n_var) int8
@@ -81,6 +88,7 @@ run_config = {
     "patch_constraint_type": PATCH_CONSTRAINT_TYPE,
     "pixel_tolerance": PIXEL_TOLERANCE,
     "save_snapshots": SAVE_SNAPSHOTS,
+    "aggregation_factor": AGGREGATION_FACTOR,
     "custom_scenario_params": custom_scenario_params,
 }
 
@@ -125,6 +133,7 @@ for run_label, ecosystem_for_loader in runs:
                 ecosystem=ecosystem_for_loader,
                 sample_fraction=SAMPLE_FRACTION,
                 sample_seed=SAMPLE_SEED,
+                aggregation_factor=AGGREGATION_FACTOR,
             )
             print(f"✓ Data loaded for {run_label}")
 
@@ -143,6 +152,7 @@ for run_label, ecosystem_for_loader in runs:
                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                 pixel_tolerance=PIXEL_TOLERANCE,
                 save_snapshots=SAVE_SNAPSHOTS,
+                warm_seeding=WARM_SEEDING,
                 run_label=RUN_LABEL,
                 run_config=run_config,
             )

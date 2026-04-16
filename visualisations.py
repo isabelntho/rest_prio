@@ -296,7 +296,7 @@ def plot_objectives_correlation_matrix(initial_conditions, save_path=None, figsi
     return fig
 
 
-def load_results(pkl_path, scenario_id=None):
+def load_results(pkl_path, scenario_id=None, for_plotting_all=False):
     """
     Load optimization results from pickle file.
     
@@ -306,6 +306,8 @@ def load_results(pkl_path, scenario_id=None):
                     - None: Load scenario 0 for multi-scenario files, or the single scenario
                     - int: Load specific scenario by ID
                     - 'all': Load all scenarios (returns list of scenario results)
+        for_plotting_all (bool): Internal flag to prevent filtering when the full
+                                 population is needed for a plot.
         
     Returns:
         dict or list: 
@@ -379,6 +381,36 @@ def load_results(pkl_path, scenario_id=None):
 
     # Process objectives for single scenario result
     results = _process_objectives(results)
+    
+    # If we need the full population for plotting, we're done.
+    if for_plotting_all:
+        return results
+
+    # Filter for non-dominated solutions if the flag exists
+    if 'is_nondominated' in results:
+        print("Filtering for non-dominated solutions.")
+        
+        # Store the full population before filtering
+        results['full_population'] = {
+            'objectives': results.get('objectives'),
+            'decisions': results.get('decisions'),
+            'objectives_normalized': results.get('objectives_normalized'),
+        }
+        
+        non_dominated_mask = results['is_nondominated']
+        
+        # Filter the main keys
+        results['objectives'] = results['objectives'][non_dominated_mask]
+        results['decisions'] = results['decisions'][non_dominated_mask]
+        if 'objectives_normalized' in results and results['objectives_normalized'] is not None:
+            results['objectives_normalized'] = results['objectives_normalized'][non_dominated_mask]
+        
+        # Update solution counts
+        results['n_solutions'] = len(results['objectives'])
+        results['n_nondominated_solutions'] = results['n_solutions']
+        
+        print(f"Found {results['n_solutions']} non-dominated solutions.")
+
     return results
 
 
@@ -1299,7 +1331,7 @@ def create_effect_summary_visualization(pkl_path, save_path="effect_summary.png"
     
     # 2. Burden Sharing Effect (box plots)
     df_burden = df.melt(id_vars=['burden_sharing'], 
-                       value_vars=['total_anomaly_reduction'])#, 'cost_efficiency'])
+                       value_vars=['total_anomaly_reduction'])#, 'cost_efficiency')
     sns.boxplot(data=df_burden, x='burden_sharing', y='value', hue='variable', ax=axes[0,1])
     axes[0,1].set_title('Burden Sharing Effects')
     
@@ -1321,94 +1353,150 @@ def create_effect_summary_visualization(pkl_path, save_path="effect_summary.png"
     return fig
 
 
-def plot_pareto_front(pkl_path, save_path=None, figsize=(10, 8), alpha=0.7):
+def plot_pareto_front(
+    pkl_path,
+    save_path=None,
+    figsize=(10, 8),
+    alpha=0.7,
+    show_all_solutions=False,
+    scenario_id=None,
+):
     """
-    Plot the Pareto front from optimization results.
+    Plot Pareto front from optimization results.
+
+    Args:
+        pkl_path (str): Path to the pickle file containing results.
+        save_path (str, optional): Path to save the figure. Defaults to None.
+        figsize (tuple, optional): Figure size. Defaults to (10, 8).
+        alpha (float, optional): Transparency of the points. Defaults to 0.7.
+        show_all_solutions (bool, optional): If True, plots all solutions from the
+            final population and highlights the non-dominated ones. Defaults to False.
+        scenario_id (int, optional): The ID of the scenario to load from a
+            multi-scenario result file. Defaults to the first available scenario.
     """
-    # Load results
-    results = load_results(pkl_path)
-    objectives = results['objectives']
-    n_solutions, n_objectives = objectives.shape
+    results = load_results(pkl_path, scenario_id=scenario_id)
     
-    # Get objective names
-    from resto_anom import RestorationProblem
-    problem = RestorationProblem(results['initial_conditions'], results['scenario_params'])
-    
-    # Clean up names for display
-    display_names = {'abiotic_anomaly': 'Abiotic Anomaly', 'biotic_anomaly': 'Biotic Anomaly',
-                     'landscape_anomaly': 'Landscape Anomaly', 'implementation_cost': 'Implementation Cost'}
-    labels = [display_names.get(name, name) for name in problem.objective_names]
-    
-    print(f"Plotting Pareto front: {n_solutions} solutions, {n_objectives} objectives")
-    
-    # Setup scatter plot parameters
     fig, ax = plt.subplots(1, 1, figsize=figsize)
-    scatter_params = {'alpha': alpha, 'edgecolors': 'black', 'linewidth': 0.5}
     
-    # Add color if 3+ objectives
-    if n_objectives >= 3:
-        scatter_params.update({'c': objectives[:, 2], 'cmap': 'viridis'})
-    
-    # Add size if 4+ objectives
-    if n_objectives >= 4:
-        sizes = objectives[:, 3]
-        size_range = sizes.max() - sizes.min()
-        scatter_params['s'] = 50 + 450 * (sizes - sizes.min()) / size_range if size_range > 0 else 100
+    plot_title = "Pareto Front"
+    obj_names = results.get("objective_names", ["Objective 1", "Objective 2", "Objective 3"])
+
+    if show_all_solutions:
+        # When showing all, we need the full unfiltered data
+        results = load_results(pkl_path, scenario_id=scenario_id, for_plotting_all=True)
+        all_objectives = results.get("objectives")
+        is_nondominated = results.get("is_nondominated")
+
+        if all_objectives is None:
+            print(f"Warning: No objectives found in {pkl_path}")
+            return None
+        
+        # Use the third objective for color if available
+        if all_objectives.shape[1] > 2:
+            colors = all_objectives[:, 2]
+            c_label = obj_names[2].replace("_", " ").title()
+        else:
+            colors = "grey"
+            c_label = ""
+
+        # Plot all points first
+        sc = ax.scatter(
+            all_objectives[:, 0],
+            all_objectives[:, 1],
+            c=colors,
+            cmap="viridis",
+            s=60,
+            alpha=alpha,
+            label=f"All Solutions ({len(all_objectives)})"
+        )
+
+        # Then, overlay the red outline on the non-dominated points
+        if is_nondominated is not None and np.any(is_nondominated):
+            ax.scatter(
+                all_objectives[is_nondominated, 0],
+                all_objectives[is_nondominated, 1],
+                s=60, # Match size
+                facecolors='none',
+                edgecolors='red',
+                linewidths=1.5,
+                label=f'Non-dominated ({np.sum(is_nondominated)})'
+            )
+        
+        if all_objectives.shape[1] > 2:
+            cbar = fig.colorbar(sc, ax=ax)
+            cbar.set_label(c_label)
+        
+        ax.legend()
+        plot_title = "All Final Solutions"
+
     else:
-        scatter_params['s'] = 100
-    
-    # Create scatter plot
-    scatter = ax.scatter(objectives[:, 0], objectives[:, 1], **scatter_params)
-    ax.set_xlabel(labels[0], fontsize=12)
-    ax.set_ylabel(labels[1], fontsize=12)
-    ax.set_title(f'Pareto Front ({n_solutions} solutions)', fontsize=14, pad=20)
-    ax.grid(True, alpha=0.3)
-    
-    # Add colorbar for 3rd objective
-    if n_objectives >= 3:
-        cbar = plt.colorbar(scatter, ax=ax, pad=0.02)
-        cbar.set_label(labels[2], rotation=270, labelpad=20, fontsize=11)
-    
-    # Add size legend for 4th objective
-    if n_objectives >= 4:
-        sizes = objectives[:, 3]
-        size_samples = [sizes.min(), (sizes.min() + sizes.max()) / 2, sizes.max()]
-        legend_elements = [plt.scatter([], [], s=s, c='grey', alpha=0.6, edgecolors='black', 
-                                      linewidth=0.5, label=f'{val:.2e}')
-                          for val, s in zip(size_samples, [50, 275, 500])]
-        ax.legend(handles=legend_elements, title=labels[3], loc='upper right',
-                 framealpha=0.9, fontsize=9, title_fontsize=10)
-    
-    plt.tight_layout()
-    
+        # Original behavior: load pre-filtered non-dominated front
+        results = load_results(pkl_path, scenario_id=scenario_id)
+        objectives = results.get("objectives")
+        if objectives is None:
+            print(f"Warning: No objectives found in {pkl_path}")
+            return None
+            
+        if objectives.shape[1] > 2:
+            colors = objectives[:, 2]
+            c_label = obj_names[2].replace("_", " ").title()
+        else:
+            colors = "tab:blue"
+            c_label = ""
+
+        sc = ax.scatter(
+            objectives[:, 0],
+            objectives[:, 1],
+            c=colors,
+            cmap="viridis",
+            s=60,
+            alpha=alpha,
+        )
+        
+        if objectives.shape[1] > 2:
+            cbar = fig.colorbar(sc, ax=ax)
+            cbar.set_label(c_label)
+
+    ax.set_xlabel(obj_names[0].replace("_", " ").title())
+    ax.set_ylabel(obj_names[1].replace("_", " ").title())
+    ax.set_title(plot_title)
+    ax.grid(True, which="both", ls="--", alpha=0.5)
+
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Pareto front plot saved to: {save_path}")
-    
-    plt.show()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"✓ Saved pareto front to: {save_path}")
+
     return fig
 
-
-def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_background=0.15):
+def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_background=1):
     """
     Plot parallel coordinates showing all objectives.
     Each objective is a vertical axis, each solution is a line.
-    Highlights the best solution for each objective with a distinct color.
+    Dominated solutions are drawn in grey, non-dominated solutions in black,
+    and the best solution for each objective is highlighted in a distinct color.
     
     Args:
         pkl_path: Path to pickle file with optimization results
         save_path: Optional path to save the figure
         figsize: Figure size (width, height)
-        alpha_background: Transparency for non-highlighted solutions
+        alpha_background: Transparency for dominated (grey) solutions
         
     Returns:
         fig: matplotlib figure
     """
-    # Load results
-    results = load_results(pkl_path)
+    # Load full population so we can distinguish dominated from non-dominated
+    results = load_results(pkl_path, for_plotting_all=True)
     objectives = results['objectives']
+    is_nondominated = results.get('is_nondominated')
     n_solutions, n_objectives = objectives.shape
-    
+
+    # Fall back: treat all solutions as non-dominated if flag is absent
+    if is_nondominated is None:
+        is_nondominated = np.ones(n_solutions, dtype=bool)
+
+    n_nondominated = int(np.sum(is_nondominated))
+    n_dominated = n_solutions - n_nondominated
+
     # Get objective names
     from resto_anom import RestorationProblem
     problem = RestorationProblem(results['initial_conditions'], results['scenario_params'])
@@ -1419,9 +1507,10 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
                      'population_proximity': 'Population\nProximity'}
     labels = [display_names.get(name, name) for name in problem.objective_names]
     
-    print(f"Plotting parallel coordinates: {n_solutions} solutions, {n_objectives} objectives")
+    print(f"Plotting parallel coordinates: {n_solutions} solutions total "
+          f"({n_nondominated} non-dominated, {n_dominated} dominated)")
     
-    # Normalize objectives to [0, 1] for visualization
+    # Normalize objectives to [0, 1] for visualization using the full population range
     objectives_norm = np.zeros_like(objectives)
     for i in range(n_objectives):
         obj_min, obj_max = objectives[:, i].min(), objectives[:, i].max()
@@ -1430,30 +1519,46 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
         else:
             objectives_norm[:, i] = 0.5
     
-    # Find best solution for each objective (minimum value = best)
+    # Find best solution for each objective among non-dominated solutions only
     best_solutions = {}
-    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00']  # Distinct colors
+    highlight_colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00']  # Distinct colors
+    nd_indices = np.where(is_nondominated)[0]
     for i in range(n_objectives):
-        best_idx = np.argmin(objectives[:, i])
-        best_solutions[i] = {'idx': best_idx, 'color': colors[i % len(colors)], 'label': labels[i]}
+        best_nd_pos = np.argmin(objectives[nd_indices, i])
+        best_idx = int(nd_indices[best_nd_pos])
+        best_solutions[i] = {'idx': best_idx, 'color': highlight_colors[i % len(highlight_colors)], 'label': labels[i]}
     
     # Create figure
     fig, ax = plt.subplots(1, 1, figsize=figsize)
-    
-    # Plot all solutions in grey (background)
     x_positions = np.arange(n_objectives)
+
+    # Layer 1: dominated solutions in grey (background)
+    dominated_plotted = False
     for sol_idx in range(n_solutions):
-        ax.plot(x_positions, objectives_norm[sol_idx, :], 
-               color='grey', alpha=alpha_background, linewidth=0.8, zorder=1)
-    
-    # Plot best solutions with distinct colors (foreground)
-    plotted_indices = set()  # Track which solutions we've already highlighted
+        if not is_nondominated[sol_idx]:
+            ax.plot(x_positions, objectives_norm[sol_idx, :],
+                    color='grey', alpha=alpha_background, linewidth=0.8, zorder=1,
+                    label='Dominated' if not dominated_plotted else '_nolegend_')
+            dominated_plotted = True
+
+    # Layer 2: non-dominated solutions in black
+    nd_plotted = False
+    best_indices = {info['idx'] for info in best_solutions.values()}
+    for sol_idx in nd_indices:
+        if sol_idx not in best_indices:
+            ax.plot(x_positions, objectives_norm[sol_idx, :],
+                    color='black', alpha=0.9, linewidth=0.9, zorder=2,
+                    label='Non-dominated' if not nd_plotted else '_nolegend_')
+            nd_plotted = True
+
+    # Layer 3: best solutions with distinct colors (foreground)
+    plotted_indices = set()
     for obj_idx, best_info in best_solutions.items():
         sol_idx = best_info['idx']
         if sol_idx not in plotted_indices:
-            ax.plot(x_positions, objectives_norm[sol_idx, :], 
-                   color=best_info['color'], alpha=0.9, linewidth=2.5, 
-                   label=f"Best for {best_info['label'].replace(chr(10), ' ')}", zorder=2)
+            ax.plot(x_positions, objectives_norm[sol_idx, :],
+                    color=best_info['color'], alpha=0.9, linewidth=2.5,
+                    label=f"Best for {best_info['label'].replace(chr(10), ' ')}", zorder=3)
             plotted_indices.add(sol_idx)
     
     # Format axes
@@ -1461,7 +1566,10 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
     ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylabel('Normalized Objective Value\n(0 = best, 1 = worst)', fontsize=11)
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(f'Parallel Coordinates Plot ({n_solutions} Pareto solutions)', fontsize=14, pad=15)
+    ax.set_title(
+        f'Parallel Coordinates Plot ({n_nondominated} non-dominated / {n_solutions} total solutions)',
+        fontsize=14, pad=15
+    )
     ax.grid(True, axis='y', alpha=0.3, linestyle='--')
     
     # Add legend

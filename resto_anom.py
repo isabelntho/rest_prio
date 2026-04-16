@@ -25,6 +25,7 @@ from pymoo.termination import get_termination
 from pymoo.operators.crossover.hux import HUX
 from pymoo.indicators.hv import HV
 from pymoo.util.ref_dirs import get_reference_directions
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation
 from data_loader import load_initial_conditions
@@ -103,6 +104,46 @@ def build_repair_scores(initial_conditions, scenario_params):
         scores = scores - 1e-6 * c
 
     return np.asarray(scores, dtype=np.float64)
+
+
+def build_per_objective_repair_scores(initial_conditions, scenario_params):
+    """Per-objective pixel scores for direction-aware patch repair.
+
+    Returns a dict with keys 'abiotic', 'biotic', 'cost'.  Each value is a
+    1-D float64 array over eligible pixels, normalized to [0, 1].  Higher
+    score always means "prefer this pixel for the corresponding objective":
+      - abiotic: degradation weight (same as composite abiotic term)
+      - biotic:  degradation weight (same as composite biotic term)
+      - cost:    inverted, normalised cost  (lower cost → higher score)
+    """
+    elig = initial_conditions["eligible_mask"]
+
+    wshape = scenario_params.get("anomaly_weight_shape", "exponential")
+    wscale = scenario_params.get("anomaly_weight_scale", 0.5)
+
+    a0 = initial_conditions["abiotic_anomaly"][elig]
+    b0 = initial_conditions["biotic_anomaly"][elig]
+
+    wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
+    wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
+
+    if "implementation_cost" in initial_conditions:
+        c = initial_conditions["implementation_cost"][elig].astype(np.float64)
+        c_min, c_max = np.nanmin(c), np.nanmax(c)
+        span = c_max - c_min
+        if span > 1e-12:
+            cost_score = 1.0 - (c - c_min) / span
+        else:
+            cost_score = np.full(len(c), 0.5, dtype=np.float64)
+    else:
+        cost_score = np.full(len(wa), 0.5, dtype=np.float64)
+
+    return {
+        "abiotic": np.asarray(wa, dtype=np.float64),
+        "biotic": np.asarray(wb, dtype=np.float64),
+        "cost": cost_score,
+    }
+
 
 # --- Patch Approach Initialization ---
 
@@ -743,7 +784,7 @@ class PatchRestorationProblem(RestorationProblem):
                     abs(n_pixels_used - min_pixels),
                     abs(n_pixels_used - max_pixels)
                 )
-                if self._constraint_debug_count <= 5:
+                if self._constraint_debug_count < 5:
                     print(f"                    VIOLATION: G={constraint_value}")
         
         out["G"] = [constraint_value]
@@ -1002,9 +1043,9 @@ class ProgressCallback:
             print(f"   Generation {gen}/{self.n_generations} ({progress:.1f}%) - "
                   f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}")
 
-        # TEMPORARILY DISABLED: Hypervolume-based early stopping
-        # if self.hv_callback.converged:
-        #     algorithm.termination.force_termination = True
+        # Hypervolume-based early stopping
+        if self.hv_callback.converged:
+            algorithm.termination.force_termination = True
 
 
 def _filter_initial_conditions_for_return(initial_conditions):
@@ -1029,7 +1070,7 @@ def _filter_initial_conditions_for_return(initial_conditions):
 
 
 def _build_operators(initial_conditions, scenario_params, problem, use_patch_approach,
-                     use_repair, patch_constraint_type, pixel_tolerance, verbose):
+                     use_repair, patch_constraint_type, pixel_tolerance, verbose, warm_seeding=True):
     """
     Build sampling and repair operators for the chosen optimization mode.
 
@@ -1050,6 +1091,25 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         patch_random_share = float(scenario_params.get('patch_random_share', 0.15))
         patch_repair_top_k = int(scenario_params.get('patch_repair_top_k', 12))
 
+        # Build per-objective patch scores for direction-aware repair.
+        # Each individual is assigned to an NSGA-III reference direction whose
+        # weights indicate how much that direction cares about each objective.
+        # PatchRepair uses these weights at repair time to blend the three score
+        # vectors, so cost-axis individuals get repaired toward cheap patches,
+        # abiotic-axis individuals toward high-abiotic patches, etc.
+        per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
+        per_obj_patch_scores = np.stack([
+            aggregate_patch_scores_from_pixel_scores(
+                patch_mappings=initial_conditions['patch_mappings'],
+                restoration_pixel_scores=per_obj_pixel_scores[obj],
+                conversion_pixel_scores=None,
+                mode='mean',
+            )
+            for obj in ["abiotic", "biotic", "cost"]
+        ], axis=0)  # shape (3, n_patches)
+
+        repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=8)
+
         sampling = PatchAwareSampling(
             patch_mappings=initial_conditions['patch_mappings'],
             target_pixels=problem.target_constraint_value,
@@ -1057,6 +1117,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             patch_scores=patch_scores,
             score_temperature=patch_score_temperature,
             random_share=patch_random_share,
+            per_objective_patch_scores=per_obj_patch_scores,
         )
         repair = PatchRepair(
             constraint_type=patch_constraint_type,
@@ -1066,6 +1127,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             patch_scores=patch_scores,
             score_temperature=patch_score_temperature,
             top_k=patch_repair_top_k,
+            per_objective_patch_scores=per_obj_patch_scores if warm_seeding else None,
+            ref_dirs=repair_ref_dirs,
         ) if use_repair else None
 
         if verbose:
@@ -1120,7 +1183,7 @@ def _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_parti
         ref_dirs=ref_dirs,
         sampling=sampling,
         crossover=HUX(),
-        mutation=InstrumentedBitflipMutation(prob=1.0 / max(problem.n_var, 1)),
+        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=100.0 / problem.n_var),
         repair=repair,
     )
     termination = get_termination("n_gen", n_generations)
@@ -1158,34 +1221,34 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
         print(f"\u2713 Optimization completed after {final_gen} generations ({convergence_reason})")
         if callback.hv_callback.hv_history:
             print(f"Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
-        print(f"Found {len(result.F)} Pareto-optimal solutions")
+        print(f"Found {len(result.F)} Pareto-optimal solutions out of {len(result.pop.get('F'))} evaluated solutions")
 
     initial_conditions_filtered = _filter_initial_conditions_for_return(initial_conditions)
 
-    full_population_data = None
-    if hasattr(result, 'pop') and result.pop is not None:
-        pop_F = result.pop.get("F")
-        pop_X = result.pop.get("X")
-        if pop_F is not None and pop_X is not None:
-            pop_F_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in pop_X], dtype=float)
-            full_population_data = {
-                'objectives': pop_F_raw,
-                'objectives_normalized': pop_F,
-                'decisions': pop_X,
-                'population_size': len(pop_F),
-            }
+    # ----- Full Population Data -----
+    X_full = result.pop.get("X")
+    F_full_norm = result.pop.get("F")
+    F_full_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X_full], dtype=float)
 
-    objectives_normalized = np.asarray(result.F, dtype=float)
-    objectives_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in result.X], dtype=float)
+    # ----- Non-dominated Data -----
+    X_nd = result.X
+    F_nd_norm = result.F
+    
+    # ----- Identify non-dominated solutions within the full population -----
+    # Create a set of tuples for efficient lookup of non-dominated decision vectors
+    nd_solutions_set = {tuple(row) for row in X_nd}
+    is_nondominated = np.array([tuple(row) in nd_solutions_set for row in X_full])
 
     optimization_results = {
         'scenario_params': scenario_params,
         'objective_names': problem.objective_names,
-        'objectives': objectives_raw,
-        'objectives_raw': objectives_raw,
-        'objectives_normalized': objectives_normalized,
-        'decisions': result.X,
-        'n_solutions': len(result.F),
+        'objectives': F_full_raw,
+        'objectives_raw': F_full_raw,
+        'objectives_normalized': F_full_norm,
+        'decisions': X_full,
+        'is_nondominated': is_nondominated,
+        'n_solutions': len(X_full),
+        'n_nondominated_solutions': len(X_nd),
         'problem_info': {
             'n_pixels': initial_conditions['n_pixels'],
             'n_restoration_pixels': initial_conditions.get('n_restoration_pixels', 0),
@@ -1222,7 +1285,6 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
         },
         'initial_conditions': initial_conditions_filtered,
         'hv_callback': callback.hv_callback,
-        'full_population': full_population_data,
         'run_label': run_label,
         'run_config': run_config,
     }
@@ -1290,7 +1352,17 @@ def _print_failure_diagnostics(result, problem, initial_conditions):
             if pop_G is not None:
                 n_feasible = np.sum(np.all(pop_G <= 0, axis=1))
                 n_total = len(pop_G)
-                print(f"  Final population: {n_total} solutions, {n_feasible} feasible")
+                
+                pop_F = result.pop.get("F")
+                if pop_F is not None:
+                    # Perform non-dominated sort on the final population
+                    nds = NonDominatedSorting()
+                    fronts = nds.do(pop_F, only_non_dominated_front=False)
+                    n_nondominated = len(fronts[0]) if fronts and len(fronts) > 0 else 0
+                    print(f"  Final population had {n_total} solutions, with {n_nondominated} non-dominated and {n_feasible} feasible.")
+                else:
+                    print(f"  Final population: {n_total} solutions, {n_feasible} feasible (objectives not available for ND sort).")
+
                 if n_feasible == 0 and pop_X is not None:
                     print(f"  Checking actual pixel counts for first 5 solutions:")
                     patch_mappings = initial_conditions.get('patch_mappings')
@@ -1326,7 +1398,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
                                      output_dir=".", save_snapshots=False,
                                      run_label="", run_config=None,
-                                     n_partitions=8):
+                                     n_partitions=8, warm_seeding=True):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
@@ -1416,6 +1488,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     sampling, repair = _build_operators(
         initial_conditions, scenario_params, problem,
         use_patch_approach, use_repair, patch_constraint_type, pixel_tolerance, verbose,
+        warm_seeding=warm_seeding,
     )
 
     # --- 6. Build HV reference point ---
