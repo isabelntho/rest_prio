@@ -812,7 +812,7 @@ class PatchRestorationProblem(RestorationProblem):
 
 # --- Execution Utilities ---
 
-def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42, verbose=False):
+def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42, verbose=False, n_jobs=1):
     """
     Build a fixed hypervolume reference point using a warm up sample of solutions.
     """
@@ -821,13 +821,28 @@ def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42
     pop = sampling.do(problem, n_samples)
     X = pop.get("X")
 
-    F_list = []
-    for k in range(X.shape[0]):
+    def _eval_one(x):
         out = {}
-        problem._evaluate(X[k], out)
-        F_list.append(out["F"])
-        if verbose and (k + 1) % 25 == 0:
-            print(f"  Warm-up ref point evaluation: {k + 1}/{X.shape[0]}")
+        problem._evaluate(x, out)
+        return out["F"]
+
+    if n_jobs != 1:
+        # scipy.ndimage.convolve releases the GIL, so threads genuinely run in
+        # parallel without pickling overhead. n_jobs=-1/None => use all cores.
+        from concurrent.futures import ThreadPoolExecutor
+        n_workers = None if n_jobs in (-1, None) else n_jobs
+        if verbose:
+            print(f"  Warm-up ref point: evaluating {X.shape[0]} samples with {n_workers or 'all'} threads...")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            F_list = list(executor.map(_eval_one, [X[k] for k in range(X.shape[0])]))
+    else:
+        if verbose:
+            print(f"  Warm-up ref point: evaluating {X.shape[0]} samples sequentially...")
+        F_list = []
+        for k in range(X.shape[0]):
+            F_list.append(_eval_one(X[k]))
+            if verbose and (k + 1) % 10 == 0:
+                print(f"    {k + 1}/{X.shape[0]} done")
 
     Fw = np.asarray(F_list, dtype=float)
 
@@ -845,7 +860,7 @@ class HVCallback:
     is observed for a specified number of generations.
     """
     
-    def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None):
+    def __init__(self, patience=10, min_improvement=1e-6, verbose=True, ref_point=None):
         """
         Initialize hypervolume callback.
         
@@ -984,7 +999,7 @@ class ProgressCallback:
     """
 
     def __init__(self, verbose=True, n_generations=100,
-                 hv_patience=15, hv_min_improvement=1e-6, ref_point=None,
+                 hv_patience=10, hv_min_improvement=1e-6, ref_point=None,
                  save_snapshots=False, snapshot_dir=None):
         """
         Args:
@@ -1108,7 +1123,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             for obj in ["abiotic", "biotic", "cost"]
         ], axis=0)  # shape (3, n_patches)
 
-        repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=8)
+        repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=12)
 
         sampling = PatchAwareSampling(
             patch_mappings=initial_conditions['patch_mappings'],
@@ -1159,7 +1174,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
     return sampling, repair
 
 
-def _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_partitions=8):
+def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8):
     """
     Construct the NSGA-III algorithm and generation-based termination criterion.
 
@@ -1168,9 +1183,8 @@ def _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_parti
     selection pressure in 3-objective space where NSGA-II degenerates because
     nearly all solutions end up on rank 0.
 
-    With n_partitions=8 and 3 objectives, 45 reference directions are generated.
-    pop_size is ignored — NSGA-III sets population size equal to the number of
-    reference directions (45 in the default case).
+    With n_partitions=12 and 3 objectives, 45 reference directions are generated. NSGA-III sets population size equal to the number of
+    reference directions
 
     Returns
     -------
@@ -1183,7 +1197,7 @@ def _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_parti
         ref_dirs=ref_dirs,
         sampling=sampling,
         crossover=HUX(),
-        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=100.0 / problem.n_var),
+        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=200.0 / problem.n_var),
         repair=repair,
     )
     termination = get_termination("n_gen", n_generations)
@@ -1392,7 +1406,7 @@ def _print_failure_diagnostics(result, problem, initial_conditions):
 
 def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      n_generations=100, save_results=True, verbose=True,
-                                     skip_diagnostics=False, hv_patience=15,
+                                     skip_diagnostics=False, hv_patience=10,
                                      hv_min_improvement=1e-6, n_jobs=None, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
@@ -1498,10 +1512,11 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     fixed_ref = build_fixed_ref_point(
         problem=problem, sampling=sampling,
         n_samples=hv_warmup_samples, margin=0.05, seed=42, verbose=verbose,
+        n_jobs=n_jobs,
     )
 
     # --- 7. Build algorithm ---
-    algorithm, termination = _build_algorithm(problem, sampling, repair, pop_size, n_generations, n_partitions)
+    algorithm, termination = _build_algorithm(problem, sampling, repair, n_generations, n_partitions)
 
     # --- 8. Initial sampling quality check (patch mode only) ---
     if use_patch_approach and verbose:

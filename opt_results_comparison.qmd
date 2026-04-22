@@ -1,0 +1,757 @@
+---
+title: "Optimisation Results Overview"
+author: "inthomas@ethz.ch"
+date: "`r Sys.Date()`"
+bibliography: rest_moo_paper.bib
+format:
+  html:
+    embed-resources: true
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: false
+    fig-width: 12
+    fig-height: 6
+    lightbox: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+editor: visual
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+pkgs <- c("jsonlite", "dplyr", "tidyr", "ggplot2", "gridExtra", "patchwork", "plotly",
+            "scales", "viridis", "grid", "sf", "terra", "hexbin")
+
+missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+theme_set(
+  theme_minimal() +
+    theme(
+      plot.title   = element_text(size = 13, face = "bold"),
+      plot.subtitle = element_text(size = 11, colour = "grey40"),
+      legend.position = "right"
+    )
+)
+
+# Spatial map theme (no axes, grey background for non-selected area)
+theme_sp <- theme_void() +
+  theme(
+    panel.background = element_rect(fill = "#e6e6e6", colour = NA),
+    plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
+    legend.position  = "right"
+  )
+
+source("_plot_functions.R")
+```
+
+```{r}
+#| label: config
+
+# ── User configuration ─────────────────────────────────────────────────────
+# Set the two export_to_r.py output directories and display labels here.
+# All other parameters are derived automatically from metadata.json.
+
+RUN_DIR_A  <- "r_inputs/mut200_notseeded_p12_update"          # ← replace with your directory
+RUN_DIR_B  <- "r_inputs/mut200_seeded_p12_update"          # ← replace with your directory
+LABEL_A    <- "Not-seeded"
+LABEL_B    <- "Seeded"
+
+ECOSYSTEM  <- "fg"                       # used in plot titles only
+OUTPUT_DIR <- "notebook_outputs"        # directory for saved figures
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Colours used consistently across Pareto / parallel-coords plots
+COL_ND   <- "#E05C2A"   # non-dominated solutions
+COL_DOM  <- "grey60"    # dominated solutions
+ALPHA_ND  <- 0.85
+ALPHA_DOM <- 0.15
+```
+
+```{r}
+#| label: load-data
+
+# ── Helper: load all CSV/JSON exports from one run directory ────────────────
+load_run_data <- function(dir_path, label) {
+  dir_path <- normalizePath(dir_path, mustWork = TRUE)
+
+  meta     <- jsonlite::read_json(file.path(dir_path, "metadata.json"))
+  df_obj   <- read.csv(file.path(dir_path, "objectives.csv"))
+
+  norm_path <- file.path(dir_path, "objectives_normalized.csv")
+  df_norm   <- if (file.exists(norm_path)) read.csv(norm_path) else NULL
+
+  hv_path  <- file.path(dir_path, "hypervolume_evolution.csv")
+  df_hv    <- if (file.exists(hv_path)) read.csv(hv_path) else NULL
+
+  pop_path <- file.path(dir_path, "population_stats.csv")
+  df_pop   <- if (file.exists(pop_path)) read.csv(pop_path) else NULL
+
+  psel_path  <- file.path(dir_path, "pixel_selection.csv")
+  df_psel    <- if (file.exists(psel_path)) read.csv(psel_path) else NULL
+
+  elig_path  <- file.path(dir_path, "eligible_pixels.csv")
+  df_elig    <- if (file.exists(elig_path)) read.csv(elig_path) else NULL
+
+  obj_names     <- unlist(meta$objective_names)
+  raster_shape  <- unlist(meta$raster_info$shape)   # c(nrows, ncols)
+
+  # Objective normalisation scales (for annotation, not applied here)
+  norm_scales <- tryCatch(
+    unlist(meta$algorithm$objective_normalization$scales),
+    error = function(e) NULL
+  )
+
+  list(
+    label        = label,
+    dir          = dir_path,
+    meta         = meta,
+    obj_names    = obj_names,
+    n_obj        = length(obj_names),
+    n_solutions  = meta$n_solutions,
+    n_nondom     = meta$n_nondominated_solutions,
+    raster_shape = raster_shape,
+    norm_scales  = norm_scales,
+    df_obj       = df_obj,
+    df_norm      = df_norm,
+    df_hv        = df_hv,
+    df_pop       = df_pop,
+    df_psel      = df_psel,
+    df_elig      = df_elig
+  )
+}
+
+run_a <- load_run_data(RUN_DIR_A, LABEL_A)
+run_b <- load_run_data(RUN_DIR_B, LABEL_B)
+run_main <- run_b  # primary run displayed in Part 1 (single-run sections)
+
+# Use run_a's objective names as canonical; warn if they differ
+obj_names <- run_a$obj_names
+if (!identical(obj_names, run_b$obj_names)) {
+  warning("Objective names differ between runs. Using Run A names throughout.")
+}
+
+obj_labels <- gsub("_", " ", obj_names) %>% tools::toTitleCase()
+
+#other data
+lulc <- rast("Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif")
+
+BE <- st_read("Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_KANTONSGEBIET.shp", quiet = TRUE)
+BE <- BE %>% filter(NAME== "Bern")
+
+abiotic_anomaly <- rast("./inputs/abiotic_condition_anomaly.tif")
+biotic_anomaly <- rast("./inputs/biotic_condition_anomaly.tif")
+implementation_cost <- rast("./inputs/implementation_cost.tif")
+
+```
+
+# Conceptual overview of workflow
+
+![](figs/workflow_feb.jpg){fig-cap="Workflow overview"}
+
+------------------------------------------------------------------------
+
+{{< include _restmoo_methods.qmd >}}
+
+------------------------------------------------------------------------
+
+# Initial state
+
+```{r}
+
+files <- c(
+  Abiotic_Anomaly = "inputs/abiotic_condition_anomaly.tif",
+  Biotic_Anomaly = "inputs/biotic_condition_anomaly.tif",
+  Landscape_Anomaly = "inputs/landscape_condition_anomaly.tif",
+  Implementation_Cost = "inputs/implementation_cost.tif"
+)
+
+rasters <- lapply(files[file.exists(files)], rast)
+if (length(rasters) == 0) stop("No raster files found.")
+if (length(rasters) < length(files)) message("Some raster files are missing.")
+
+lulc <- rast("W:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif") |>
+  crop(rasters[[1]])
+names(lulc) <- "layer"
+
+r <- c(rasters, list(layer = lulc)) %>% rast()
+
+allowed_layers <- c(12, 13, 16, 17) 
+
+df <- as.data.frame(r, xy = TRUE) %>%
+  drop_na() %>%
+  filter(layer %in% allowed_layers) %>%
+  pivot_longer(
+    cols = c(Abiotic_Anomaly, Biotic_Anomaly, Landscape_Anomaly, Implementation_Cost),
+    names_to = "Objective",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Objective = recode(
+      Objective,
+      Abiotic_Anomaly = "Abiotic anomaly",
+      Biotic_Anomaly = "Biotic anomaly",
+      Landscape_Anomaly = "Landscape anomaly",
+      Implementation_Cost = "Implementation cost"
+    )
+  )
+
+ggplot(df, aes(x = x, y = y, fill = Value)) +
+  geom_raster() +
+  scale_fill_viridis_c(name = "Value") +
+  facet_wrap(~Objective, ncol = 2) +
+  coord_equal() +
+  theme_sp
+
+```
+
+# Results
+
+```{r}
+#| label: run-stats
+cat(sprintf("Run A: %s - initial population randomly selected (%d solutions, %d non-dominated)\n",
+            run_a$label, run_a$n_solutions, run_a$n_nondom))
+cat(sprintf("Run B: %s - initial population receives 3 extreme solutions (%d solutions, %d non-dominated)\n",
+            run_b$label, run_b$n_solutions, run_b$n_nondom))
+cat(sprintf("Objectives: %s\n", paste(obj_names, collapse = ", ")))
+```
+
+## Algorithm performance and convergence
+
+#### Hypervolume indicator & objective value per generation
+
+::: {.panel-tabset}
+
+##### `r LABEL_A`
+
+```{r}
+#| label: run-a-hv-evo
+make_hv_evo_plot(run_a, obj_names, obj_labels)
+```
+
+##### `r LABEL_B`
+
+```{r}
+#| label: run-b-hv-evo
+make_hv_evo_plot(run_b, obj_names, obj_labels)
+```
+
+:::
+
+## Pareto front and tradeoffs
+
+#### Pareto front
+
+::: {.panel-tabset}
+
+##### `r LABEL_A`
+
+```{r}
+#| label: run-a-pareto-extremes
+#| fig-height: 5
+make_pareto_extremes_plot(run_a, obj_names, obj_labels)
+```
+
+##### `r LABEL_B`
+
+```{r}
+#| label: run-b-pareto-extremes
+#| fig-height: 5
+make_pareto_extremes_plot(run_b, obj_names, obj_labels)
+```
+
+:::
+
+#### Trade-offs between objectives
+
+::: {.panel-tabset}
+
+##### `r LABEL_A`
+
+```{r}
+#| label: run-a-pareto-pairwise
+#| fig-height: 6
+#| fig-width: 12
+make_pareto_pairwise(run_a, obj_names, obj_labels)
+```
+
+##### `r LABEL_B`
+
+```{r}
+#| label: run-b-pareto-pairwise
+#| fig-height: 6
+#| fig-width: 12
+make_pareto_pairwise(run_b, obj_names, obj_labels)
+```
+
+:::
+
+#### Objective correlations
+
+::: {.panel-tabset}
+
+##### `r LABEL_A`
+
+```{r}
+#| label: run-a-corr
+#| fig-height: 4
+#| fig-width: 8
+make_corr_plot(run_a, obj_names, obj_labels)
+```
+
+##### `r LABEL_B`
+
+```{r}
+#| label: run-b-corr
+#| fig-height: 4
+#| fig-width: 8
+make_corr_plot(run_b, obj_names, obj_labels)
+```
+
+:::
+
+#### Parallel Coordinates
+
+::: {.panel-tabset}
+
+##### `r LABEL_A`
+
+```{r}
+#| label: run-a-parcoord
+#| fig-height: 5
+make_parcoord_plot(run_a, obj_names, obj_labels)
+```
+
+##### `r LABEL_B`
+
+```{r}
+#| label: run-b-parcoord
+#| fig-height: 5
+make_parcoord_plot(run_b, obj_names, obj_labels)
+```
+
+:::
+
+## Do trade-offs exist in space?
+
+Pairwise spatial similarity (Jaccard index) between non-dominated solutions, plotted against Euclidean distance in normalised objective space.
+
+Negative relationship = solutions with lower spatial overlap correspond to greater differences in objective performance, indicating that trade-offs in the Pareto set are driven by distinct spatial configurations.
+
+::: {.panel-tabset}
+
+### `r LABEL_A`
+
+```{r}
+#| label: run-a-jaccard
+#| fig-height: 4
+#| fig-width: 6
+make_jaccard_plot(run_a, obj_names)
+```
+
+### `r LABEL_B`
+
+```{r}
+#| label: run-b-jaccard
+#| fig-height: 4
+#| fig-width: 6
+make_jaccard_plot(run_b, obj_names)
+```
+
+:::
+
+## Spatial distribution of selected areas
+
+Relative frequency of occurrence in the Pareto front (RFOP): how often each pixel appears across the non-dominated solutions. Coloured pixels were selected in ≥ 1 solution. Grey underlay indicates pixels that were eligible for selection but never selected in any non-dominated solution.
+
+::: {.panel-tabset}
+
+### `r LABEL_A`
+
+::: {.panel-tabset}
+
+#### Raster
+
+```{r}
+#| label: run-a-sel-freq-raster
+#| fig-height: 8
+make_sel_freq_plot(run_a)
+```
+
+#### Hex
+
+```{r}
+#| label: run-a-sel-freq-hex
+#| fig-height: 8
+make_sel_freq_plot_agg_hex(run_a, bins = 30)
+```
+
+:::
+
+### `r LABEL_B`
+
+::: {.panel-tabset}
+
+#### Raster
+
+```{r}
+#| label: run-b-sel-freq-raster
+#| fig-height: 8
+make_sel_freq_plot(run_b)
+```
+
+#### Hex
+
+```{r}
+#| label: run-b-sel-freq-hex
+#| fig-height: 8
+make_sel_freq_plot_agg_hex(run_b, bins = 30)
+```
+
+:::
+
+:::
+
+## Characteristics of selected pixels
+
+::: {.panel-tabset}
+
+### `r LABEL_A`
+
+::: {.panel-tabset}
+
+#### LULC
+
+```{r}
+#| label: run-a-sel-freq-lulc
+#| fig-height: 5
+make_sel_freq_unified_plot(run_a,
+  fill_values = rfop_fill_lulc(run_a, lulc),
+  fill_label  = "LULC Class",
+  subtitle    = "Coloured by Land Use/Land Cover type")
+```
+
+#### Baseline objective values
+
+```{r}
+#| label: run-a-sel-freq-baseline
+#| fig-height: 5
+make_sel_freq_unified_plot(run_a,
+  fill_values = rfop_fill_objective(run_a, abiotic_anomaly),
+  fill_label  = "Abiotic anomaly (quintile)",
+  subtitle    = "Coloured by baseline abiotic condition")
+```
+
+:::
+
+### `r LABEL_B`
+
+::: {.panel-tabset}
+
+#### LULC
+
+```{r}
+#| label: run-b-sel-freq-lulc
+#| fig-height: 5
+make_sel_freq_unified_plot(run_b,
+  fill_values = rfop_fill_lulc(run_b, lulc),
+  fill_label  = "LULC Class",
+  subtitle    = "Coloured by Land Use/Land Cover type")
+```
+
+#### Baseline objective values
+
+```{r}
+#| label: run-b-sel-freq-baseline
+#| fig-height: 5
+make_sel_freq_unified_plot(run_b,
+  fill_values = rfop_fill_objective(run_b, abiotic_anomaly),
+  fill_label  = "Abiotic anomaly (quintile)",
+  subtitle    = "Coloured by baseline abiotic condition")
+```
+
+:::
+
+:::
+
+
+# Effect of seeding on optimisation outcomes
+
+Comparing the effect of seeding with 3 extreme solutions.
+
+```{r}
+#| label: comparison stats
+cat(sprintf("Run A: %s  (%d solutions, %d non-dominated)\n",
+            LABEL_A, run_a$n_solutions, run_a$n_nondom))
+cat(sprintf("Run B: %s  (%d solutions, %d non-dominated)\n",
+            LABEL_B, run_b$n_solutions, run_b$n_nondom))
+```
+
+#### a) Convergence: does seeding accelerate convergence?
+
+Without seeding, the algorithm converges earlier. With seeding, it reaches a higher hypervolume, and shows slightly faster improvement from generations 2 - 6
+
+```{r}
+#| label: compare-hv
+#| fig-height: 4
+
+compare_hv_plot <- function(run_a, run_b) {
+  if (is.null(run_a$df_hv) && is.null(run_b$df_hv)) {
+    cat("hypervolume_evolution.csv not available for either run.\n")
+    return(invisible(NULL))
+  }
+  hv_df <- bind_rows(
+    if (!is.null(run_a$df_hv)) mutate(run_a$df_hv, run = run_a$label) else NULL,
+    if (!is.null(run_b$df_hv)) mutate(run_b$df_hv, run = run_b$label) else NULL
+  ) %>% mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
+
+  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
+
+  hv_a  <- if (!is.null(run_a$df_hv)) tail(run_a$df_hv$hypervolume, 1) else NA_real_
+  hv_b  <- if (!is.null(run_b$df_hv)) tail(run_b$df_hv$hypervolume, 1) else NA_real_
+  ratio <- if (!is.na(hv_a) && hv_a != 0) hv_b / hv_a else NA_real_
+
+  sub_txt <- sprintf(
+    "Final HV: %s = %.4g | %s = %.4g | ratio B/A = %.3f",
+    run_a$label, hv_a, run_b$label, hv_b,
+    if (!is.na(ratio)) ratio else NaN
+  )
+
+  ggplot(hv_df, aes(x = generation, y = hypervolume, colour = run)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.2, alpha = 0.6) +
+    scale_colour_manual(values = run_cols, name = "Run") +
+    scale_y_continuous(labels = scales::scientific) +
+    labs(
+      subtitle = sub_txt,
+      x = "Generation", y = "Hypervolume"
+    )
+}
+
+compare_hv_plot(run_a, run_b)
+```
+
+#### b) Pareto quality: does seeding improve the Pareto front?
+
+Non-dominated solutions from both runs plotted together.
+
+```{r}
+#| label: compare-pareto
+#| fig-height: 4
+
+compare_pareto_overlay <- function(run_a, run_b, obj_names, obj_labels) {
+  k <- length(obj_names)
+  if (k < 2) { cat("Need >= 2 objectives.\n"); return(invisible(NULL)) }
+
+  nd_a <- run_a$df_obj[run_a$df_obj$is_nondominated == 1, ] %>% mutate(run = run_a$label)
+  nd_b <- run_b$df_obj[run_b$df_obj$is_nondominated == 1, ] %>% mutate(run = run_b$label)
+  df   <- bind_rows(nd_a, nd_b) %>%
+    mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
+
+  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
+  pairs    <- combn(k, 2, simplify = FALSE)
+
+  plots <- lapply(pairs, function(p) {
+    xi <- obj_names[p[1]]; yi <- obj_names[p[2]]
+    xl <- obj_labels[p[1]]; yl <- obj_labels[p[2]]
+    ggplot(df, aes(x = .data[[xi]], y = .data[[yi]], colour = run)) +
+      geom_point(size = 2.5, alpha = 0.7) +
+      scale_colour_manual(values = run_cols, name = "Run") +
+      labs(x = xl, y = yl)
+  })
+
+  wrap_plots(plots, ncol = length(plots), guides = "collect") +
+    plot_annotation(
+      title    = sprintf("Pareto Front Overlay \u2014 %s", toupper(ECOSYSTEM)),
+      subtitle = sprintf("%d ND (%s)  +  %d ND (%s)",
+                         run_a$n_nondom, run_a$label,
+                         run_b$n_nondom, run_b$label),
+      theme = theme(plot.title    = element_text(size = 13, face = "bold"),
+                    plot.subtitle = element_text(size = 11, colour = "grey40"))
+    )
+}
+
+compare_pareto_overlay(run_a, run_b, obj_names, obj_labels)
+```
+ 
+The C-metric table below quantifies mutual domination. Seeded run outperformed the not-seeded run in terms of dominance.
+
+```{r}
+#| label: coverage-table
+
+# C(B, A): proportion of run_a's ND front dominated by at least one solution in run_b
+coverage_stats <- function(run_a, run_b, obj_names) {
+  nd_a <- as.matrix(run_a$df_obj[run_a$df_obj$is_nondominated == 1, obj_names])
+  nd_b <- as.matrix(run_b$df_obj[run_b$df_obj$is_nondominated == 1, obj_names])
+
+  dom_by_b <- mean(apply(nd_a, 1, function(a)
+    any(apply(nd_b, 1, function(b) all(b <= a) && any(b < a)))))
+  dom_by_a <- mean(apply(nd_b, 1, function(b)
+    any(apply(nd_a, 1, function(a) all(a <= b) && any(a < b)))))
+
+  hv_a <- if (!is.null(run_a$df_hv)) tail(run_a$df_hv$hypervolume, 1) else NA_real_
+  hv_b <- if (!is.null(run_b$df_hv)) tail(run_b$df_hv$hypervolume, 1) else NA_real_
+
+  # Generational Distance (GD): mean distance from each run's ND front to the
+  # combined reference front (union of both ND sets, re-filtered for dominance).
+  # GD(A) < GD(B) means run A's front is closer to the combined best-known front.
+  combined <- rbind(nd_a, nd_b)
+  # Keep only non-dominated rows of the combined set
+  is_nd_combined <- !apply(combined, 1, function(p)
+    any(apply(combined, 1, function(q) all(q <= p) && any(q < p))))
+  ref <- combined[is_nd_combined, , drop = FALSE]
+
+  gd <- function(approx, reference) {
+    mean(apply(approx, 1, function(p)
+      sqrt(min(colSums((t(reference) - p)^2)))))
+  }
+
+  gd_a <- gd(nd_a, ref)
+  gd_b <- gd(nd_b, ref)
+
+  tibble::tibble(
+    Metric = c(
+      sprintf("C(B\u2192A): %% of %s solutions dominated by %s", run_a$label, run_b$label),
+      sprintf("C(A\u2192B): %% of %s solutions dominated by %s", run_b$label, run_a$label),
+      sprintf("GD (%s): mean dist to combined reference front", run_a$label),
+      sprintf("GD (%s): mean dist to combined reference front", run_b$label)
+    ),
+    Value = c(
+      sprintf("%.1f%%", dom_by_b * 100),
+      sprintf("%.1f%%", dom_by_a * 100),
+      sprintf("%.4g", gd_a),
+      sprintf("%.4g", gd_b)
+    )
+  )
+}
+
+knitr::kable(coverage_stats(run_a, run_b, obj_names),
+             caption = "C-metric and Generational Distance comparison between runs")
+```
+
+#### c) Bias: does seeding shift which part of objective space is explored?
+
+All solutions from both runs for each pair of objectives (colour = run). A systematic positional shift or difference in cloud shape indicates seeding biases the search towards a different region of objective space.
+
+```{r}
+#| label: compare-pairwise
+#| fig-height: 5
+
+compare_pairwise_scatter <- function(run_a, run_b, obj_names, obj_labels) {
+  k <- length(obj_names)
+  if (k < 2) { cat("Need at least 2 objectives.\n"); return(invisible(NULL)) }
+
+  df <- bind_rows(
+    run_a$df_obj %>% select(all_of(obj_names)) %>% mutate(run = run_a$label),
+    run_b$df_obj %>% select(all_of(obj_names)) %>% mutate(run = run_b$label)
+  ) %>% mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
+
+  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
+  pairs    <- combn(k, 2, simplify = FALSE)
+
+  plots <- lapply(seq_along(pairs), function(pi) {
+    p  <- pairs[[pi]]
+    xi <- obj_names[p[1]]; yi <- obj_names[p[2]]
+    xl <- obj_labels[p[1]]; yl <- obj_labels[p[2]]
+    ggplot(df, aes(x = .data[[xi]], y = .data[[yi]], colour = run)) +
+      geom_point(size = 1.5, alpha = 0.35) +
+      scale_colour_manual(values = run_cols, name = "Run") +
+      labs(x = xl, y = yl) +
+      theme(legend.position = if (pi == 1) "top" else "none",
+            axis.title = element_text(size = 9))
+  })
+
+  do.call(gridExtra::grid.arrange,
+          c(plots, list(ncol = min(3L, length(plots)),
+                        top  = textGrob(
+                          sprintf("Pairwise Objective Scatter \u2014 %s", toupper(ECOSYSTEM)),
+                          gp = gpar(fontsize = 13, fontface = "bold")))))
+}
+
+compare_pairwise_scatter(run_a, run_b, obj_names, obj_labels)
+```
+
+#### d) Spatial robustness: does seeding change which pixels are selected?
+
+Pairwise Jaccard similarity of pixel selections across three groups: within run A's Pareto front, within run B's Pareto front, and cross-run (one solution from each front). If the cross-run distribution resembles within-run distributions, seeding does not substantially alter which pixels are chosen.
+
+```{r}
+#| label: compare-spatial
+#| fig-height: 4
+
+compute_cross_jaccard <- function(run_a, run_b) {
+  if (is.null(run_a$df_psel) || is.null(run_b$df_psel)) {
+    message("pixel_selection.csv not available for one or both runs.")
+    return(NULL)
+  }
+
+  make_pixel_sets <- function(run) {
+    psel   <- run$df_psel
+    has_xy <- all(c("x", "y") %in% names(psel))
+    psel   <- psel %>% mutate(
+      pkey = if (has_xy) paste(round(x, 1), round(y, 1), sep = "_")
+             else paste(pixel_row, pixel_col, sep = "_")
+    )
+    split(psel$pkey, psel$solution_id)
+  }
+
+  sets_a <- make_pixel_sets(run_a)
+  sets_b <- make_pixel_sets(run_b)
+  if (length(sets_a) == 0 || length(sets_b) == 0) return(NULL)
+
+  rows <- lapply(names(sets_a), function(i)
+    lapply(names(sets_b), function(j) {
+      s1    <- sets_a[[i]]; s2 <- sets_b[[j]]
+      inter <- length(intersect(s1, s2))
+      uni   <- length(union(s1, s2))
+      data.frame(jaccard = if (uni == 0) 0 else inter / uni,
+                 type    = sprintf("Cross (%s \u00d7 %s)", run_a$label, run_b$label))
+    })
+  )
+  bind_rows(unlist(rows, recursive = FALSE))
+}
+
+plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
+  jac_a <- compute_jaccard_pairs(run_a, obj_names)
+  jac_b <- compute_jaccard_pairs(run_b, obj_names)
+  jac_x <- compute_cross_jaccard(run_a, run_b)
+
+  parts <- Filter(Negate(is.null), list(
+    if (!is.null(jac_a) && nrow(jac_a) > 0)
+      data.frame(jaccard = jac_a$jaccard_similarity,
+                 type    = sprintf("Within %s", run_a$label)),
+    if (!is.null(jac_b) && nrow(jac_b) > 0)
+      data.frame(jaccard = jac_b$jaccard_similarity,
+                 type    = sprintf("Within %s", run_b$label)),
+    if (!is.null(jac_x) && nrow(jac_x) > 0) jac_x
+  ))
+
+  if (length(parts) == 0) { cat("Jaccard data not available.\n"); return(invisible(NULL)) }
+
+  df_all <- bind_rows(parts) %>%
+    mutate(type = factor(type, levels = unique(type)))
+
+  ggplot(df_all, aes(x = type, y = jaccard, fill = type)) +
+    geom_violin(trim = FALSE, alpha = 0.45, colour = NA) +
+    geom_boxplot(width = 0.15, outlier.size = 0.8, fill = "white") +
+    scale_fill_manual(values = c("#E05C2A", "steelblue", "grey50"), guide = "none") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       limits = c(0, 1)) +
+    labs(
+      title    = sprintf("Spatial Similarity (Jaccard) \u2014 %s", toupper(ECOSYSTEM)),
+      subtitle = "Pairwise Jaccard within each run's Pareto front and across runs",
+      x = NULL, y = "Jaccard similarity"
+    )
+}
+
+plot_jaccard_comparison(run_a, run_b, obj_names)
+```

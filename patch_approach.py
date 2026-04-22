@@ -399,7 +399,8 @@ class PatchAwareSampling(Sampling):
     """Sampling that creates initial solutions near target pixel count."""
     
     def __init__(self, patch_mappings, target_pixels, pixel_tolerance=0.05,
-                 patch_scores=None, score_temperature=0.25, random_share=0.15):
+                 patch_scores=None, score_temperature=0.25, random_share=0.15,
+                 per_objective_patch_scores=None):
         super().__init__()
         self.patch_mappings = patch_mappings
         self.target_pixels = target_pixels
@@ -407,7 +408,13 @@ class PatchAwareSampling(Sampling):
         self.patch_scores = patch_scores
         self.score_temperature = float(score_temperature)
         self.random_share = float(np.clip(random_share, 0.0, 1.0))
-        
+        # per_objective_patch_scores: shape (n_obj, n_patches) — seeds one extreme
+        # solution per objective into the initial population (warm start).
+        self.per_objective_patch_scores = (
+            np.asarray(per_objective_patch_scores, dtype=np.float64)
+            if per_objective_patch_scores is not None else None
+        )
+
         # Precompute pixels per patch for both restoration and conversion
         restoration_patches = patch_mappings['restoration_patches']
         conversion_patches = patch_mappings['conversion_patches']
@@ -449,21 +456,52 @@ class PatchAwareSampling(Sampling):
             return np.array([], dtype=np.float64)
 
         return np.clip(self._base_weights[candidates], 1e-12, None)
-        
+
+    def _build_extreme_solution(self, score_vec, all_pixels, n_patches):
+        """Greedily fill budget in descending score order up to target_max.
+
+        Returns a binary int array of shape (n_patches,) satisfying the same
+        pixel-count tolerance as normal repair.
+        """
+        target_max = int(self.target_pixels * (1 + self.pixel_tolerance))
+        order = np.argsort(-score_vec)
+        active = np.zeros(n_patches, dtype=int)
+        current = 0
+        for idx in order:
+            patch_pix = int(all_pixels[idx])
+            if patch_pix <= 0:
+                continue
+            if current + patch_pix > target_max:
+                continue
+            active[idx] = 1
+            current += patch_pix
+        return active
+
     def _do(self, problem, n_samples, **kwargs):
         """Generate solutions targeting center of tolerance range."""
         n_patches = self.n_restoration_patches + self.n_conversion_patches
         X = np.zeros((n_samples, n_patches), dtype=int)
-        
+
         # Combine all patch pixel counts
         all_pixels = np.concatenate([self.restoration_pixels_per_patch,
                                      self.conversion_pixels_per_patch])
-        
+
         target_center = self.target_pixels
         target_min = int(self.target_pixels * (1 - self.pixel_tolerance))
         target_max = int(self.target_pixels * (1 + self.pixel_tolerance))
-        
-        for i in range(n_samples):
+
+        # --- Warm seeding: place one extreme solution per objective at the end ---
+        # Only seed when there are enough slots for at least one stochastic solution.
+        n_extreme = 0
+        if (self.per_objective_patch_scores is not None
+                and n_samples > self.per_objective_patch_scores.shape[0]):
+            n_extreme = self.per_objective_patch_scores.shape[0]  # typically 3
+            for k in range(n_extreme):
+                X[n_samples - n_extreme + k] = self._build_extreme_solution(
+                    self.per_objective_patch_scores[k], all_pixels, n_patches
+                )
+
+        for i in range(n_samples - n_extreme):
             # Score-guided stochastic construction to preserve diversity.
             active = np.zeros(n_patches, dtype=bool)
             current = 0
@@ -510,9 +548,10 @@ class PatchAwareSampling(Sampling):
 class PatchRepair(Repair):
     """Repair operator enforcing patch_count or pixel_count constraints."""
     
-    def __init__(self, constraint_type='pixel_count', target_value=None, 
+    def __init__(self, constraint_type='pixel_count', target_value=None,
                  patch_mappings=None, pixel_tolerance=0.05,
-                 patch_scores=None, score_temperature=0.2, top_k=12):
+                 patch_scores=None, score_temperature=0.5, top_k=12,
+                 per_objective_patch_scores=None, ref_dirs=None):
         super().__init__()
         self.constraint_type = constraint_type
         self.target_value = target_value
@@ -521,11 +560,23 @@ class PatchRepair(Repair):
         self.patch_scores = patch_scores
         self.score_temperature = float(score_temperature)
         self.top_k = int(max(2, top_k))
-        
+        # per_objective_patch_scores: shape (n_obj, n_patches), one row per objective
+        # (order: abiotic, biotic, cost).  ref_dirs: shape (n_ref_dirs, n_obj).
+        # When both are provided, repair blends the objective rows using the
+        # reference-direction weights assigned to each individual by NSGA-III.
+        self.per_objective_patch_scores = (
+            np.asarray(per_objective_patch_scores, dtype=np.float64)
+            if per_objective_patch_scores is not None else None
+        )
+        self.ref_dirs = (
+            np.asarray(ref_dirs, dtype=np.float64)
+            if ref_dirs is not None else None
+        )
+
         # Precompute pixels per patch for efficiency
         if patch_mappings is not None:
             self.restoration_patch_pixel_counts = {
-                pid: len(pixels) 
+                pid: len(pixels)
                 for pid, pixels in patch_mappings['restoration_patches']['patch_to_pixels'].items()
             }
             self.conversion_patch_pixel_counts = {
@@ -545,8 +596,41 @@ class PatchRepair(Repair):
         X_in = X.copy()  # snapshot before repair for bit-diff
         n_restoration_patches = problem.n_restoration_patches
 
+        # --- Direction-aware score blending ---
+        # Try to read per-individual niche (reference-direction) assignments.
+        # pymoo stores these as integer indices into self.ref_dirs after the
+        # first selection step; they are None at initialisation (generation 0).
+        niches = None
+        use_per_obj = (
+            self.per_objective_patch_scores is not None
+            and self.ref_dirs is not None
+        )
+        if use_per_obj:
+            try:
+                algorithm = kwargs.get('algorithm')
+                if algorithm is not None and hasattr(algorithm, 'pop') and algorithm.pop is not None:
+                    niches = algorithm.pop.get('niche')
+            except Exception:
+                niches = None
+
         # X is 2D array: (population_size, n_var)
         for i in range(len(X)):
+            # Compute per-individual score vector when niche info is available.
+            if use_per_obj and niches is not None:
+                try:
+                    niche_idx = int(niches[i % len(niches)])
+                    weights = self.ref_dirs[niche_idx]          # shape (n_obj,)
+                    blended = np.einsum('o,op->p', weights, self.per_objective_patch_scores)
+                    # Normalise to [0, 1] so temperature is comparable across directions.
+                    b_min, b_max = blended.min(), blended.max()
+                    if b_max - b_min > 1e-12:
+                        blended = (blended - b_min) / (b_max - b_min)
+                    score_vec_i = blended
+                except Exception:
+                    score_vec_i = None
+            else:
+                score_vec_i = None
+
             if self.constraint_type == 'patch_count':
                 X[i] = enforce_patch_count(X[i], self.target_value)
 
@@ -554,7 +638,8 @@ class PatchRepair(Repair):
                 X[i] = self._enforce_pixel_count(
                     X[i],
                     n_restoration_patches,
-                    self.target_value
+                    self.target_value,
+                    override_score_vec=score_vec_i,
                 )
 
         # Record bit-diff diagnostics
@@ -569,8 +654,16 @@ class PatchRepair(Repair):
 
         return X
     
-    def _enforce_pixel_count(self, patch_decisions, n_restoration_patches, target_pixels):
-        """Enforce pixel count by adding/removing patches within tolerance."""
+    def _enforce_pixel_count(self, patch_decisions, n_restoration_patches, target_pixels,
+                             override_score_vec=None):
+        """Enforce pixel count by adding/removing patches within tolerance.
+
+        Parameters
+        ----------
+        override_score_vec : np.ndarray or None
+            When provided, used instead of ``self.patch_scores``.  Allows the
+            caller (_do) to supply a per-individual blended score vector.
+        """
         result = patch_decisions.copy()
         min_pix = int(target_pixels * (1 - self.pixel_tolerance))
         max_pix = int(target_pixels * (1 + self.pixel_tolerance))
@@ -582,12 +675,14 @@ class PatchRepair(Repair):
         ])
 
         current = int(np.dot(result.astype(np.int64), all_patch_sizes))
-        
+
         if min_pix <= current <= max_pix:
             return result
 
         score_vec = None
-        if self.patch_scores is not None and len(self.patch_scores) == len(result):
+        if override_score_vec is not None and len(override_score_vec) == len(result):
+            score_vec = np.asarray(override_score_vec, dtype=np.float64)
+        elif self.patch_scores is not None and len(self.patch_scores) == len(result):
             score_vec = np.asarray(self.patch_scores, dtype=np.float64)
 
         min_patch = max(int(np.min(all_patch_sizes[all_patch_sizes > 0])) if np.any(all_patch_sizes > 0) else 1, 1)

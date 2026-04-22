@@ -4,6 +4,7 @@ Custom single-scenario and multi-ecosystem run script.
 Edit the configuration variables below and run directly:
     python run_custom.py
 """
+import time
 from resto_anom import run_optimization_instance, main
 from data_loader import load_initial_conditions
 from logger_setup import setup_logger
@@ -18,7 +19,7 @@ ECOSYSTEM_TO_RUN = "fg"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "cost_corrected_noWS"
+RUN_LABEL = "mut200_seeded_p12_idw"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -43,7 +44,8 @@ N_GENERATIONS = 100
 N_JOBS = 12
 RANDOM_SEED = 42
 N_SAMPLES_PER_PARAM = 3
-WARM_SEEDING = False
+N_PARTITIONS = 12
+WARM_SEEDING = True
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
 custom_scenario_params = {
@@ -104,9 +106,12 @@ else:
     runs = [(ECOSYSTEM_TO_RUN, ECOSYSTEM_TO_RUN)]
 
 all_results = {}
+run_times = {}
+_script_start = time.perf_counter()
 
 for run_label, ecosystem_for_loader in runs:
     print(f"=== Starting optimisation for {run_label.upper()} ecosystem ===")
+    _run_start = time.perf_counter()
 
     try:
         if SCENARIO_MODE == "all":
@@ -152,6 +157,7 @@ for run_label, ecosystem_for_loader in runs:
                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                 pixel_tolerance=PIXEL_TOLERANCE,
                 save_snapshots=SAVE_SNAPSHOTS,
+                n_partitions=N_PARTITIONS,
                 warm_seeding=WARM_SEEDING,
                 run_label=RUN_LABEL,
                 run_config=run_config,
@@ -159,11 +165,14 @@ for run_label, ecosystem_for_loader in runs:
 
         if results is not None:
             all_results[run_label] = results
+            run_times[run_label] = time.perf_counter() - _run_start
             print(f"\n✓ {run_label.title()} optimisation completed successfully!")
         else:
+            run_times[run_label] = time.perf_counter() - _run_start
             print(f"\n✗ {run_label.title()} optimisation failed.")
 
     except Exception as e:
+        run_times[run_label] = time.perf_counter() - _run_start
         print(f"\n✗ Error optimising {run_label} ecosystem: {e}")
         continue
 
@@ -175,9 +184,14 @@ total_runs = len(runs)
 print(f"Successfully completed {successful_runs}/{total_runs} ecosystem optimisations:")
 for run_label, _ in runs:
     status = "✓ SUCCESS" if run_label in all_results else "✗ FAILED"
-    print(f"  {run_label.title():<12}: {status}")
+    elapsed = run_times.get(run_label)
+    time_str = f"  ({elapsed/60:.1f} min)" if elapsed is not None else ""
+    print(f"  {run_label.title():<12}: {status}{time_str}")
+
+_total_elapsed = time.perf_counter() - _script_start
+print(f"\nTotal wall-clock time: {_total_elapsed/60:.1f} min ({_total_elapsed:.0f} s)")
 
 if successful_runs > 0:
-    print(f"\n✓ Completed with outputs for {successful_runs} ecosystems.")
+    print(f"✓ Completed with outputs for {successful_runs} ecosystems.")
 else:
-    print("\n✗ No optimisations completed successfully.")
+    print("✗ No optimisations completed successfully.")
