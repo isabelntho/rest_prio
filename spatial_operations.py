@@ -72,6 +72,56 @@ def compute_sn_dens_array(lu, nodata, res, focal_classes, radius_m=300):
     dens = np.divide(sum_focal, n_valid, out=np.full_like(sum_focal, np.nan), where=(n_valid > 0))
     return dens
 
+
+def compute_connectivity_gain_array(lu, nodata, res, focal_classes, radius_m=100):
+    """
+    Precompute the per-pixel connectivity gain from converting each pixel to semi-natural habitat.
+
+    Connectivity at pixel i is defined as the *amount* of semi-natural (focal) habitat within
+    a circular neighbourhood of radius R — i.e. the raw count of focal pixels, not the
+    proportion.  Converting pixel j to semi-natural adds j to the focal set, so every pixel i
+    within R of j gains +1 in connectivity.  Summing that gain over all such i gives the total
+    connectivity gain attributable to converting j:
+
+        connectivity_gain[j] = sum_{i: dist(i,j) <= R} focal[i]
+                              = convolve(focal_mask, K)[j]
+
+    This means j gains more when there is already substantial focal habitat in its
+    neighbourhood — converting pixels that are embedded in the existing habitat matrix is
+    rewarded over converting isolated pixels surrounded by agriculture.
+
+    Note: the previous formulation used 1/n_valid(i) weighting, which normalised by kernel
+    size rather than habitat presence, yielding near-uniform gain across most pixels.  This
+    version makes gain depend on habitat amount, not kernel geometry.
+
+    Args:
+        lu: 2D numpy array of LULC codes
+        nodata: LULC nodata value (excluded from focal count)
+        res: Pixel resolution in metres
+        focal_classes: List of LULC codes considered semi-natural
+        radius_m: Neighbourhood radius in metres (default 100m = 1 pixel at 100m resolution)
+
+    Returns:
+        numpy.ndarray (float32): Per-pixel precomputed connectivity gain, same shape as lu.
+            Nodata pixels have value 0.0.
+    """
+    focal = np.where(np.isin(lu, focal_classes), 1.0, 0.0).astype(np.float32)
+    if nodata is not None:
+        focal[lu == nodata] = 0.0
+
+    radius_px = max(1, int(radius_m / res))
+    y, x = np.ogrid[-radius_px:radius_px + 1, -radius_px:radius_px + 1]
+    K = ((x ** 2 + y ** 2) <= radius_px ** 2).astype(np.float32)
+
+    gain = convolve(focal, K, mode="constant", cval=0.0).astype(np.float32)
+
+    # Zero out nodata pixels — they cannot be converted
+    if nodata is not None:
+        gain[lu == nodata] = 0.0
+
+    return gain
+
+
 # https://docs.scipy.org/doc/scipy/reference/ndimage.html may be faster
 
 # fclass = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
@@ -310,7 +360,10 @@ class AdaptiveSampling(Sampling):
             scenario_params = {}
         self.burden_sharing = scenario_params.get('burden_sharing', 'no') == 'yes'
         self.clustering_strength = scenario_params.get('spatial_clustering', 0.0)
-        self.enable_conversions = 'landscape_anomaly' in initial_conditions
+        self.enable_conversions = (
+            'landscape_anomaly' in initial_conditions
+            or 'connectivity_gain_1d' in initial_conditions
+        )
     
     def _do(self, problem, n_samples, **kwargs):
         n_decision_vars = problem.n_var  # n_restoration_pixels + n_conversion_pixels

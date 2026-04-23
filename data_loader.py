@@ -19,7 +19,7 @@ import numpy as np
 import tempfile
 import rasterio as rio
 import geopandas as gpd
-from spatial_operations import compute_sn_dens
+from spatial_operations import compute_sn_dens, compute_connectivity_gain_array
 
 logger = logging.getLogger("resto_prio")
 
@@ -383,13 +383,15 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     Returns:
         dict: Initial conditions for specified objectives and ecosystem
     """
-    # Define all possible objectives and their file mappings
+    # Define all possible objectives and their file mappings.
+    # A value of None means the objective is computed in-memory (no file required).
     all_objectives = {
         'abiotic': 'inputs/abiotic_condition_anomaly.tif',
         'biotic': 'inputs/biotic_condition_anomaly.tif', 
         #'abiotic': 'inputs/abiotic_idw.tif',
         #'biotic': 'inputs/biotic_idw.tif', 
         'landscape': 'inputs/sn_dens.tif',
+        'connectivity': None,  # Computed in-memory from landscape LULC; no file required
         'cost': 'inputs/implementation_cost_corrected.tif',
         'population_proximity': 'inputs/population_proximity.tif'
     }
@@ -402,10 +404,14 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     
     # Build file paths for selected objectives
     data_files = {}
+    computed_objectives = set()  # Objectives that are computed from other data, not loaded from file
     for obj in objectives:
         if obj in all_objectives:
             filename = all_objectives[obj]
-            if obj == 'cost':
+            if filename is None:
+                # Computed objective — no file to load; handled after LULC is loaded
+                computed_objectives.add(obj)
+            elif obj == 'cost':
                 data_files['implementation_cost'] = os.path.join(workspace_dir, filename)
             else:
                 data_files[f'{obj}_anomaly'] = os.path.join(workspace_dir, filename)
@@ -865,6 +871,31 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     initial_conditions['n_pixels'] = len(eligible_indices)  # For backward compatibility (restoration count)
     initial_conditions['n_restoration_pixels'] = len(restoration_eligible_indices)
     initial_conditions['n_conversion_pixels'] = len(conversion_eligible_indices)
+
+    # Compute connectivity_gain if requested.
+    # Done here — after conversion_eligible_indices is finalised — so the 1D slice aligns correctly.
+    if 'connectivity' in computed_objectives:
+        if 'landscape_lulc_data' in initial_conditions:
+            lulc_meta = initial_conditions['landscape_lulc_meta']
+            lulc_data = initial_conditions['landscape_lulc_data']
+            lulc_nodata = lulc_meta.get('nodata')
+            lulc_res = abs(lulc_meta['transform'][0])  # pixel size in metres
+            focal_classes_conn = initial_conditions.get(
+                'landscape_focal_classes',
+                FOCAL_CLASSES
+            )
+            logger.info("Computing per-pixel connectivity gain (radius=100m) …")
+            gain_2d = compute_connectivity_gain_array(
+                lulc_data, lulc_nodata, lulc_res, focal_classes_conn, radius_m=100
+            )
+            initial_conditions['connectivity_gain'] = gain_2d
+            # 1D slice indexed identically to x_convert (conversion-eligible pixels)
+            flat_gain = gain_2d.flatten()
+            initial_conditions['connectivity_gain_1d'] = flat_gain[conversion_eligible_indices]
+            logger.info(f"connectivity_gain computed: shape={gain_2d.shape}, "
+                        f"1d slice length={len(initial_conditions['connectivity_gain_1d'])}")
+        else:
+            logger.warning("'connectivity' objective requested but landscape_lulc_data not available; skipping.")
     
     initial_conditions['sample_info'] = {
         'sample_fraction': sample_fraction,

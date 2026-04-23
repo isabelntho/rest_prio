@@ -456,6 +456,121 @@ rfop_fill_objective <- function(run, obj_raster, n_breaks = 5,
 }
 
 
+# ── Action-type helpers (restore vs convert) ──────────────────────────────────
+
+# Stacked-bar chart: one bar per non-dominated solution, stacked by action_type.
+# Solutions are ordered by their value on `order_obj` (ascending = best first).
+# Requires df_psel to have an action_type column ("restore" / "convert").
+make_action_stacked_bar <- function(run, obj_names, obj_labels,
+                                    order_obj = NULL,
+                                    colours = c(restore = "#4DAF4A", convert = "#984EA3")) {
+  if (is.null(run$df_psel)) {
+    message("pixel_selection.csv not available – skipping action stacked bar.")
+    return(invisible(NULL))
+  }
+  if (!"action_type" %in% names(run$df_psel)) {
+    message("action_type column not found in pixel_selection.csv – re-run export_to_r.py.")
+    return(invisible(NULL))
+  }
+
+  # Count actions per solution × action_type (non-dominated solutions only)
+  nd_ids <- run$df_obj$solution_id[run$df_obj$is_nondominated == 1]
+  counts <- run$df_psel %>%
+    filter(solution_id %in% nd_ids) %>%
+    count(solution_id, action_type, name = "n_pixels")
+
+  # Order solutions by chosen objective (default: first in obj_names)
+  if (is.null(order_obj)) order_obj <- obj_names[1]
+  order_label <- obj_labels[match(order_obj, obj_names)]
+
+  obj_order <- run$df_obj %>%
+    filter(is_nondominated == 1) %>%
+    arrange(.data[[order_obj]]) %>%
+    mutate(sol_rank = row_number())
+
+  counts <- counts %>%
+    left_join(obj_order %>% select(solution_id, sol_rank), by = "solution_id") %>%
+    mutate(action_type = factor(action_type, levels = c("restore", "convert")))
+
+  ggplot(counts, aes(x = sol_rank, y = n_pixels, fill = action_type)) +
+    geom_col(width = 1, colour = NA) +
+    scale_fill_manual(values = colours, name = "Action type",
+                      labels = c(restore = "Restore", convert = "Convert")) +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(
+      title    = sprintf("Action mix per non-dominated solution — %s", run$label),
+      subtitle = sprintf("Solutions ordered by %s (ascending)", order_label),
+      x = sprintf("Solution rank (by %s, best → worst)", order_label),
+      y = "Number of pixels"
+    ) +
+    theme(legend.position = "top")
+}
+
+# Side-by-side spatial frequency maps split by action_type.
+# Returns a patchwork of two RFOP% maps (restore | convert).
+make_action_split_freq_plot <- function(run,
+                                        colours_restore = "YlGn",
+                                        colours_convert = "PuBuGn") {
+  if (is.null(run$df_psel)) {
+    message("pixel_selection.csv not available.")
+    return(invisible(NULL))
+  }
+  if (!"action_type" %in% names(run$df_psel)) {
+    message("action_type column not found in pixel_selection.csv – re-run export_to_r.py.")
+    return(invisible(NULL))
+  }
+  if (!all(c("x", "y") %in% names(run$df_psel))) {
+    message("x/y coordinates not found in pixel_selection.csv.")
+    return(invisible(NULL))
+  }
+
+  nd_ids  <- run$df_obj$solution_id[run$df_obj$is_nondominated == 1]
+  n_nd    <- length(nd_ids)
+  psel_nd <- run$df_psel %>% filter(solution_id %in% nd_ids)
+
+  make_one_map <- function(action, palette, title_suffix) {
+    freq_df <- psel_nd %>%
+      filter(action_type == action) %>%
+      count(x, y, name = "n_selected") %>%
+      mutate(rfop_pct = n_selected / n_nd * 100)
+
+    if (nrow(freq_df) == 0) return(ggplot() + labs(title = paste("No", action, "actions")))
+
+    # Canton outline
+    be_outline <- tryCatch(
+      st_coordinates(BE) %>% as.data.frame(),
+      error = function(e) NULL
+    )
+
+    p <- ggplot(freq_df, aes(x = x, y = y, colour = rfop_pct)) +
+      geom_point(size = 0.8, shape = 15) +
+      scale_colour_distiller(palette = palette, direction = 1,
+                             name = "RFOP %",
+                             limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
+      coord_equal() +
+      theme_sp +
+      labs(title = sprintf("%s — %s", run$label, title_suffix))
+
+    if (!is.null(be_outline)) {
+      p <- p + geom_path(data = be_outline,
+                         aes(x = X, y = Y, group = interaction(L1, L2)),
+                         colour = "black", linewidth = 0.5, inherit.aes = FALSE)
+    }
+    p
+  }
+
+  p_restore <- make_one_map("restore", colours_restore, "Restoration frequency")
+  p_convert <- make_one_map("convert", colours_convert, "Conversion frequency")
+
+  p_restore + p_convert +
+    patchwork::plot_annotation(
+      title = "Spatial selection frequency by action type (RFOP %)",
+      theme = theme(plot.title = element_text(size = 13, face = "bold"))
+    )
+}
+
+
 # ── Comparison functions ──────────────────────────────────────────────────────
 
 compare_hv_plot <- function(run_a, run_b) {

@@ -461,6 +461,8 @@ class RestorationProblem(ElementwiseProblem):
             self.objective_names.append('biotic_anomaly')
         if 'landscape_anomaly' in initial_conditions:
             self.objective_names.append('landscape_anomaly')
+        if 'connectivity_gain_1d' in initial_conditions:
+            self.objective_names.append('connectivity_gain')
         if 'implementation_cost' in initial_conditions:
             self.objective_names.append('implementation_cost')
         
@@ -530,6 +532,9 @@ class RestorationProblem(ElementwiseProblem):
             elif obj_name == 'landscape_anomaly':
                 l0 = self.initial_conditions['landscape_anomaly']
                 scale = float(np.nansum(np.abs(l0)))
+            elif obj_name == 'connectivity_gain':
+                cg = self.initial_conditions['connectivity_gain_1d']
+                scale = float(np.nansum(np.abs(cg)))
             elif obj_name == 'implementation_cost':
                 c = self.initial_conditions['implementation_cost']
                 if rest_mask is not None and conv_mask is not None:
@@ -561,8 +566,12 @@ class RestorationProblem(ElementwiseProblem):
         x_restore = x[:self.n_restoration_pixels]
         x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
 
-        # Conversion objectives only valid when landscape objective is present.
-        if 'landscape_anomaly' not in self.initial_conditions:
+        # Conversion objectives only valid when a landscape/connectivity objective is present.
+        has_conversion_objective = (
+            'landscape_anomaly' in self.initial_conditions
+            or 'connectivity_gain_1d' in self.initial_conditions
+        )
+        if not has_conversion_objective:
             x_convert = x_convert.copy()
             x_convert[:] = 0
 
@@ -579,6 +588,11 @@ class RestorationProblem(ElementwiseProblem):
                 l1 = updated_conditions["landscape_anomaly"]
                 eps = 1e-12
                 obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
+            elif obj_name == 'connectivity_gain':
+                # Precomputed per-pixel gain; sum over converted pixels.
+                # Negated: minimisation problem → maximise gain ↔ minimise negative gain.
+                cg = self.initial_conditions['connectivity_gain_1d']
+                obj_value = -float(np.sum(cg[x_convert == 1]))
             elif obj_name == 'implementation_cost':
                 obj_value = updated_conditions[obj_name]
             else:
@@ -601,9 +615,12 @@ class RestorationProblem(ElementwiseProblem):
         x_restore = x[:self.n_restoration_pixels]
         x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
 
-        # Enable conversion actions now that we have fast landscape calculation
-        if 'landscape_anomaly' not in self.initial_conditions:
-            # Force convert actions to zero if landscape objective not available
+        # Enable conversion actions when a landscape or connectivity objective is present
+        has_conversion_objective = (
+            'landscape_anomaly' in self.initial_conditions
+            or 'connectivity_gain_1d' in self.initial_conditions
+        )
+        if not has_conversion_objective:
             x_convert[:] = 0
         
         # Use both restoration and conversion decisions

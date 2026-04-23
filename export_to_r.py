@@ -8,12 +8,12 @@ Outputs (written to <output_dir>/):
   objectives_normalized.csv — same, normalized objective space
   hypervolume_evolution.csv — hypervolume per generation
   population_stats.csv      — per-generation mean/std/min/max for each objective
-  pixel_selection.csv       — long-format: solution_id, pixel_row, pixel_col (non-dominated solutions only)
+  pixel_selection.csv       — long-format: solution_id, action_type, pixel_row/x, pixel_col/y (non-dominated solutions only)
   metadata.json             — run config, scenario params, problem info, algorithm scalars
 
 Usage:
     python export_to_r.py results_files/res_fg_20260415_1840_cost_corrected.pkl
-    python export_to_r.py results_files/res_fg_20260421_1654_mut200_seeded_p12.pkl --output-dir r_inputs/mut200_seeded_p12_update
+    python export_to_r.py results_files/res_20260423_1234_4obj_02sample.pkl --output-dir r_inputs/4obj_02sample_firsttry
 """
 
 import argparse
@@ -188,27 +188,40 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
 
     # -------------------------------------------------------------------
     # 5. Pixel selection (long format, non-dominated solutions by default)
+    #    Includes action_type column: "restore" or "convert"
     # -------------------------------------------------------------------
     restoration_indices = ic.get("restoration_eligible_indices")
+    conversion_indices  = ic.get("conversion_eligible_indices")
     shape = ic.get("shape")
 
     if restoration_indices is not None and shape is not None and decisions.size > 0:
         is_patch_based = problem_info.get("is_patch_based", False)
         n_restoration_pixels = problem_info.get("n_restoration_pixels", len(restoration_indices))
+        n_conversion_pixels  = problem_info.get("n_conversion_pixels",
+                                                len(conversion_indices) if conversion_indices is not None else 0)
 
         # Expand patch decisions → pixel decisions if needed
         if is_patch_based and patch_mappings is not None:
             print("  Expanding patch decisions to pixel level ...")
             n_restoration_patches = problem_info.get("n_restoration_patches", decisions.shape[1])
-            per_sol_px_indices = _expand_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
+            per_sol_px_indices   = _expand_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
+            per_sol_conv_indices = None  # patch approach does not cover conversion
         elif not is_patch_based:
-            # pixel-level decisions directly
+            # pixel-level: first n_restoration_pixels = restore, next n_conversion_pixels = convert
             per_sol_px_indices = [
-                np.where(decisions[i, :len(restoration_indices)] == 1)[0]
+                np.where(decisions[i, :n_restoration_pixels] == 1)[0]
                 for i in range(n_solutions)
             ]
+            if n_conversion_pixels > 0 and conversion_indices is not None:
+                per_sol_conv_indices = [
+                    np.where(decisions[i, n_restoration_pixels:n_restoration_pixels + n_conversion_pixels] == 1)[0]
+                    for i in range(n_solutions)
+                ]
+            else:
+                per_sol_conv_indices = None
         else:
-            per_sol_px_indices = None
+            per_sol_px_indices   = None
+            per_sol_conv_indices = None
 
         if per_sol_px_indices is not None:
             mask = is_nondominated if nondom_pixels_only else np.ones(n_solutions, dtype=bool)
@@ -245,27 +258,38 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
             elig_df.to_csv(elig_path, index=False)
             print(f"  → {elig_path.name}  ({len(elig_df):,} eligible pixels)")
 
-            rows_list = []
-            for sol_i in sol_indices:
-                px_idx = per_sol_px_indices[sol_i]
-                flat_indices = restoration_indices[px_idx]
-                rows_px, cols_px = np.divmod(flat_indices, shape[1])
-
+            def _pixels_to_rows(sol_i, flat_pixel_indices, action_type_label):
+                """Convert a flat array of global-grid indices to a tidy DataFrame block."""
+                rows_px, cols_px = np.divmod(flat_pixel_indices, shape[1])
                 if affine_transform is not None:
                     import rasterio.transform as _rt
-                    # xy() returns (xs, ys) for pixel centres
                     xs, ys = _rt.xy(affine_transform, rows_px, cols_px)
-                    rows_list.append(pd.DataFrame({
+                    return pd.DataFrame({
                         "solution_id": sol_i,
+                        "action_type": action_type_label,
                         "x": xs,
                         "y": ys,
-                    }))
+                    })
                 else:
-                    rows_list.append(pd.DataFrame({
+                    return pd.DataFrame({
                         "solution_id": sol_i,
+                        "action_type": action_type_label,
                         "pixel_row": rows_px,
                         "pixel_col": cols_px,
-                    }))
+                    })
+
+            rows_list = []
+            for sol_i in sol_indices:
+                # Restoration pixels
+                px_idx = per_sol_px_indices[sol_i]
+                if len(px_idx) > 0:
+                    rows_list.append(_pixels_to_rows(sol_i, restoration_indices[px_idx], "restore"))
+
+                # Conversion pixels (present when a conversion objective is in the run)
+                if per_sol_conv_indices is not None:
+                    conv_idx = per_sol_conv_indices[sol_i]
+                    if len(conv_idx) > 0:
+                        rows_list.append(_pixels_to_rows(sol_i, conversion_indices[conv_idx], "convert"))
 
             if rows_list:
                 px_df = pd.concat(rows_list, ignore_index=True)
@@ -273,8 +297,11 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
                 px_df.to_csv(px_path, index=False)
                 coord_mode = "EPSG:2056 coordinates (x, y)" if affine_transform is not None else "pixel row/col"
                 label = "non-dominated" if nondom_pixels_only else "all"
+                n_convert_rows = int((px_df["action_type"] == "convert").sum())
+                n_restore_rows = len(px_df) - n_convert_rows
                 print(f"  → {px_path.name}  ({len(sol_indices)} {label} solutions, "
-                      f"{len(px_df):,} pixel-solution rows, {coord_mode})")
+                      f"{len(px_df):,} pixel-solution rows "
+                      f"[{n_restore_rows:,} restore, {n_convert_rows:,} convert], {coord_mode})")
 
     # -------------------------------------------------------------------
     # 6. metadata.json
@@ -347,5 +374,5 @@ if __name__ == "__main__":
 # objectives_normalized.csv	Same in normalized objective space
 # hypervolume_evolution.csv	generation, hypervolume — auto-sourced from evolution JSON if present
 # population_stats.csv	Per-generation mean/std/min/max for each objective
-# pixel_selection.csv	Long-format: solution_id, pixel_row, pixel_col (non-dominated solutions by default)
+# pixel_selection.csv	Long-format: solution_id, action_type ("restore"/"convert"), pixel_row/x, pixel_col/y (non-dominated solutions by default)
 # metadata.json	Run config, scenario params, algorithm settings, raster grid info (CRS, transform, shape)
