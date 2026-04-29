@@ -16,7 +16,8 @@ import os
 import numpy as np
 from scipy import ndimage
 from datetime import datetime
-from multiprocessing import Pool
+import threading
+from multiprocessing.pool import ThreadPool
 
 from pymoo.core.problem import ElementwiseProblem, StarmapParallelization
 from pymoo.optimize import minimize
@@ -493,14 +494,18 @@ class RestorationProblem(ElementwiseProblem):
         # First n_restoration_pixels elements = restoration decisions
         # Next n_conversion_pixels elements = conversion decisions
         total_decision_vars = n_restoration_pixels + n_conversion_pixels
-        
+
+        # Thread safety for shared mutable state written inside _evaluate()
+        self._eval_lock = threading.Lock()
+        self.constraint_log = []
+
         # Setup parallelization
         elementwise_runner = None
         if n_jobs is None or n_jobs != 1:
             try:
-                pool = Pool() if n_jobs in (None, -1) else Pool(processes=n_jobs)
+                pool = ThreadPool() if n_jobs in (None, -1) else ThreadPool(processes=n_jobs)
                 elementwise_runner = StarmapParallelization(pool.starmap)
-                print(f"Parallelization enabled with {pool._processes if hasattr(pool, '_processes') else 'auto'} processes")
+                print(f"Parallelization enabled with {pool._processes if hasattr(pool, '_processes') else 'auto'} threads")
             except Exception as e:
                 print(f"Warning: Could not setup parallelization: {e}")
                 print("Falling back to sequential evaluation")
@@ -637,18 +642,15 @@ class RestorationProblem(ElementwiseProblem):
         # Constraint: total number of pixels with actions (restore + convert)
         out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
         
-        # Log constraint violations
-        if not hasattr(self, 'constraint_log'):
-            self.constraint_log = []
-        
-        # Log constraint violations (G[0] > 0 means violation)
+        # Log constraint violations (thread-safe: constraint_log is shared state)
         for i, g_val in enumerate(out["G"]):
             if g_val > 0:
-                self.constraint_log.append({
-                    'generation': getattr(self, 'current_gen', 0), 
-                    'violation_value': g_val,
-                    'constraint_type': 'budget'
-                })
+                with self._eval_lock:
+                    self.constraint_log.append({
+                        'generation': getattr(self, 'current_gen', 0), 
+                        'violation_value': g_val,
+                        'constraint_type': 'budget'
+                    })
 
 
 # --- Patch-Based Problem ---
@@ -786,13 +788,14 @@ class PatchRestorationProblem(RestorationProblem):
             min_pixels = int(self.target_constraint_value * (1 - evaluation_tolerance))
             max_pixels = int(self.target_constraint_value * (1 + evaluation_tolerance))
             
-            # DEBUG: Print constraint check details
+            # DEBUG: Print constraint check details (thread-safe counter)
             if not hasattr(self, '_constraint_debug_count'):
                 self._constraint_debug_count = 0
             if self._constraint_debug_count < 5:
                 print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
                 print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
-                self._constraint_debug_count += 1
+                with self._eval_lock:
+                    self._constraint_debug_count += 1
             
             if min_pixels <= n_pixels_used <= max_pixels:
                 constraint_value = 0  # Accept as feasible
@@ -1502,7 +1505,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         problem = PatchRestorationProblem(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
-            n_jobs=1,
+            n_jobs=n_jobs,
             patch_constraint_type=patch_constraint_type,
             pixel_tolerance=pixel_tolerance,
         )
@@ -1510,7 +1513,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         problem = RestorationProblem(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
-            n_jobs=1,
+            n_jobs=n_jobs,
         )
 
     # --- 4. Print problem details ---

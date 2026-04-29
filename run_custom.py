@@ -19,7 +19,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "all_idw"
+RUN_LABEL = "check_parallelisation"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"

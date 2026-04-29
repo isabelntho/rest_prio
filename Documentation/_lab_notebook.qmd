@@ -1,0 +1,27 @@
+
+# Meeting 28.08.2026
+Discussed priorities over the next 6 weeks:
+
+* Scenarios & uncertainty
+  + Implement at least one element of:
+    -   Construction of ecosystem condition indicators/anomalies (indicator choice/weighting; baseline conditions)
+    -   Alternative objective functions (total condition improvement vs area exceeding a threshold)
+  + Sensitivity analysis --\> how do different formulations affect spatial patterns of selected areas and trade-offs between objectives?
+* Towards WP3
+  + Outline of plan to move framework towards dynamic spatial optimisation model
+  + Full understanding of results
+* Complete implementation of 4-objective version
+  + Implement simple approach but not needed to be perfect
+  + Implementation of convolution-based connectivity metric
+    -   speed of computation
+  + How to balance decision variable (amount to rehabilitate vs convert)
+  + How to include multiple cost layers
+* Implementation at national scale
+  + Scaling up algorithm
+    -   speed of computation
+    -   decisions regarding resolution of decision variable
+  + Testing effect of less elaborated cost data
+  + Decisions regarding resolution of decision vector, etc.
+* Algorithm fine-tuning
+  + Systematic runs varying algorithm parameters (population size, number of generations, mutation/crossover rates, etc.) and their influence on convergence and solution quality.
+  + Sensitivity analysis to understand how robust the Pareto front is to algorithm settings (minimum = random seed).

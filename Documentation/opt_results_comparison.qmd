@@ -157,9 +157,15 @@ implementation_cost <- rast("./inputs/implementation_cost.tif")
 
 ```
 
+------------------------------------------------------------------------
+
+{{< include _lab_notebook.qmd >}}
+
+------------------------------------------------------------------------
+
 # Conceptual overview of workflow
 
-![](figs/workflow_feb_3obj.jpg){fig-cap="Workflow overview"}
+![](figs/workflow_feb.jpg){fig-cap="Workflow overview"}
 
 ------------------------------------------------------------------------
 
@@ -231,8 +237,7 @@ cat(sprintf("Objectives: %s\n", paste(obj_names, collapse = ", ")))
 
 #### Hypervolume indicator & objective value per generation
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ##### `r LABEL_A`
 
 ```{r}
@@ -246,15 +251,13 @@ make_hv_evo_plot(run_a, obj_names, obj_labels)
 #| label: run-b-hv-evo
 make_hv_evo_plot(run_b, obj_names, obj_labels)
 ```
-
 :::
 
 ## Pareto front and tradeoffs
 
 #### Pareto front
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ##### `r LABEL_A`
 
 ```{r}
@@ -270,13 +273,11 @@ make_pareto_extremes_plot(run_a, obj_names, obj_labels)
 #| fig-height: 5
 make_pareto_extremes_plot(run_b, obj_names, obj_labels)
 ```
-
 :::
 
 #### Trade-offs between objectives
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ##### `r LABEL_A`
 
 ```{r}
@@ -294,13 +295,11 @@ make_pareto_pairwise(run_a, obj_names, obj_labels)
 #| fig-width: 12
 make_pareto_pairwise(run_b, obj_names, obj_labels)
 ```
-
 :::
 
 #### Objective correlations
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ##### `r LABEL_A`
 
 ```{r}
@@ -318,13 +317,11 @@ make_corr_plot(run_a, obj_names, obj_labels)
 #| fig-width: 8
 make_corr_plot(run_b, obj_names, obj_labels)
 ```
-
 :::
 
 #### Parallel Coordinates
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ##### `r LABEL_A`
 
 ```{r}
@@ -340,7 +337,6 @@ make_parcoord_plot(run_a, obj_names, obj_labels)
 #| fig-height: 5
 make_parcoord_plot(run_b, obj_names, obj_labels)
 ```
-
 :::
 
 ## Do trade-offs exist in space?
@@ -349,8 +345,7 @@ Pairwise spatial similarity (Jaccard index) between non-dominated solutions, plo
 
 Negative relationship = solutions with lower spatial overlap correspond to greater differences in objective performance, indicating that trade-offs in the Pareto set are driven by distinct spatial configurations.
 
-::: {.panel-tabset}
-
+::: panel-tabset
 ### `r LABEL_A`
 
 ```{r}
@@ -368,19 +363,16 @@ make_jaccard_plot(run_a, obj_names)
 #| fig-width: 6
 make_jaccard_plot(run_b, obj_names)
 ```
-
 :::
 
 ## Spatial distribution of selected areas
 
 Relative frequency of occurrence in the Pareto front (RFOP): how often each pixel appears across the non-dominated solutions. Coloured pixels were selected in ≥ 1 solution. Grey underlay indicates pixels that were eligible for selection but never selected in any non-dominated solution.
 
-::: {.panel-tabset}
-
+::::: panel-tabset
 ### `r LABEL_A`
 
-::: {.panel-tabset}
-
+::: panel-tabset
 #### Raster
 
 ```{r}
@@ -396,13 +388,11 @@ make_sel_freq_plot(run_a)
 #| fig-height: 8
 make_sel_freq_plot_agg_hex(run_a, bins = 30)
 ```
-
 :::
 
 ### `r LABEL_B`
 
-::: {.panel-tabset}
-
+::: panel-tabset
 #### Raster
 
 ```{r}
@@ -418,19 +408,15 @@ make_sel_freq_plot(run_b)
 #| fig-height: 8
 make_sel_freq_plot_agg_hex(run_b, bins = 30)
 ```
-
 :::
-
-:::
+:::::
 
 ## Characteristics of selected pixels
 
-::: {.panel-tabset}
-
+::::: panel-tabset
 ### `r LABEL_A`
 
-::: {.panel-tabset}
-
+::: panel-tabset
 #### LULC
 
 ```{r}
@@ -474,13 +460,11 @@ make_sel_freq_unified_plot(run_a,
   fill_label  = "Implementation cost (quartile)",
   subtitle    = "Implementation cost")
 ```
-
 :::
 
 ### `r LABEL_B`
 
-::: {.panel-tabset}
-
+::: panel-tabset
 #### LULC
 
 ```{r}
@@ -502,49 +486,95 @@ make_sel_freq_unified_plot(run_b,
   fill_label  = "Abiotic anomaly (quintile)",
   subtitle    = "Coloured by baseline abiotic condition")
 ```
-
 :::
-
-:::
+:::::
 
 # Sensitivity
 
 ## Change in % area restored
-::: {.panel-tabset}
+
+::: panel-tabset
 ## RFOP
+
 ```{r}
 #| label: rfop_frac
-#| fig-height: 8
+#| fig-height: 6
 #| fig-width: 14
-(make_sel_freq_plot(run_a) + labs(title = run_a$label)) +
-  (make_sel_freq_plot(run_c) + labs(title = run_c$label)) +
+make_sel_freq_plot(run_a) +
+  make_sel_freq_plot(run_b) +
   patchwork::plot_layout(ncol = 2)
 ```
+
 ## Pareto front
+
 ```{r}
 #| label: pareto_frac
+#| fig-height: 6
+#| fig-width: 14
+(make_pareto_extremes_plot(run_a, obj_names, obj_labels, scale_by_n_pixels = TRUE) + labs(title = run_a$label)) +
+  (make_pareto_extremes_plot(run_b, obj_names, obj_labels, scale_by_n_pixels = TRUE) + labs(title = run_b$label)) +
+  patchwork::plot_layout(ncol = 2)
+```
+:::
+
+Increasing maximum restoration area spreads effort into lower quality locations, reducing overall efficiency.
+
+## Implementing burden sharing
+
+::: panel-tabset
+## RFOP
+
+```{r}
+#| label: rfop_bs
+#| fig-height: 6
+#| fig-width: 14
+make_sel_freq_plot(run_a) +
+  make_sel_freq_plot(run_c) +
+  patchwork::plot_layout(ncol = 2)
+```
+
+Burden sharing forces equal area for restoration across administrative units (here municipalities) & changing the distribution of selected areas.
+
+## Pareto front
+
+```{r}
+#| label: pareto_bs
 #| fig-height: 5
 #| fig-width: 14
 (make_pareto_extremes_plot(run_a, obj_names, obj_labels) + labs(title = run_a$label)) +
   (make_pareto_extremes_plot(run_c, obj_names, obj_labels) + labs(title = run_c$label)) +
   patchwork::plot_layout(ncol = 2)
 ```
-:::
 
-## Implementing burden sharing
+Burden sharing constrains the optimisation, reducing flexibility and eliminating high performing solutions, while forcing a much higher correlation between objectives.
+:::
 
 # Four-objective run (abiotic × biotic × cost × connectivity)
 
-![](figs/workflow_feb.jpg){fig-cap="Workflow overview"}
+Connectivity gain is currently included as a precomputed per-pixel metric based on the amount of existing semi-natural habitat within a 100 m neighbourhood of each conversion-eligible pixel.
 
-This section analyses a run that includes a fourth objective to represent landscape condition in the form of connectivity of semi-natural habitats.
+Restoration is here divided into two action types:
 
-Connectivity gain is currently included as a precomputed per-pixel metric based on the amount of existing semi-natural habitat within a 100 m neighbourhood of each conversion-eligible pixel. 
+-   **restoration** (improving ecological condition in-situ)
+-   **conversion** (changing agricultural land use to semi-natural habitat, directly contributing to connectivity gain).
 
-Solutions in this run include two action types: 
+## Connectivity objective function
 
-- **restoration** (improving ecological condition in-situ) 
-- **conversion** (changing agricultural land use to semi-natural habitat, directly contributing connectivity gain).
+For each candidate conversion pixel $j$, the precomputed gain is:
+
+$$
+g_j = \sum_{i \,:\, d(i,j) \le R} \mathbf{1}\!\left[\text{LULC}_i \in \mathcal{S}\right]
+$$
+
+where $R = 100\,\text{m}$, $\mathcal{S}$ is the set of semi-natural LULC classes, and $d(i,j)$ is Euclidean distance between pixels $i$ and $j$.
+
+Given a binary decision vector $\mathbf{x}_c$ over conversion-eligible pixels, the objective maximised by the algorithm is:
+
+$$
+f_{\text{conn}}(\mathbf{x}_c) = \sum_j x_{c,j} \cdot g_j
+$$
+
+Pixels embedded in existing semi-natural habitat receive higher $g_j$ and are therefore prioritised over isolated pixels surrounded by agriculture.
 
 ```{r}
 #| label: config-4obj
@@ -575,9 +605,7 @@ make_hv_evo_plot(run_4obj, obj_names_4, obj_labels_4)
 
 ## Pareto front — pairwise trade-offs
 
-All six pairwise objective combinations. Note especially the panels involving
-`connectivity_gain` vs. each ecological and cost objective — these reveal whether
-connectivity trades off against or aligns with condition improvement.
+All six pairwise objective combinations. Note especially the panels involving `connectivity_gain` vs. each ecological and cost objective — these reveal whether connectivity trades off against or aligns with condition improvement.
 
 ```{r}
 #| label: 4obj-pairwise
@@ -598,9 +626,7 @@ if (inherits(p_pairs, "patchwork")) {
 
 ## Parallel coordinates
 
-Each axis is min-max normalised across all solutions. Thick coloured lines highlight the
-solution that is best on each individual objective; thin black lines are other non-dominated
-solutions; grey lines are dominated solutions.
+Each axis is min-max normalised across all solutions. Thick coloured lines highlight the solution that is best on each individual objective; thin black lines are other non-dominated solutions; grey lines are dominated solutions.
 
 ```{r}
 #| label: 4obj-parcoord
@@ -623,10 +649,7 @@ make_corr_plot(run_4obj, obj_names_4, obj_labels_4)
 
 ## Action mix per solution
 
-Stacked bar showing how many pixels in each non-dominated solution are **restoration** actions
-vs **conversion** actions. Solutions are ordered by their connectivity gain objective value
-(ascending = most connectivity gain first), so the leftmost solutions are those that focus most
-on connectivity improvement via land-use conversion.
+Stacked bar showing how many pixels in each non-dominated solution are **restoration** actions vs **conversion** actions. Solutions are ordered by their connectivity gain objective value (ascending = most connectivity gain first), so the leftmost solutions are those that focus most on connectivity improvement via land-use conversion.
 
 ```{r}
 #| label: 4obj-action-bar
@@ -640,8 +663,7 @@ make_action_stacked_bar(run_4obj, obj_names_4, obj_labels_4, order_obj = order_b
 
 ## Spatial frequency by action type
 
-Selection frequency maps (RFOP %) for restoration and conversion actions separately, showing
-whether the two action types target different parts of the landscape.
+Selection frequency maps (RFOP %) for restoration and conversion actions separately, showing whether the two action types target different parts of the landscape.
 
 ```{r}
 #| label: 4obj-action-maps
@@ -783,7 +805,7 @@ compare_pareto_overlay <- function(run_a, run_b, obj_names, obj_labels) {
 
 compare_pareto_overlay(run_a, run_b, obj_names, obj_labels)
 ```
- 
+
 The C-metric table below quantifies mutual domination. Seeded run outperformed the not-seeded run in terms of dominance.
 
 ```{r}
@@ -956,6 +978,3 @@ plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
 
 plot_jaccard_comparison(run_a, run_b, obj_names)
 ```
-
----
-
