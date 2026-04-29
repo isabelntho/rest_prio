@@ -400,7 +400,7 @@ class PatchAwareSampling(Sampling):
     
     def __init__(self, patch_mappings, target_pixels, pixel_tolerance=0.05,
                  patch_scores=None, score_temperature=0.25, random_share=0.15,
-                 per_objective_patch_scores=None):
+                 per_objective_patch_scores=None, patch_region_assignments=None):
         super().__init__()
         self.patch_mappings = patch_mappings
         self.target_pixels = target_pixels
@@ -408,6 +408,10 @@ class PatchAwareSampling(Sampling):
         self.patch_scores = patch_scores
         self.score_temperature = float(score_temperature)
         self.random_share = float(np.clip(random_share, 0.0, 1.0))
+        # Burden-sharing: per-patch region assignments (or None → disabled).
+        # Set by _build_operators only when burden_sharing='yes' and admin data
+        # is available; no effect on runs without burden sharing.
+        self.patch_region_assignments = patch_region_assignments  # dict or None
         # per_objective_patch_scores: shape (n_obj, n_patches) — seeds one extreme
         # solution per objective into the initial population (warm start).
         self.per_objective_patch_scores = (
@@ -502,7 +506,17 @@ class PatchAwareSampling(Sampling):
                 )
 
         for i in range(n_samples - n_extreme):
-            # Score-guided stochastic construction to preserve diversity.
+            # ── Burden-sharing construction ──────────────────────────────────
+            # When enabled, fill each region's patch pool independently up to
+            # its fair share of the target budget.  Falls back to the standard
+            # global construction if assignments are missing or incomplete.
+            if self.patch_region_assignments:
+                active = self._build_burden_shared_solution(all_pixels, n_patches,
+                                                            target_min, target_max)
+                X[i, active] = 1
+                continue
+
+            # ── Standard score-guided stochastic construction ─────────────
             active = np.zeros(n_patches, dtype=bool)
             current = 0
             safety = 0
@@ -544,6 +558,117 @@ class PatchAwareSampling(Sampling):
         
         return X
 
+    def _build_burden_shared_solution(self, all_pixels: np.ndarray,
+                                      n_patches: int,
+                                      target_min: int,
+                                      target_max: int) -> np.ndarray:
+        """
+        Fill patches region-by-region so each region receives an equal share of
+        the pixel budget.  Returns a boolean active mask of length n_patches.
+
+        Safe fallback: if region info is incomplete, delegates to standard
+        global fill.
+        """
+        pra = self.patch_region_assignments
+        n_regions = pra.get('n_regions', 0)
+        rest_assign = pra.get('restoration', {})
+        conv_assign = pra.get('conversion', {})
+        n_rest = self.n_restoration_patches
+
+        if n_regions == 0:
+            return self._build_global_solution(all_pixels, n_patches, target_min, target_max)
+
+        # Build per-region patch index lists (restoration + conversion combined).
+        region_patches: Dict[int, List[int]] = {r: [] for r in range(n_regions)}
+        unassigned: List[int] = []
+        for pid in range(n_patches):
+            assign = rest_assign if pid < n_rest else conv_assign
+            local_pid = pid if pid < n_rest else pid - n_rest
+            region_id = assign.get(local_pid, -1)
+            if region_id >= 0:
+                region_patches[region_id].append(pid)
+            else:
+                unassigned.append(pid)
+
+        target_center = int((target_min + target_max) / 2)
+        per_region_target = target_center // n_regions
+        active = np.zeros(n_patches, dtype=bool)
+
+        for region_id in range(n_regions):
+            patches_in_region = np.array(region_patches[region_id], dtype=int)
+            if patches_in_region.size == 0:
+                continue
+            r_max = per_region_target + int(per_region_target * self.pixel_tolerance)
+            r_min = max(0, per_region_target - int(per_region_target * self.pixel_tolerance))
+            current = 0
+            safety = 0
+            max_steps = int(max(r_max / max(self._min_patch_pixels, 1) * 3.0, 32))
+            available_mask = np.ones(len(patches_in_region), dtype=bool)
+
+            while current < r_min and safety < max_steps:
+                pool = patches_in_region[available_mask]
+                if pool.size == 0:
+                    break
+                weights = np.clip(self._base_weights[pool], 1e-12, None)
+                idx = int(_sample_without_replacement_weighted(pool, weights, 1)[0])
+                active[idx] = True
+                available_mask[patches_in_region == idx] = False
+                current += int(all_pixels[idx])
+                safety += 1
+
+            while current < per_region_target and safety < max_steps:
+                pool = patches_in_region[available_mask]
+                if pool.size == 0:
+                    break
+                feasible = pool[current + all_pixels[pool] <= r_max]
+                if feasible.size == 0:
+                    break
+                if current >= r_min and np.random.random() < 0.35:
+                    break
+                weights = np.clip(self._base_weights[feasible], 1e-12, None)
+                idx = int(_sample_without_replacement_weighted(feasible, weights, 1)[0])
+                active[idx] = True
+                available_mask[patches_in_region == idx] = False
+                current += int(all_pixels[idx])
+                safety += 1
+
+        return active
+
+    def _build_global_solution(self, all_pixels: np.ndarray,
+                               n_patches: int,
+                               target_min: int,
+                               target_max: int) -> np.ndarray:
+        """Standard global stochastic fill — used as fallback."""
+        target_center = int((target_min + target_max) / 2)
+        active = np.zeros(n_patches, dtype=bool)
+        current = 0
+        safety = 0
+        max_steps = int(max(target_max / max(self._min_patch_pixels, 1) * 3.0, 64))
+        while current < target_min and safety < max_steps:
+            candidates = np.where(~active)[0]
+            if candidates.size == 0:
+                break
+            weights = self._candidate_weights(candidates, all_pixels)
+            idx = int(_sample_without_replacement_weighted(candidates, weights, 1)[0])
+            active[idx] = True
+            current += int(all_pixels[idx])
+            safety += 1
+        while current < target_center and safety < max_steps:
+            candidates = np.where(~active)[0]
+            if candidates.size == 0:
+                break
+            feasible = candidates[current + all_pixels[candidates] <= target_max]
+            if feasible.size == 0:
+                break
+            if current >= target_min and np.random.random() < 0.35:
+                break
+            weights = self._candidate_weights(feasible, all_pixels)
+            idx = int(_sample_without_replacement_weighted(feasible, weights, 1)[0])
+            active[idx] = True
+            current += int(all_pixels[idx])
+            safety += 1
+        return active
+
 
 class PatchRepair(Repair):
     """Repair operator enforcing patch_count or pixel_count constraints."""
@@ -551,7 +676,8 @@ class PatchRepair(Repair):
     def __init__(self, constraint_type='pixel_count', target_value=None,
                  patch_mappings=None, pixel_tolerance=0.05,
                  patch_scores=None, score_temperature=0.5, top_k=12,
-                 per_objective_patch_scores=None, ref_dirs=None):
+                 per_objective_patch_scores=None, ref_dirs=None,
+                 patch_region_assignments=None):
         super().__init__()
         self.constraint_type = constraint_type
         self.target_value = target_value
@@ -585,6 +711,9 @@ class PatchRepair(Repair):
             }
         self.repair_log = []  # Per-generation bit-diff diagnostics
         self._total_calls = 0
+        # Burden-sharing: per-patch region assignments (or None → disabled).
+        # No effect on runs without burden sharing.
+        self.patch_region_assignments = patch_region_assignments if patch_region_assignments else None
     
     def _do(self, problem, X, **kwargs):
         import numpy as np
@@ -642,6 +771,13 @@ class PatchRepair(Repair):
                     override_score_vec=score_vec_i,
                 )
 
+            # ── Burden-sharing second pass ─────────────────────────────────
+            # Rebalance pixels across regions after global count enforcement.
+            # Only runs when patch_region_assignments is set; completely skipped
+            # otherwise, so non-burden-sharing runs are unaffected.
+            if self.patch_region_assignments and self.constraint_type == 'pixel_count':
+                X[i] = self._balance_regions(X[i], n_restoration_patches, self.target_value)
+
         # Record bit-diff diagnostics
         diffs = np.sum(X_in != X, axis=1)  # (pop_size,)
         self._total_calls += 1
@@ -654,6 +790,93 @@ class PatchRepair(Repair):
 
         return X
     
+    def _balance_regions(self, patch_decisions: np.ndarray,
+                         n_restoration_patches: int,
+                         target_pixels: int) -> np.ndarray:
+        """
+        Second-pass region balancing for burden sharing.
+
+        For each admin region, checks whether its pixel contribution deviates
+        more than ``pixel_tolerance`` from its fair share
+        (``target_pixels / n_regions``).  Over-represented regions lose their
+        lowest-scored patches; under-represented regions gain highest-scored
+        unselected patches — without changing the global pixel total.
+
+        Safe: returns the input unchanged if region data is absent.
+        """
+        pra = self.patch_region_assignments
+        n_regions = pra.get('n_regions', 0)
+        if n_regions == 0:
+            return patch_decisions
+
+        rest_assign = pra['restoration']
+        conv_assign = pra['conversion']
+        result = patch_decisions.copy()
+        n_patches = len(result)
+
+        all_patch_sizes = np.concatenate([
+            np.array([self.restoration_patch_pixel_counts.get(i, 0)
+                      for i in range(n_restoration_patches)], dtype=np.int64),
+            np.array([self.conversion_patch_pixel_counts.get(i, 0)
+                      for i in range(n_patches - n_restoration_patches)], dtype=np.int64),
+        ])
+
+        per_region_target = target_pixels / n_regions
+        tolerance_pix = int(per_region_target * self.pixel_tolerance) + 1
+
+        score_vec = (np.asarray(self.patch_scores, dtype=np.float64)
+                     if self.patch_scores is not None and len(self.patch_scores) == n_patches
+                     else None)
+
+        # Build region → patch indices mapping once
+        region_patches: Dict[int, List[int]] = {r: [] for r in range(n_regions)}
+        for pid in range(n_patches):
+            assign = rest_assign if pid < n_restoration_patches else conv_assign
+            local_pid = pid if pid < n_restoration_patches else pid - n_restoration_patches
+            rid = assign.get(local_pid, -1)
+            if rid >= 0:
+                region_patches[rid].append(pid)
+
+        for rid in range(n_regions):
+            patches = np.array(region_patches[rid], dtype=int)
+            if patches.size == 0:
+                continue
+
+            region_pixels = int(np.dot(result[patches].astype(np.int64), all_patch_sizes[patches]))
+            diff = region_pixels - int(per_region_target)
+
+            if diff > tolerance_pix:
+                # Over-represented — remove lowest-scored active patches
+                active_in_region = patches[result[patches] == 1]
+                if active_in_region.size == 0:
+                    continue
+                if score_vec is not None:
+                    order = active_in_region[np.argsort(score_vec[active_in_region])]
+                else:
+                    order = active_in_region[np.argsort(all_patch_sizes[active_in_region])]
+                for pid in order:
+                    if region_pixels - int(per_region_target) <= tolerance_pix:
+                        break
+                    result[pid] = 0
+                    region_pixels -= int(all_patch_sizes[pid])
+
+            elif diff < -tolerance_pix:
+                # Under-represented — add highest-scored inactive patches
+                inactive_in_region = patches[result[patches] == 0]
+                if inactive_in_region.size == 0:
+                    continue
+                if score_vec is not None:
+                    order = inactive_in_region[np.argsort(-score_vec[inactive_in_region])]
+                else:
+                    order = inactive_in_region[np.argsort(-all_patch_sizes[inactive_in_region])]
+                for pid in order:
+                    if int(per_region_target) - region_pixels <= tolerance_pix:
+                        break
+                    result[pid] = 1
+                    region_pixels += int(all_patch_sizes[pid])
+
+        return result
+
     def _enforce_pixel_count(self, patch_decisions, n_restoration_patches, target_pixels,
                              override_score_vec=None):
         """Enforce pixel count by adding/removing patches within tolerance.
@@ -743,6 +966,49 @@ class PatchRepair(Repair):
                 step += 1
         
         return result
+
+
+def assign_patches_to_regions(patch_mappings: Dict, initial_conditions: Dict) -> Dict:
+    """
+    Assign each patch to an admin region by majority pixel vote.
+
+    Requires that ``initial_conditions`` contains ``'_region_assignments_cache'``
+    (built lazily by ``apply_burden_sharing`` in ``spatial_operations.py``).
+    Returns a dict with keys ``'restoration'`` and ``'conversion'``, each
+    mapping ``patch_id -> region_id`` (int, or -1 for unassigned patches).
+
+    Returns an empty dict when admin data or the cache is absent, so callers
+    can treat a missing result as "burden sharing unavailable".
+    """
+    admin_data = initial_conditions.get('admin_data')
+    region_cache = initial_conditions.get('_region_assignments_cache')
+
+    if admin_data is None or region_cache is None:
+        return {}
+
+    n_regions = admin_data['n_regions']
+
+    def _dominant_region(eligible_indices: np.ndarray) -> int:
+        """Return the region that contains the most of these eligible-pixel indices."""
+        if len(eligible_indices) == 0:
+            return -1
+        region_ids = region_cache[eligible_indices]
+        counts = np.bincount(region_ids[region_ids >= 0], minlength=n_regions)
+        return int(np.argmax(counts)) if counts.sum() > 0 else -1
+
+    def _build_assignment(patches: Dict) -> Dict[int, int]:
+        assignment = {}
+        patch_to_pixels = patches['patch_to_pixels']
+        for pid in range(patches['n_patches']):
+            pix = np.asarray(patch_to_pixels.get(pid, []), dtype=int)
+            assignment[pid] = _dominant_region(pix)
+        return assignment
+
+    return {
+        'restoration': _build_assignment(patch_mappings['restoration_patches']),
+        'conversion':  _build_assignment(patch_mappings['conversion_patches']),
+        'n_regions':   n_regions,
+    }
 
 
 def convert_patch_results_to_pixel_decisions(results_dict, patch_mappings):

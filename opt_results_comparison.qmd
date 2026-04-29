@@ -61,10 +61,12 @@ source("_plot_functions.R")
 # Set the two export_to_r.py output directories and display labels here.
 # All other parameters are derived automatically from metadata.json.
 
-RUN_DIR_A  <- "r_inputs/mut200_notseeded_p12_update"          # ← replace with your directory
-RUN_DIR_B  <- "r_inputs/mut200_seeded_p12_update"          # ← replace with your directory
-LABEL_A    <- "Not-seeded"
-LABEL_B    <- "Seeded"
+RUN_DIR_B  <- "r_inputs/mut200_notseeded_p12_update"          # ← replace with your directory
+RUN_DIR_A  <- "r_inputs/mut200_seeded_p12_update"
+RUN_DIR_C  <- "r_inputs/3obj_frac10"                 # ← replace with your directory
+LABEL_B    <- "Not-seeded"
+LABEL_A    <- "Seeded"
+LABEL_C    <- "Seeded + 0.05 area"
 
 ECOSYSTEM  <- "fg"                       # used in plot titles only
 OUTPUT_DIR <- "notebook_outputs"        # directory for saved figures
@@ -132,7 +134,8 @@ load_run_data <- function(dir_path, label) {
 
 run_a <- load_run_data(RUN_DIR_A, LABEL_A)
 run_b <- load_run_data(RUN_DIR_B, LABEL_B)
-run_main <- run_b  # primary run displayed in Part 1 (single-run sections)
+run_c <- load_run_data(RUN_DIR_C, LABEL_C)
+run_main <- run_a  # primary run displayed in Part 1 (single-run sections)
 
 # Use run_a's objective names as canonical; warn if they differ
 obj_names <- run_a$obj_names
@@ -156,7 +159,7 @@ implementation_cost <- rast("./inputs/implementation_cost.tif")
 
 # Conceptual overview of workflow
 
-![](figs/workflow_feb.jpg){fig-cap="Workflow overview"}
+![](figs/workflow_feb_3obj.jpg){fig-cap="Workflow overview"}
 
 ------------------------------------------------------------------------
 
@@ -171,7 +174,7 @@ implementation_cost <- rast("./inputs/implementation_cost.tif")
 files <- c(
   Abiotic_Anomaly = "inputs/abiotic_condition_anomaly.tif",
   Biotic_Anomaly = "inputs/biotic_condition_anomaly.tif",
-  Landscape_Anomaly = "inputs/landscape_condition_anomaly.tif",
+  #Landscape_Anomaly = "inputs/landscape_condition_anomaly.tif",
   Implementation_Cost = "inputs/implementation_cost.tif"
 )
 
@@ -191,7 +194,7 @@ df <- as.data.frame(r, xy = TRUE) %>%
   drop_na() %>%
   filter(layer %in% allowed_layers) %>%
   pivot_longer(
-    cols = c(Abiotic_Anomaly, Biotic_Anomaly, Landscape_Anomaly, Implementation_Cost),
+    cols = c(Abiotic_Anomaly, Biotic_Anomaly, Implementation_Cost),
     names_to = "Objective",
     values_to = "Value"
   ) %>%
@@ -200,7 +203,6 @@ df <- as.data.frame(r, xy = TRUE) %>%
       Objective,
       Abiotic_Anomaly = "Abiotic anomaly",
       Biotic_Anomaly = "Biotic anomaly",
-      Landscape_Anomaly = "Landscape anomaly",
       Implementation_Cost = "Implementation cost"
     )
   )
@@ -208,7 +210,7 @@ df <- as.data.frame(r, xy = TRUE) %>%
 ggplot(df, aes(x = x, y = y, fill = Value)) +
   geom_raster() +
   scale_fill_viridis_c(name = "Value") +
-  facet_wrap(~Objective, ncol = 2) +
+  facet_wrap(~Objective, ncol = 3) +
   coord_equal() +
   theme_sp
 
@@ -440,15 +442,37 @@ make_sel_freq_unified_plot(run_a,
   subtitle    = "Coloured by Land Use/Land Cover type")
 ```
 
-#### Baseline objective values
+#### Abiotic condition
 
 ```{r}
-#| label: run-a-sel-freq-baseline
+#| label: run-a-sel-freq-abiotic
 #| fig-height: 5
 make_sel_freq_unified_plot(run_a,
   fill_values = rfop_fill_objective(run_a, abiotic_anomaly),
-  fill_label  = "Abiotic anomaly (quintile)",
-  subtitle    = "Coloured by baseline abiotic condition")
+  fill_label  = "Abiotic anomaly (quartile)",
+  subtitle    = "Baseline abiotic condition anomaly")
+```
+
+#### Biotic condition
+
+```{r}
+#| label: run-a-sel-freq-biotic
+#| fig-height: 5
+make_sel_freq_unified_plot(run_a,
+  fill_values = rfop_fill_objective(run_a, biotic_anomaly),
+  fill_label  = "Biotic anomaly (quartile)",
+  subtitle    = "Baseline biotic condition anomaly")
+```
+
+#### Cost
+
+```{r}
+#| label: run-a-sel-freq-cost
+#| fig-height: 5
+make_sel_freq_unified_plot(run_a,
+  fill_values = rfop_fill_objective(run_a, implementation_cost),
+  fill_label  = "Implementation cost (quartile)",
+  subtitle    = "Implementation cost")
 ```
 
 :::
@@ -483,6 +507,183 @@ make_sel_freq_unified_plot(run_b,
 
 :::
 
+# Sensitivity
+
+## Change in % area restored
+::: {.panel-tabset}
+## RFOP
+```{r}
+#| label: rfop_frac
+#| fig-height: 8
+#| fig-width: 14
+(make_sel_freq_plot(run_a) + labs(title = run_a$label)) +
+  (make_sel_freq_plot(run_c) + labs(title = run_c$label)) +
+  patchwork::plot_layout(ncol = 2)
+```
+## Pareto front
+```{r}
+#| label: pareto_frac
+#| fig-height: 5
+#| fig-width: 14
+(make_pareto_extremes_plot(run_a, obj_names, obj_labels) + labs(title = run_a$label)) +
+  (make_pareto_extremes_plot(run_c, obj_names, obj_labels) + labs(title = run_c$label)) +
+  patchwork::plot_layout(ncol = 2)
+```
+:::
+
+## Implementing burden sharing
+
+# Four-objective run (abiotic × biotic × cost × connectivity)
+
+![](figs/workflow_feb.jpg){fig-cap="Workflow overview"}
+
+This section analyses a run that includes a fourth objective to represent landscape condition in the form of connectivity of semi-natural habitats.
+
+Connectivity gain is currently included as a precomputed per-pixel metric based on the amount of existing semi-natural habitat within a 100 m neighbourhood of each conversion-eligible pixel. 
+
+Solutions in this run include two action types: 
+
+- **restoration** (improving ecological condition in-situ) 
+- **conversion** (changing agricultural land use to semi-natural habitat, directly contributing connectivity gain).
+
+```{r}
+#| label: config-4obj
+
+# ── Point this at the export_to_r.py output directory for the 4-objective run ──
+RUN_DIR_4OBJ <- "r_inputs/4obj_02sample_2ndtry"   # ← update before rendering
+LABEL_4OBJ   <- "4-objective (with connectivity)"
+
+run_4obj <- load_run_data(RUN_DIR_4OBJ, LABEL_4OBJ)
+obj_names_4  <- run_4obj$obj_names
+obj_labels_4 <- gsub("_", " ", obj_names_4) |> tools::toTitleCase()
+
+cat(sprintf("Objectives: %s\n", paste(obj_names_4, collapse = ", ")))
+cat(sprintf("Solutions: %d total, %d non-dominated\n",
+            run_4obj$n_solutions, run_4obj$n_nondom))
+```
+
+## Algorithm convergence
+
+Hypervolume and per-objective mean (± 1 SD) across generations.
+
+```{r}
+#| label: 4obj-convergence
+#| fig-height: 6
+#| fig-width: 12
+make_hv_evo_plot(run_4obj, obj_names_4, obj_labels_4)
+```
+
+## Pareto front — pairwise trade-offs
+
+All six pairwise objective combinations. Note especially the panels involving
+`connectivity_gain` vs. each ecological and cost objective — these reveal whether
+connectivity trades off against or aligns with condition improvement.
+
+```{r}
+#| label: 4obj-pairwise
+#| fig-height: 8
+#| fig-width: 18
+
+# Existing make_pareto_pairwise produces one panel per pair; wrap at 3 columns
+# so the 6 panels appear as two rows of three.
+p_pairs <- make_pareto_pairwise(run_4obj, obj_names_4, obj_labels_4)
+
+# Override the default ncol if the function returns a patchwork object
+if (inherits(p_pairs, "patchwork")) {
+  p_pairs + patchwork::plot_layout(ncol = 3)
+} else {
+  p_pairs
+}
+```
+
+## Parallel coordinates
+
+Each axis is min-max normalised across all solutions. Thick coloured lines highlight the
+solution that is best on each individual objective; thin black lines are other non-dominated
+solutions; grey lines are dominated solutions.
+
+```{r}
+#| label: 4obj-parcoord
+#| fig-height: 5
+#| fig-width: 13
+
+# Extend best-solution colours to 4 objectives
+best_cols_4 <- c("#E05C2A", "#2A7BE0", "#2AB05C", "#9B59B6")
+make_parcoord_plot(run_4obj, obj_names_4, obj_labels_4, best_colours = best_cols_4)
+```
+
+## Objective correlations
+
+```{r}
+#| label: 4obj-corr
+#| fig-height: 5
+#| fig-width: 10
+make_corr_plot(run_4obj, obj_names_4, obj_labels_4)
+```
+
+## Action mix per solution
+
+Stacked bar showing how many pixels in each non-dominated solution are **restoration** actions
+vs **conversion** actions. Solutions are ordered by their connectivity gain objective value
+(ascending = most connectivity gain first), so the leftmost solutions are those that focus most
+on connectivity improvement via land-use conversion.
+
+```{r}
+#| label: 4obj-action-bar
+#| fig-height: 5
+#| fig-width: 14
+
+# Order by connectivity_gain if present, otherwise by first objective
+order_by <- if ("connectivity_gain" %in% obj_names_4) "connectivity_gain" else obj_names_4[1]
+make_action_stacked_bar(run_4obj, obj_names_4, obj_labels_4, order_obj = order_by)
+```
+
+## Spatial frequency by action type
+
+Selection frequency maps (RFOP %) for restoration and conversion actions separately, showing
+whether the two action types target different parts of the landscape.
+
+```{r}
+#| label: 4obj-action-maps
+#| fig-height: 6
+#| fig-width: 14
+make_action_split_freq_plot(run_4obj)
+```
+
+## Spatial distribution of selected areas (combined)
+
+Overall selection frequency across both action types.
+
+```{r}
+#| label: 4obj-sel-freq
+#| fig-height: 6
+#| fig-width: 8
+make_sel_freq_plot(run_4obj)
+```
+
+## Composition of selected pixels
+
+```{r}
+#| label: 4obj-composition
+#| fig-height: 5
+#| fig-width: 12
+#| layout-ncol: 2
+
+make_sel_freq_unified_plot(
+  run_4obj,
+  fill_values = rfop_fill_lulc(run_4obj, lulc),
+  fill_label  = "LULC class",
+  title       = "Selection frequency by LULC class"
+)
+
+make_sel_freq_unified_plot(
+  run_4obj,
+  fill_values = rfop_fill_objective(run_4obj, abiotic_anomaly),
+  fill_label  = "Abiotic anomaly quintile",
+  palette     = "YlOrRd",
+  title       = "Selection frequency by abiotic anomaly"
+)
+```
 
 # Effect of seeding on optimisation outcomes
 
@@ -498,7 +699,7 @@ cat(sprintf("Run B: %s  (%d solutions, %d non-dominated)\n",
 
 #### a) Convergence: does seeding accelerate convergence?
 
-Without seeding, the algorithm converges earlier. With seeding, it reaches a higher hypervolume, and shows slightly faster improvement from generations 2 - 6
+Without seeding, the algorithm converges earlier and shows faster improvement over early generations. With seeding, it reaches a higher hypervolume.
 
 ```{r}
 #| label: compare-hv
@@ -755,3 +956,6 @@ plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
 
 plot_jaccard_comparison(run_a, run_b, obj_names)
 ```
+
+---
+

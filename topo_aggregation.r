@@ -4,7 +4,7 @@ library(ggplot2)
 library(sf)
 library(patchwork)
 
-raster_path <- "abiotic_condition_anomaly.tif"
+raster_path <- "inputs/implementation_cost.tif"
 plot_dir <- "topo_aggregation_plots"
 n_variogram_samples <- 5000
 n_seeds <- 100
@@ -310,4 +310,4 @@ message("Saved plots to: ", normalizePath(plot_dir, winslash = "/", mustWork = F
 
 #reconvert seg_poly_idw to raster for export
 seg_r_idw <- rasterize(seg_poly_idw, r, field = "Mean", fun = "mean", background = NA)
-writeRaster(seg_r_idw, "abiotic_idw.tif", overwrite = TRUE)
+writeRaster(seg_r_idw, "cost_idw.tif", overwrite = TRUE)

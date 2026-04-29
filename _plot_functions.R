@@ -76,15 +76,28 @@ make_hv_evo_plot <- function(run, obj_names, obj_labels) {
 
 # ── Pareto front ──────────────────────────────────────────────────────────────
 
-make_pareto_extremes_plot <- function(run, obj_names, obj_labels, title = NULL) {
+make_pareto_extremes_plot <- function(run, obj_names, obj_labels, title = NULL,
+                                       scale_by_n_pixels = FALSE) {
   o1 <- obj_names[1]; o2 <- obj_names[2]; o3 <- obj_names[3]
   l1 <- obj_labels[1]; l2 <- obj_labels[2]; l3 <- obj_labels[3]
 
   df <- run$df_obj
 
+  if (scale_by_n_pixels && !is.null(run$df_psel)) {
+    n_pix <- run$df_psel |>
+      dplyr::count(solution_id, name = "n_pixels")
+    df <- df |>
+      dplyr::left_join(n_pix, by = "solution_id") |>
+      dplyr::mutate(dplyr::across(dplyr::all_of(obj_names), ~ . / n_pixels)) |>
+      dplyr::select(-n_pixels)
+    l1 <- paste0(l1, " / pixel")
+    l2 <- paste0(l2, " / pixel")
+    l3 <- paste0(l3, " / pixel")
+  }
+
   ggplot(df, aes(x = .data[[o1]], y = .data[[o2]])) +
     geom_point(aes(fill = .data[[o3]]), shape = 21, colour = "grey70",
-               size = 2, stroke = 0.8, alpha = 0.8) +
+               size = 4, stroke = 0.8, alpha = 0.8) +
     scale_fill_viridis_c(name = l3, option = "plasma") +
     labs(x = l1, y = l2)
 }
@@ -117,9 +130,21 @@ make_pareto_pairwise <- function(run, obj_names, obj_labels) {
     plot_annotation(theme = theme(plot.title = element_text(size = 13, face = "bold")))
 }
 
-make_corr_plot <- function(run, obj_names, obj_labels, title = NULL) {
+make_corr_plot <- function(run, obj_names, obj_labels, title = NULL, maximize = NULL) {
+  # Determine direction: TRUE = higher is better (same heuristic as prep_parcoord_data).
+  if (is.null(maximize)) {
+    maximize <- grepl("anomaly|gain", obj_names, ignore.case = TRUE)
+  }
+
   make_corr_tiles <- function(df, panel_label, n) {
-    corr <- cor(df[, obj_names], use = "complete.obs")
+    # Flip minimised objectives so that for all objectives higher = better.
+    # This ensures that a positive correlation means genuine alignment (both
+    # improve together) and a negative correlation means a true trade-off.
+    df_dir <- df
+    for (i in seq_along(obj_names)) {
+      if (!maximize[i]) df_dir[[obj_names[i]]] <- -df_dir[[obj_names[i]]]
+    }
+    corr <- cor(df_dir[, obj_names], use = "complete.obs")
     expand.grid(x_idx = seq_along(obj_names), y_idx = seq_along(obj_names)) %>%
       filter(y_idx > x_idx) %>%
       mutate(
@@ -153,8 +178,8 @@ make_corr_plot <- function(run, obj_names, obj_labels, title = NULL) {
               colour = "white", linewidth = 0.5) +
     geom_text(data = tiles, aes(x = x_label, y = y_label, label = r_text,
                                 colour = abs(r) > 0.5),
-              size = 4, fontface = "bold") +
-    facet_wrap(~panel, ncol = 2) +
+              size = 8, fontface = "bold") +
+    facet_wrap(~panel, ncol = 1) +
     scale_fill_distiller(palette = "RdBu", direction = -1, limits = c(-1, 1),
                          name = "Pearson r") +
     scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "black"), guide = "none") +
@@ -163,27 +188,55 @@ make_corr_plot <- function(run, obj_names, obj_labels, title = NULL) {
     theme(
       axis.text.x = element_text(angle = 30, hjust = 1),
       panel.grid  = element_blank(),
-      strip.text  = element_text(size = 10, face = "bold")
+      strip.text  = element_text(size = 18, face = "bold"), 
+      axis.text = element_text(size = 18),
+      legend.position = "none"
     )
 }
 
 prep_parcoord_data <- function(run, obj_names, obj_labels,
-                               best_colours = c("#E05C2A", "#2A7BE0", "#2AB05C")) {
+                               best_colours = c("#E05C2A", "#2A7BE0", "#2AB05C"),
+                               maximize = NULL) {
   df <- run$df_obj
-  extended_colours <- rep_len(best_colours, length(obj_names))
 
-  df_norm_local <- df %>%
-    mutate(
-      across(all_of(obj_names),
-             ~ (. - min(.)) / (max(.) - min(.)),
-             .names = "{.col}_norm"),
-      solution_id = paste(run$label, row_number(), sep = "__")
-    )
+  # If best_colours is a named vector, look up by objective name so colours
+  # are consistent regardless of objective order across runs.
+  # Fall back to positional rep_len for unnamed vectors.
+  if (!is.null(names(best_colours))) {
+    default_col <- "grey60"
+    extended_colours <- vapply(obj_names, function(nm) {
+      if (nm %in% names(best_colours)) best_colours[[nm]] else default_col
+    }, character(1))
+  } else {
+    extended_colours <- rep_len(best_colours, length(obj_names))
+  }
+
+  # Determine direction: TRUE = higher is better.
+  # Defaults to detecting "anomaly" or "gain" in the objective name.
+  if (is.null(maximize)) {
+    maximize <- grepl("anomaly|gain", obj_names, ignore.case = TRUE)
+  }
+
+  # Normalise to [0, 1] with 1 = better for all objectives.
+  # Maximise: (x - min) / (max - min)
+  # Minimise: (max - x) / (max - min)
+  df_norm_local <- df %>% mutate(solution_id = paste(run$label, row_number(), sep = "__"))
+  for (i in seq_along(obj_names)) {
+    x   <- df_norm_local[[obj_names[i]]]
+    rng <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
+    nc  <- paste0(obj_names[i], "_norm")
+    df_norm_local[[nc]] <- if (maximize[i]) {
+      (x - min(x, na.rm = TRUE)) / rng
+    } else {
+      (max(x, na.rm = TRUE) - x) / rng
+    }
+  }
 
   norm_cols <- paste0(obj_names, "_norm")
   nd_rows   <- df_norm_local[df_norm_local$is_nondominated == 1, ]
+  # 1 = best on all axes, so use which.max throughout
   best_sols <- vapply(norm_cols, function(nc) {
-    nd_rows$solution_id[which.min(nd_rows[[nc]])]
+    nd_rows$solution_id[which.max(nd_rows[[nc]])]
   }, character(1))
 
   sol_colour <- rep("grey85", nrow(df_norm_local))
@@ -204,13 +257,14 @@ prep_parcoord_data <- function(run, obj_names, obj_labels,
 }
 
 make_parcoord_plot <- function(run, obj_names, obj_labels,
-                               best_colours = c("#E05C2A", "#2A7BE0", "#2AB05C")) {
+                               best_colours = c("#E05C2A", "#2A7BE0", "#2AB05C"),
+                               maximize = NULL) {
   extended_colours <- rep_len(best_colours, length(obj_names))
   legend_breaks    <- c(extended_colours[seq_along(obj_names)], "black", "grey85")
   legend_labels    <- c(sprintf("Best: %s", obj_labels[seq_along(obj_names)]),
                         "Non-dominated", "Dominated")
 
-  df_pc       <- prep_parcoord_data(run, obj_names, obj_labels, best_colours)
+  df_pc       <- prep_parcoord_data(run, obj_names, obj_labels, best_colours, maximize)
   df_dom      <- df_pc[df_pc$line_colour == "grey85", ]
   df_nd_plain <- df_pc[df_pc$line_colour == "black",  ]
   df_nd_best  <- df_pc[!df_pc$line_colour %in% c("grey85", "black"), ]
@@ -329,6 +383,60 @@ make_jaccard_plot <- function(run, obj_names, title = NULL) {
 
 # ── Selection frequency maps ──────────────────────────────────────────────────
 
+# Internal helper: builds a small vertical histogram inset coloured by the same
+# YlOrRd ramp as the map.  Returns a ggplot (consumed by patchwork::inset_element).
+.rfop_inset_grob <- function(freq_df, binwidth = 5) {
+  ylord_cols <- c("#FFFFCC", "#FFEDA0", "#FED976", "#FEB24C",
+                  "#FD8D3C", "#FC4E2A", "#E31A1C", "#BD0026", "#800026")
+  pal_fn <- colorRampPalette(ylord_cols)
+
+  bin_df <- freq_df %>%
+    mutate(rfop_bin = floor(rfop_pct / binwidth) * binwidth + binwidth / 2) %>%
+    dplyr::count(rfop_bin, name = "n_pixels") %>%
+    mutate(bar_fill = pal_fn(100)[pmax(1L, pmin(100L, as.integer(rfop_bin)))])
+
+  ggplot(bin_df, aes(x = rfop_bin, y = n_pixels, fill = bar_fill)) +
+    geom_col(width = binwidth * 0.85, colour = NA) +
+    scale_fill_identity() +
+    scale_x_continuous(
+      limits = c(0, 105),
+      breaks = c(0, 25, 50, 75, 100),
+      labels = c("0", "25%", "50%", "75%", "100%"),
+      expand = expansion(0)
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult = c(0, 0.12)),
+      labels = scales::label_number(scale_cut = scales::cut_short_scale())
+    ) +
+    coord_flip() +
+    labs(x = "RFOP", y = "") +
+    theme_minimal(base_size = 6) +
+    theme(
+      plot.background  = element_rect(fill = "#f1f1f1", colour = "#ffffff",
+                                      linewidth = 0.4),
+      panel.background = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(),
+      axis.title       = element_text(size = 8),
+      axis.text        = element_text(size = 8),
+      axis.text.x      = element_blank(),
+      plot.margin      = margin(3, 4, 3, 3)
+    )
+}
+
+# Place RFOP inset in the top-right corner using patchwork::inset_element().
+# Coordinates are normalised (0–1) relative to the panel, so they work
+# regardless of the map's coordinate system (including coord_sf).
+.add_rfop_inset <- function(p_map, freq_df,
+                             left = 0.72, bottom = 0.58,
+                             right = 0.99, top = 0.99) {
+  p_map + patchwork::inset_element(
+    .rfop_inset_grob(freq_df),
+    left = left, bottom = bottom, right = right, top = top,
+    align_to = "panel"
+  )
+}
+
 make_sel_freq_plot <- function(run) {
   if (is.null(run$df_psel)) {
     return(ggplot() +
@@ -345,20 +453,22 @@ make_sel_freq_plot <- function(run) {
     anti_join(run$df_elig, freq_df, by = c("x", "y"))
   } else NULL
 
-  p <- ggplot() +
+  p_map <- ggplot() +
     theme_void() +
     theme(panel.background = element_rect(fill = "white", colour = NA),
           plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
-          legend.position  = "right")
+          legend.position  = "none") +
+    labs(title = run$label)
 
   if (!is.null(elig_unsel) && nrow(elig_unsel) > 0)
-    p <- p + geom_raster(data = elig_unsel, aes(x = x, y = y), fill = "grey80")
+    p_map <- p_map + geom_raster(data = elig_unsel, aes(x = x, y = y), fill = "grey80")
 
-  p +
+  p_map <- p_map +
     geom_raster(data = freq_df, aes(x = x, y = y, fill = rfop_pct)) +
-    scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "RFOP (%)",
-                         limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
+    scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, 100)) +
     geom_sf(data = BE, fill = NA, color = "black", inherit.aes = FALSE)
+
+  .add_rfop_inset(p_map, freq_df)
 }
 
 make_sel_freq_plot_agg_hex <- function(run, bins = 30) {
@@ -379,41 +489,54 @@ make_sel_freq_plot_agg_hex <- function(run, bins = 30) {
     st_coordinates() %>%
     as.data.frame()
 
-  p <- ggplot() +
+  p_map <- ggplot() +
     theme_void() +
     theme(panel.background = element_rect(fill = "white", colour = NA),
           plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
-          legend.position  = "right")
+          legend.position  = "none") +
+    labs(title = run$label)
 
   if (!is.null(run$df_elig)) {
-    p <- p + stat_summary_hex(
+    p_map <- p_map + stat_summary_hex(
       data = run$df_elig, aes(x = x, y = y, z = 1),
       fun = function(x) 1, bins = bins, fill = "grey80",
       colour = "white", size = 0.1
     )
   }
 
-  p +
+  p_map <- p_map +
     stat_summary_hex(data = freq_df, aes(x = x, y = y, z = rfop_pct),
                      fun = mean, bins = bins, colour = "white", size = 0.1) +
-    scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "Mean RFOP (%)",
-                         limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
+    scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, 100)) +
     geom_path(data = be_outline,
               aes(x = X, y = Y, group = interaction(L1, L2)),
               color = "black", linewidth = 0.5, inherit.aes = FALSE)
+
+  # Inset histogram uses pixel-level RFOP (not hex-aggregated means)
+  elig_unsel <- if (!is.null(run$df_elig)) {
+    anti_join(run$df_elig, freq_df, by = c("x", "y"))
+  } else NULL
+
+  .add_rfop_inset(p_map, freq_df)
 }
 
 
 # ── Selection frequency histograms ────────────────────────────────────────────
 
 # Stacked RFOP histogram coloured by an arbitrary grouping variable.
-# `fill_values`: factor of length == nrow(count(df_psel, x, y)).
-# `palette`:     RColorBrewer name OR named colour vector.
+# `fill_values`:      factor of length == nrow(count(df_psel, x, y)).
+# `elig_fill_values`: optional factor for ALL eligible pixels (from elig_fill_lulc /
+#                     elig_fill_objective).  When supplied the y-axis shows the
+#                     proportion of each class's eligible pixels that fall in each
+#                     RFOP bin rather than the raw pixel count.
+# `palette`:          RColorBrewer name OR named colour vector.
 make_sel_freq_unified_plot <- function(run, fill_values, fill_label = "Class",
-                                       palette = "Set3", binwidth = 5,
+                                       elig_fill_values = NULL,
+                                       palette = "Set3", binwidth = 10,
                                        position = "stack",
-                                       title = "Selection Frequency Composition",
-                                       subtitle = NULL) {
+                                       title = NULL,
+                                       subtitle = NULL,
+                                       top_n = NULL) {
   if (is.null(run$df_psel)) return(NULL)
 
   freq_df <- run$df_psel %>%
@@ -423,13 +546,51 @@ make_sel_freq_unified_plot <- function(run, fill_values, fill_label = "Class",
   stopifnot(length(fill_values) == nrow(freq_df))
   freq_df$fill_group <- as.factor(fill_values)
 
-  p <- ggplot(freq_df, aes(x = rfop_pct, fill = fill_group)) +
+  # Collapse all but the top_n most frequent classes into "Other"
+  if (!is.null(top_n)) {
+    top_classes <- freq_df %>%
+      count(fill_group, wt = n_selected, name = "total") %>%
+      slice_max(total, n = top_n) %>%
+      pull(fill_group) %>%
+      as.character()
+    freq_df <- freq_df %>%
+      mutate(fill_group = factor(
+        ifelse(as.character(fill_group) %in% top_classes,
+               as.character(fill_group), "Other"),
+        levels = c(top_classes, "Other")
+      ))
+    if (!is.null(elig_fill_values)) {
+      elig_fill_values <- ifelse(
+        as.character(elig_fill_values) %in% top_classes,
+        as.character(elig_fill_values), "Other"
+      )
+    }
+  }
+
+  # When eligible-pixel class counts are available, weight each selected pixel
+  # by 1 / (total eligible pixels in that class).  The histogram then sums
+  # weights per bin, giving the proportion of each class's eligible area
+  # that appears at each RFOP level.
+  if (!is.null(elig_fill_values)) {
+    class_totals <- table(as.factor(elig_fill_values))
+    freq_df <- freq_df %>%
+      mutate(weight = 1 / as.numeric(class_totals[as.character(fill_group)]))
+    y_label <- "Proportion of eligible class pixels"
+    y_scale <- scale_y_continuous(labels = scales::percent_format(accuracy = 0.1))
+  } else {
+    freq_df$weight <- 1
+    y_label <- if (position == "fill") "Proportion" else "Pixel Count"
+    y_scale <- scale_y_continuous()
+  }
+
+  p <- ggplot(freq_df, aes(x = rfop_pct, fill = fill_group, weight = weight)) +
     geom_histogram(binwidth = binwidth, colour = "black", linewidth = 0.1,
                    position = position) +
     scale_x_continuous(limits = c(0, 100)) +
+    y_scale +
     labs(title = title, subtitle = subtitle,
          x = "Selection Frequency (RFOP %)",
-         y = if (position == "fill") "Proportion" else "Pixel Count") +
+         y = y_label) +
     theme_minimal() +
     theme(legend.position = "bottom", panel.grid.minor = element_blank())
 
@@ -439,20 +600,86 @@ make_sel_freq_unified_plot <- function(run, fill_values, fill_label = "Class",
     p + scale_fill_manual(values = palette, name = fill_label)
 }
 
-rfop_fill_lulc <- function(run, lulc_raster, col_idx = 2) {
+# Reclassify a factor of raw LULC codes into named habitat classes.
+# Codes not in the map are set to NA.  Useful before passing to
+# make_sel_freq_unified_plot or elig_fill_lulc.
+# Usage: rfop_fill_lulc(run, lulc) |> reclass_lulc()
+reclass_lulc <- function(lulc_codes, reclass_map = NULL) {
+  if (is.null(reclass_map)) {
+    reclass_map <- c(
+      "12" = "Forest",
+      "13" = "Forest",
+      "15" = "Agricultural land",
+      "16" = "Pastures & grasslands",
+      "17" = "Pastures & grasslands"
+    )
+  }
+  codes_chr <- as.character(lulc_codes)
+  labels    <- reclass_map[codes_chr]
+  labels[is.na(labels)] <- NA_character_
+  lvls <- unique(reclass_map)                 # stable order from the map
+  factor(labels, levels = lvls)
+}
+
+rfop_fill_lulc <- function(run, lulc_raster, col_idx = 2, pts_crs = NULL) {
   freq_df <- run$df_psel %>% count(x, y)
-  vals    <- terra::extract(lulc_raster, freq_df[, c("x", "y")])
+  coords  <- freq_df[, c("x", "y")]
+  if (!is.null(pts_crs)) {
+    pts  <- terra::vect(coords, geom = c("x", "y"), crs = pts_crs)
+    pts  <- terra::project(pts, terra::crs(lulc_raster))
+    vals <- terra::extract(lulc_raster, pts)
+  } else {
+    vals <- terra::extract(lulc_raster, coords)
+  }
   as.factor(vals[, col_idx])
 }
 
-rfop_fill_objective <- function(run, obj_raster, n_breaks = 5,
+# Quartile breaks are defined over the eligible pixel population (run$df_elig)
+# when available, so levels are consistent with elig_fill_objective().
+rfop_fill_objective <- function(run, obj_raster, n_breaks = 4,
                                 labels = paste0("Q", seq_len(n_breaks)),
                                 col_idx = 1) {
-  freq_df <- run$df_psel %>% count(x, y)
-  vals    <- terra::extract(obj_raster, freq_df[, c("x", "y")])[, col_idx + 1]
-  cut(vals,
-      breaks = quantile(vals, probs = seq(0, 1, length.out = n_breaks + 1), na.rm = TRUE),
-      labels = labels, include.lowest = TRUE)
+  ref_coords <- if (!is.null(run$df_elig)) {
+    run$df_elig[, c("x", "y")]
+  } else {
+    run$df_psel %>% count(x, y) %>% select(x, y)
+  }
+  ref_vals <- terra::extract(obj_raster, ref_coords)[, col_idx + 1]
+  brk      <- quantile(ref_vals, probs = seq(0, 1, length.out = n_breaks + 1), na.rm = TRUE)
+  brk[1]           <- -Inf
+  brk[n_breaks + 1] <- Inf
+
+  sel_coords <- run$df_psel %>% count(x, y) %>% select(x, y)
+  vals       <- terra::extract(obj_raster, sel_coords)[, col_idx + 1]
+  as.factor(cut(vals, breaks = brk, labels = labels, include.lowest = TRUE))
+}
+
+# ── Eligible-pixel fill helpers (denominators for make_sel_freq_unified_plot) ─
+
+elig_fill_lulc <- function(run, lulc_raster, col_idx = 2, pts_crs = NULL) {
+  if (is.null(run$df_elig)) return(NULL)
+  coords <- run$df_elig[, c("x", "y")]
+  if (!is.null(pts_crs)) {
+    pts  <- terra::vect(coords, geom = c("x", "y"), crs = pts_crs)
+    pts  <- terra::project(pts, terra::crs(lulc_raster))
+    vals <- terra::extract(lulc_raster, pts)
+  } else {
+    vals <- terra::extract(lulc_raster, coords)
+  }
+  as.factor(vals[, col_idx])
+}
+
+# Quartile breaks derived from the eligible population (same breaks as
+# rfop_fill_objective so factor levels match across the two functions).
+elig_fill_objective <- function(run, obj_raster, n_breaks = 4,
+                                labels = paste0("Q", seq_len(n_breaks)),
+                                col_idx = 1) {
+  if (is.null(run$df_elig)) return(NULL)
+  vals <- terra::extract(obj_raster, run$df_elig[, c("x", "y")])[, col_idx + 1]
+  brk  <- quantile(vals, probs = seq(0, 1, length.out = n_breaks + 1), na.rm = TRUE)
+  brk[1]           <- -Inf
+  brk[n_breaks + 1] <- Inf
+  as.factor(cut(vals, breaks = brk, labels = labels, include.lowest = TRUE))
 }
 
 
@@ -535,29 +762,37 @@ make_action_split_freq_plot <- function(run,
       count(x, y, name = "n_selected") %>%
       mutate(rfop_pct = n_selected / n_nd * 100)
 
-    if (nrow(freq_df) == 0) return(ggplot() + labs(title = paste("No", action, "actions")))
+    if (nrow(freq_df) == 0) {
+      return(ggplot() +
+               annotate("text", x = 0.5, y = 0.5,
+                        label = paste("No", action, "actions"), size = 5) +
+               theme_void() +
+               labs(title = sprintf("%s", title_suffix)))
+    }
 
-    # Canton outline
-    be_outline <- tryCatch(
-      st_coordinates(BE) %>% as.data.frame(),
-      error = function(e) NULL
-    )
+    p <- ggplot() +
+      theme_void() +
+      theme(panel.background = element_rect(fill = "white", colour = NA),
+            plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
+            legend.position  = "none")
 
-    p <- ggplot(freq_df, aes(x = x, y = y, colour = rfop_pct)) +
-      geom_point(size = 0.8, shape = 15) +
-      scale_colour_distiller(palette = palette, direction = 1,
-                             name = "RFOP %",
-                             limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
-      coord_equal() +
-      theme_sp +
+    # Eligible-but-unselected underlay: only meaningful for restore, because
+    # df_elig contains restoration-eligible pixels; conversion-eligible pixels
+    # occupy a different part of the landscape and would obscure the convert map.
+    if (action == "restore" && !is.null(run$df_elig)) {
+      elig_unsel <- anti_join(run$df_elig, freq_df, by = c("x", "y"))
+      if (nrow(elig_unsel) > 0)
+        p <- p + geom_raster(data = elig_unsel, aes(x = x, y = y), fill = "grey80")
+    }
+
+    p <- p +
+      geom_raster(data = freq_df, aes(x = x, y = y, fill = rfop_pct)) +
+      scale_fill_distiller(palette = palette, direction = 1,
+                           limits = c(0, 100)) +
+      geom_sf(data = BE, fill = NA, colour = "black", inherit.aes = FALSE) +
       labs(title = sprintf("%s — %s", run$label, title_suffix))
 
-    if (!is.null(be_outline)) {
-      p <- p + geom_path(data = be_outline,
-                         aes(x = X, y = Y, group = interaction(L1, L2)),
-                         colour = "black", linewidth = 0.5, inherit.aes = FALSE)
-    }
-    p
+    .add_rfop_inset(p, freq_df)
   }
 
   p_restore <- make_one_map("restore", colours_restore, "Restoration frequency")
@@ -565,7 +800,6 @@ make_action_split_freq_plot <- function(run,
 
   p_restore + p_convert +
     patchwork::plot_annotation(
-      title = "Spatial selection frequency by action type (RFOP %)",
       theme = theme(plot.title = element_text(size = 13, face = "bold"))
     )
 }

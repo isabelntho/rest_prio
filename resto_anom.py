@@ -27,7 +27,7 @@ from pymoo.indicators.hv import HV
 from pymoo.util.ref_dirs import get_reference_directions
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
-from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation
+from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache
 from data_loader import load_initial_conditions
 from results_saving import save_results_with_reports
 from patch_approach import (
@@ -35,6 +35,7 @@ from patch_approach import (
     PatchRepair,
     PatchAwareSampling,
     aggregate_patch_scores_from_pixel_scores,
+    assign_patches_to_regions,
 )
 from scenarios import sample_scenario_parameters
 from time import time
@@ -1142,6 +1143,21 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
 
         repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=12)
 
+        # Burden-sharing: build region assignments only when requested.
+        # build_region_assignments_cache must be called first so the cache exists
+        # when assign_patches_to_regions inspects it (the cache is normally built
+        # lazily inside apply_burden_sharing, which is only used in the non-patch
+        # path, so it would never be populated here without this explicit call).
+        burden_sharing_enabled = scenario_params.get('burden_sharing', 'no') == 'yes'
+        if burden_sharing_enabled:
+            build_region_assignments_cache(initial_conditions)
+        patch_region_assignments = (
+            assign_patches_to_regions(
+                initial_conditions['patch_mappings'], initial_conditions
+            )
+            if burden_sharing_enabled else None
+        )
+
         sampling = PatchAwareSampling(
             patch_mappings=initial_conditions['patch_mappings'],
             target_pixels=problem.target_constraint_value,
@@ -1150,6 +1166,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             score_temperature=patch_score_temperature,
             random_share=patch_random_share,
             per_objective_patch_scores=per_obj_patch_scores,
+            patch_region_assignments=patch_region_assignments,
         )
         repair = PatchRepair(
             constraint_type=patch_constraint_type,
@@ -1161,6 +1178,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             top_k=patch_repair_top_k,
             per_objective_patch_scores=per_obj_patch_scores if warm_seeding else None,
             ref_dirs=repair_ref_dirs,
+            patch_region_assignments=patch_region_assignments,
         ) if use_repair else None
 
         if verbose:

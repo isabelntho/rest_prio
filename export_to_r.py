@@ -13,7 +13,7 @@ Outputs (written to <output_dir>/):
 
 Usage:
     python export_to_r.py results_files/res_fg_20260415_1840_cost_corrected.pkl
-    python export_to_r.py results_files/res_20260423_1234_4obj_02sample.pkl --output-dir r_inputs/4obj_02sample_firsttry
+    python export_to_r.py results_files/res_20260427_1100_3obj_rf10_bs.pkl --output-dir r_inputs/3obj_bs
 """
 
 import argparse
@@ -66,6 +66,34 @@ def _expand_patches_to_pixels(decisions_patches, patch_mappings, n_restoration_p
     result = []
     for sol_idx in range(n_solutions):
         selected = np.where(decisions_patches[sol_idx, :n_restoration_patches] == 1)[0]
+        px_indices = []
+        for p in selected:
+            px_indices.extend(patch_to_pixels.get(p, []))
+        result.append(np.array(px_indices, dtype=np.int64))
+    return result
+
+
+def _expand_conversion_patches_to_pixels(decisions_patches, patch_mappings, n_restoration_patches):
+    """
+    Expand conversion patch columns of the decision matrix to pixel indices per solution.
+
+    Returns a list of length n_solutions; each element is a 1-D int array of
+    eligible-pixel indices (0-based into conversion_eligible_indices).
+    Returns None if no conversion patch mapping is available.
+    """
+    conversion_pm = patch_mappings.get("conversion_patches", {})
+    patch_to_pixels = conversion_pm.get("patch_to_pixels")
+    if patch_to_pixels is None:
+        return None
+    n_conversion_patches = conversion_pm.get("n_patches", 0)
+    if n_conversion_patches == 0:
+        return None
+
+    n_solutions = decisions_patches.shape[0]
+    result = []
+    for sol_idx in range(n_solutions):
+        conv_slice = decisions_patches[sol_idx, n_restoration_patches:n_restoration_patches + n_conversion_patches]
+        selected = np.where(conv_slice == 1)[0]
         px_indices = []
         for p in selected:
             px_indices.extend(patch_to_pixels.get(p, []))
@@ -205,7 +233,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
             print("  Expanding patch decisions to pixel level ...")
             n_restoration_patches = problem_info.get("n_restoration_patches", decisions.shape[1])
             per_sol_px_indices   = _expand_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
-            per_sol_conv_indices = None  # patch approach does not cover conversion
+            per_sol_conv_indices = _expand_conversion_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
         elif not is_patch_based:
             # pixel-level: first n_restoration_pixels = restore, next n_conversion_pixels = convert
             per_sol_px_indices = [
@@ -376,3 +404,32 @@ if __name__ == "__main__":
 # population_stats.csv	Per-generation mean/std/min/max for each objective
 # pixel_selection.csv	Long-format: solution_id, action_type ("restore"/"convert"), pixel_row/x, pixel_col/y (non-dominated solutions by default)
 # metadata.json	Run config, scenario params, algorithm settings, raster grid info (CRS, transform, shape)
+
+
+
+## saving eligible pixels raster.. code snippet
+
+#import numpy as np
+#import rasterio as rio
+#from data_loader import load_initial_conditions
+
+#ic = load_initial_conditions(
+#    ".",
+#    objectives=["abiotic", "biotic", "cost"],
+#    region="Bern",
+#    ecosystem="fg",
+#)
+
+#eligible = ic["eligible_mask"].astype(np.uint8)  # 1=eligible, 0=not eligible
+
+#with rio.open("inputs/abiotic_condition_anomaly.tif") as src:
+#    profile = src.profile.copy()
+
+#profile.update(dtype=rio.uint8, count=1, nodata=None)
+
+#out_path = "inputs/eligible_pixels_fg.tif"
+#with rio.open(out_path, "w", **profile) as dst:
+#    dst.write(eligible, 1)
+
+#n = int(eligible.sum())
+#print(f"Saved {out_path}  ({n} eligible pixels, {100*n/eligible.size:.1f}% of raster)")

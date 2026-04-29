@@ -133,6 +133,51 @@ def compute_connectivity_gain_array(lu, nodata, res, focal_classes, radius_m=100
 # =============================================================================
 
 
+def build_region_assignments_cache(initial_conditions):
+    """
+    Build (or retrieve) the per-pixel region-assignment cache in ``initial_conditions``.
+
+    Maps each restoration-eligible pixel (indexed by position within
+    ``initial_conditions['eligible_indices']``) to its admin region ID.  The
+    result is stored in-place as ``_region_assignments_cache`` and
+    ``_non_empty_regions_cache`` so subsequent calls are free.
+
+    Does nothing when ``admin_data`` is absent.
+    """
+    admin_data = initial_conditions.get('admin_data')
+    if admin_data is None or '_region_assignments_cache' in initial_conditions:
+        return
+
+    from rasterio.features import rasterize
+
+    shape = initial_conditions['shape']
+    eligible_indices = initial_conditions['eligible_indices']
+    transform = initial_conditions['transform']
+
+    region_assignments = np.full(len(eligible_indices), -1, dtype=int)
+
+    for i, region in enumerate(admin_data['unique_regions']):
+        region_geom = admin_data['gdf'][admin_data['gdf'][admin_data['region_column']] == region]
+        region_mask = rasterize(
+            region_geom.geometry,
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            default_value=1,
+        ).astype(bool)
+        eligible_in_region = region_mask.flatten()[eligible_indices]
+        region_assignments[eligible_in_region] = i
+
+    non_empty_regions = []
+    for region_id in range(admin_data['n_regions']):
+        region_pixels = np.where(region_assignments == region_id)[0]
+        if len(region_pixels) > 0:
+            non_empty_regions.append((region_id, region_pixels))
+
+    initial_conditions['_region_assignments_cache'] = region_assignments
+    initial_conditions['_non_empty_regions_cache'] = non_empty_regions
+
+
 def apply_burden_sharing(decision_vars, initial_conditions, seed=None, exact_count=None):
     """
     Apply burden sharing to ensure equal restoration across admin regions.
@@ -159,52 +204,9 @@ def apply_burden_sharing(decision_vars, initial_conditions, seed=None, exact_cou
     if total_restore == 0:
         return decision_vars.copy()
     
-    # Check if we already have cached region assignments
-    if '_region_assignments_cache' not in initial_conditions:
-        #print("DEBUG: Building region assignments cache (first time only)...")
-        shape = initial_conditions['shape']
-        eligible_indices = initial_conditions['eligible_indices']
-        
-        # Create raster mask for each admin region
-        from rasterio.features import rasterize
-        
-        transform = initial_conditions['transform']
-        crs = initial_conditions['crs']
-        
-        # Create region assignment for eligible pixels
-        region_assignments = np.full(len(eligible_indices), -1, dtype=int)
-        
-        # For each region, determine which eligible pixels belong to it
-        for i, region in enumerate(admin_data['unique_regions']):
-            region_geom = admin_data['gdf'][admin_data['gdf'][admin_data['region_column']] == region]
-            
-            # Rasterize this region
-            region_mask = rasterize(
-                region_geom.geometry,
-                out_shape=shape,
-                transform=transform,
-                fill=0,
-                default_value=1
-            ).astype(bool)
-            
-            # Find eligible pixels in this region
-            eligible_in_region = region_mask.flatten()[eligible_indices]
-            region_assignments[eligible_in_region] = i
-        
-        # Cache the assignments and create a list of non-empty regions
-        non_empty_regions = []
-        for region_id in range(admin_data['n_regions']):
-            region_pixels = np.where(region_assignments == region_id)[0]
-            if len(region_pixels) > 0:
-                non_empty_regions.append((region_id, region_pixels))
-        
-        initial_conditions['_region_assignments_cache'] = region_assignments
-        initial_conditions['_non_empty_regions_cache'] = non_empty_regions
-        #print(f"DEBUG: Cached {len(non_empty_regions)} non-empty regions out of {admin_data['n_regions']} total")
-    else:
-        # Use cached data
-        region_assignments = initial_conditions['_region_assignments_cache']
-        non_empty_regions = initial_conditions['_non_empty_regions_cache']
+    build_region_assignments_cache(initial_conditions)
+    region_assignments = initial_conditions['_region_assignments_cache']
+    non_empty_regions = initial_conditions['_non_empty_regions_cache']
     
     # Calculate target restoration per region (equal sharing)
     n_regions = admin_data['n_regions']

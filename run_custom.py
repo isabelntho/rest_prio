@@ -19,7 +19,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "4obj_02sample"
+RUN_LABEL = "all_idw"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -36,7 +36,7 @@ log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.l
 if log_path:
     print(f"Verbose output → {log_path}")
 
-OBJECTIVES = ["abiotic", "biotic", "cost", "connectivity"]
+OBJECTIVES = ["abiotic", "biotic", "cost"]
 # Available objective names:
 #   "abiotic"      – minimise abiotic condition anomaly (restoration pixels)
 #   "biotic"       – minimise biotic condition anomaly (restoration pixels)
@@ -44,14 +44,14 @@ OBJECTIVES = ["abiotic", "biotic", "cost", "connectivity"]
 #   "connectivity" – maximise connectivity gain (precomputed per pixel, conversion pixels)
 #                    Replaces the older "landscape" objective as the default landscape metric.
 #   "landscape"    – legacy landscape anomaly via SN-density recalculation (conversion pixels)
-SAMPLE_FRACTION = 0.2
+SAMPLE_FRACTION = None
 SAMPLE_SEED = 42
 POP_SIZE = 50
 N_GENERATIONS = 100
 N_JOBS = 12
 RANDOM_SEED = 42
 N_SAMPLES_PER_PARAM = 3
-N_PARTITIONS = 8
+N_PARTITIONS = 12
 WARM_SEEDING = True
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
@@ -63,6 +63,7 @@ custom_scenario_params = {
     "normalize_objectives": True,
     "patch_score_temperature": 2.0,
     "patch_repair_top_k": 100,
+    "burden_sharing": "no",
 }
 
 # Patch approach settings
@@ -77,7 +78,7 @@ AGGREGATION_FACTOR = None
 
 # Set to True to save per-generation population snapshots for animation
 # Output: intermediate_results/X_history_{timestamp}.npz  shape=(n_gens, pop_size, n_var) int8
-SAVE_SNAPSHOTS = True
+SAVE_SNAPSHOTS = False
 
 # Snapshot of the full configuration block — written to run_registry.jsonl alongside results.
 run_config = {
