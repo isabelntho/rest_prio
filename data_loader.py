@@ -362,7 +362,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
 
 def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosystem='all', 
                             sample_fraction=None, sample_seed=42, ecosystem_lulc_path=None, landscape_lulc_path=None,
-                            aggregation_factor=None):
+                            aggregation_factor=None, condition_scenario='global_all'):
     """
     Args:
         workspace_dir: Directory containing input data files (.tif)
@@ -380,16 +380,18 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                            (e.g., 2 halves resolution in each dimension, reducing pixels by ~4x).
                            Objective arrays are block-averaged; eligibility masks use any-eligible logic.
                            None or 1 disables aggregation.
+        condition_scenario: Tag identifying which pre-computed anomaly rasters to load from
+                           inputs/anomaly_scenarios/. E.g. 'global_all', 'global_drop_smd',
+                           'upper_q75_all'. Defaults to 'global_all'.
     Returns:
         dict: Initial conditions for specified objectives and ecosystem
     """
     # Define all possible objectives and their file mappings.
     # A value of None means the objective is computed in-memory (no file required).
+    # Abiotic and biotic paths resolve from inputs/anomaly_scenarios/ via condition_scenario.
     all_objectives = {
-        'abiotic': 'inputs/abiotic_condition_anomaly.tif',
-        'biotic': 'inputs/biotic_condition_anomaly.tif', 
-        #'abiotic': 'inputs/abiotic_idw.tif',
-        #'biotic': 'inputs/biotic_idw.tif', 
+        'abiotic': f'inputs/anomaly_scenarios/abiotic_{condition_scenario}.tif',
+        'biotic':  f'inputs/anomaly_scenarios/biotic_{condition_scenario}.tif',
         'landscape': 'inputs/sn_dens.tif',
         'connectivity': None,  # Computed in-memory from landscape LULC; no file required
         'cost': 'inputs/implementation_cost_corrected.tif',

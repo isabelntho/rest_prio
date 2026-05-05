@@ -50,6 +50,7 @@ seeds.py
 optimization_results_analysis.qmd
 opt_results_scan.ipynb
 
+batch_export_runs.py
 inspect_costs.py
 inspect_x_history.py
 compare_pickles.py
@@ -65,3 +66,7 @@ landscape_condition_anomalyFOR.tif
 selection_frequency_fg_aggregated.tif
 implementation_cost.tif
 eligible_pixels_fg.tif
+*drop_*.tif
+*global_all.tif
+*upper_q75_all.tif
+logs/profile_combined_baseline_speedcheck.txt

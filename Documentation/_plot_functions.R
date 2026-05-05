@@ -994,3 +994,1023 @@ plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
       x = NULL, y = "Jaccard similarity"
     )
 }
+
+
+# ── Spatial priority classification ──────────────────────────────────────────
+#
+# These functions support the multi-run spatial classification analysis.
+# The workflow is:
+#   1. load_run_rfop()              — load one run's per-pixel RFOP + metadata
+#   2. bind_rows() over many runs   — one row per pixel per run
+#   3. compute_spatial_classification() — classify each eligible pixel
+#   4. make_classification_map()    — categorical raster map
+#   5. make_classification_summary_bar() — % area per class
+#
+# Classification dimensions:
+#   dim_type = "indicator"  — condition/indicator assumption runs
+#   dim_type = "policy"     — policy decision runs (e.g. burden sharing)
+#   dim_type = "seed"       — stochastic replicate runs
+#   dim_type = "param"      — continuous parameter sweep runs (optional)
+
+
+# Load a single run's pixel-level RFOP and attach sensitivity-dimension metadata.
+# Returns a data frame with columns: x, y, rfop_pct, run_label, dim_type, group_label.
+# rfop_pct is computed relative to that run's own Pareto front size, so runs with
+# different numbers of non-dominated solutions are directly comparable.
+#
+# dir_path    : path to an r_inputs/<label>/ export folder
+# label       : human-readable label for this specific run
+# dim_type    : sensitivity dimension this run belongs to ("indicator", "policy",
+#               "seed", or "param")
+# group_label : the specific group within that dimension (e.g. "global_all",
+#               "burden_sharing_yes", "seed_101")
+load_run_rfop <- function(dir_path, label, dim_type, group_label) {
+  dir_path <- normalizePath(dir_path, mustWork = TRUE)
+
+  psel_path <- file.path(dir_path, "pixel_selection.csv")
+  if (!file.exists(psel_path)) {
+    warning(sprintf("pixel_selection.csv not found in %s — skipping.", dir_path))
+    return(NULL)
+  }
+
+  meta_path <- file.path(dir_path, "metadata.json")
+  n_nondom  <- if (file.exists(meta_path)) {
+    meta <- jsonlite::read_json(meta_path)
+    as.integer(meta$n_nondominated_solutions %||% meta$n_solutions %||% 1L)
+  } else {
+    warning(sprintf("metadata.json not found in %s — rfop_pct will be approximate.", dir_path))
+    NA_integer_
+  }
+
+  df <- read.csv(psel_path)
+
+  # Aggregate over solutions: count how many non-dominated solutions selected each pixel
+  freq_df <- df |>
+    dplyr::count(x, y, name = "n_selected") |>
+    dplyr::mutate(
+      rfop_pct    = n_selected / n_nondom * 100,
+      run_label   = label,
+      dim_type    = dim_type,
+      group_label = group_label
+    ) |>
+    dplyr::select(x, y, rfop_pct, run_label, dim_type, group_label)
+
+  freq_df
+}
+
+# Null-coalescing operator (available in R 4.4+; define here for older versions)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+
+# Classify each eligible pixel into one of five priority classes based on
+# its mean RFOP across all runs and the sensitivity profile across dimensions.
+#
+# runs_df       : bind_rows() of load_run_rfop() outputs; columns
+#                 x, y, rfop_pct, run_label, dim_type, group_label
+# elig_df       : eligible_pixels.csv data frame (x, y) — used to ensure every
+#                 eligible pixel receives a class (pixels absent from all runs
+#                 are treated as rfop_pct = 0 and classified as "Low priority")
+# thresh_low    : pixels with mean_rfop < thresh_low across all runs → "Low priority"
+# thresh_high   : pixels with mean_rfop >= thresh_high AND low sensitivity → "Robust priority"
+# thresh_stable : normalised sensitivity threshold below which a dimension is
+#                 considered negligible; nsens = range(group means) / (mean_rfop + 1)
+#
+# Returns a data frame with one row per eligible pixel:
+#   x, y, mean_rfop_all, sens_indicator, sens_policy, sens_seed, sens_param,
+#   dominant_dim, classification (ordered factor)
+compute_spatial_classification <- function(
+    runs_df,
+    elig_df       = NULL,
+    thresh_low    = 20,
+    thresh_high   = 60,
+    thresh_stable = 0.3
+) {
+  stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+
+  # ── Step 1: mean RFOP per pixel per (dim_type × group_label) ─────────────
+  # For each sensitivity dimension, compute the mean rfop_pct across all runs
+  # that belong to the same group, then take the range across groups.
+  # This separates within-group noise from between-group signal.
+  per_dim_sens <- runs_df |>
+    dplyr::group_by(x, y, dim_type, group_label) |>
+    dplyr::summarise(group_mean_rfop = mean(rfop_pct, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(x, y, dim_type) |>
+    dplyr::summarise(
+      sens_raw = max(group_mean_rfop, na.rm = TRUE) -
+                 min(group_mean_rfop, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    tidyr::pivot_wider(names_from = dim_type, values_from = sens_raw,
+                       names_prefix = "sens_", values_fill = 0)
+
+  # Ensure all four dimension columns exist (fill 0 when a dimension has no runs)
+  for (dim in c("sens_indicator", "sens_policy", "sens_seed", "sens_param")) {
+    if (!dim %in% names(per_dim_sens))
+      per_dim_sens[[dim]] <- 0
+  }
+
+  # ── Step 2: mean RFOP across ALL runs ─────────────────────────────────────
+  mean_rfop <- runs_df |>
+    dplyr::group_by(x, y) |>
+    dplyr::summarise(mean_rfop_all = mean(rfop_pct, na.rm = TRUE), .groups = "drop")
+
+  # ── Step 3: join and add eligible pixels that never appeared (rfop = 0) ──
+  class_df <- mean_rfop |>
+    dplyr::left_join(per_dim_sens, by = c("x", "y"))
+
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    never_selected <- dplyr::anti_join(elig_df[, c("x", "y")], class_df, by = c("x", "y")) |>
+      dplyr::mutate(
+        mean_rfop_all  = 0,
+        sens_indicator = 0,
+        sens_policy    = 0,
+        sens_seed      = 0,
+        sens_param     = 0
+      )
+    class_df <- dplyr::bind_rows(class_df, never_selected)
+  }
+
+  class_df[is.na(class_df)] <- 0
+
+  # ── Step 4: normalised sensitivity (avoids /0 for low-rfop pixels) ────────
+  class_df <- class_df |>
+    dplyr::mutate(
+      denom        = mean_rfop_all + 1,
+      nsens_ind    = sens_indicator / denom,
+      nsens_pol    = sens_policy    / denom,
+      nsens_seed   = sens_seed      / denom,
+      nsens_param  = sens_param     / denom
+    )
+
+  # ── Step 5: classify ──────────────────────────────────────────────────────
+  # Priority: Low → Robust → sensitivity dimensions (indicator > policy > seed > param)
+  class_df <- class_df |>
+    dplyr::mutate(
+      classification = dplyr::case_when(
+        mean_rfop_all < thresh_low
+          ~ "Low priority",
+        mean_rfop_all >= thresh_high &
+          nsens_ind   < thresh_stable &
+          nsens_pol   < thresh_stable &
+          nsens_seed  < thresh_stable &
+          nsens_param < thresh_stable
+          ~ "Robust priority",
+        nsens_ind >= pmax(nsens_pol, nsens_seed, nsens_param) &
+          nsens_ind >= thresh_stable
+          ~ "Condition sensitive",
+        nsens_pol >= pmax(nsens_ind, nsens_seed, nsens_param) &
+          nsens_pol >= thresh_stable
+          ~ "Policy sensitive",
+        nsens_seed >= pmax(nsens_ind, nsens_pol, nsens_param) &
+          nsens_seed >= thresh_stable
+          ~ "Unstable / noisy",
+        nsens_param >= thresh_stable
+          ~ "Condition sensitive",  # fold param sensitivity into condition
+        TRUE
+          ~ "Robust priority"       # medium freq, no dominant sensitivity
+      ),
+      classification = factor(
+        classification,
+        levels = c("Robust priority", "Condition sensitive", "Policy sensitive",
+                   "Unstable / noisy", "Low priority"),
+        ordered = TRUE
+      )
+    )
+
+  class_df
+}
+
+
+# Palette for the five priority classes (consistent across map + bar).
+# Chosen for maximum hue + lightness separation at small pixel sizes:
+#   Robust      — deep teal       (high priority, clearly distinct from orange/red)
+#   Condition   — vivid amber     (warm, distinct from teal and purple)
+#   Policy      — strong violet   (cool, separates from amber and teal)
+#   Unstable    — bright magenta  (very distinct from all others; flags caution)
+#   Low         — off-white/cream (recedes clearly; avoids confusion with map background)
+.class_palette <- c(
+  "Robust priority"      = "#006D77",   # deep teal
+  "Condition sensitive"  = "#E9C46A",   # vivid amber
+  "Policy sensitive"     = "#6A0572",   # strong violet
+  "Unstable / noisy"     = "#E63946",   # bright red-pink
+  "Low priority"         = "#F0EDE4"    # off-white / cream
+)
+
+
+# Plot a categorical raster map of the spatial classification.
+# Styling mirrors make_sel_freq_plot() (theme_void, grey eligible underlay, BE boundary).
+#
+# class_df  : output of compute_spatial_classification()
+# elig_df   : eligible_pixels.csv data frame for grey underlay (can be NULL)
+# title     : plot title
+make_classification_map <- function(class_df, elig_df = NULL,
+                                    title = "Spatial priority classification") {
+  # Grey underlay for all eligible pixels not classified as "Low priority"
+  # (Low priority pixels are already rendered in grey, so we only need the
+  # non-selected eligible pixels as background context)
+  p <- ggplot() +
+    theme_void() +
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
+      legend.position  = "right",
+      legend.title     = element_text(size = 9),
+      legend.text      = element_text(size = 8)
+    ) +
+    labs(title = title)
+
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    elig_unclassified <- dplyr::anti_join(elig_df[, c("x", "y")], class_df, by = c("x", "y"))
+    if (nrow(elig_unclassified) > 0)
+      p <- p + geom_raster(data = elig_unclassified, aes(x = x, y = y), fill = "#EEEEEE")
+  }
+
+  p <- p +
+    geom_raster(data = class_df, aes(x = x, y = y, fill = classification)) +
+    scale_fill_manual(
+      values = .class_palette,
+      name   = NULL,
+      drop   = FALSE,
+      guide  = guide_legend(
+        override.aes  = list(size = 4),
+        keywidth      = unit(0.8, "cm"),
+        keyheight     = unit(0.4, "cm"),
+        label.hjust   = 0
+      )
+    )
+
+  if (exists("BE")) {
+    p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                     linewidth = 0.4, inherit.aes = FALSE)
+  }
+
+  p
+}
+
+
+# Faceted heatmaps of raw sensitivity scores per dimension.
+# Useful for diagnosing which dimension drives variability where.
+#
+# class_df : output of compute_spatial_classification()
+# dims     : which sensitivity dimensions to show (subset if some have no runs)
+make_sensitivity_breakdown_maps <- function(
+    class_df,
+    dims = c("indicator", "policy", "seed", "param")
+) {
+  dim_labels <- c(
+    indicator = "Condition / indicator sensitivity",
+    policy    = "Policy sensitivity",
+    seed      = "Stochastic / seed sensitivity",
+    param     = "Parameter sensitivity"
+  )
+
+  available_dims <- intersect(dims, names(dim_labels))
+
+  plot_data <- dplyr::bind_rows(lapply(available_dims, function(d) {
+    col <- paste0("sens_", d)
+    if (!col %in% names(class_df)) return(NULL)
+    data.frame(
+      x         = class_df$x,
+      y         = class_df$y,
+      sens      = class_df[[col]],
+      dimension = dim_labels[[d]]
+    )
+  }))
+
+  if (nrow(plot_data) == 0) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "No sensitivity data available", size = 5) +
+             theme_void())
+  }
+
+  plot_data$dimension <- factor(plot_data$dimension,
+                                levels = dim_labels[available_dims])
+
+  ggplot(plot_data, aes(x = x, y = y, fill = sens)) +
+    geom_raster() +
+    scale_fill_distiller(
+      palette   = "YlOrRd",
+      direction = 1,
+      name      = "Sensitivity\n(RFOP range)",
+      limits    = c(0, NA)
+    ) +
+    facet_wrap(~dimension, ncol = 2) +
+    theme_void() +
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      strip.text       = element_text(size = 9, face = "bold", hjust = 0.5),
+      legend.position  = "right"
+    )
+}
+
+
+# Bar chart showing the proportion of eligible pixels in each priority class.
+# Optionally stacks by a grouping variable (e.g. LULC class).
+#
+# class_df : output of compute_spatial_classification()
+make_classification_summary_bar <- function(class_df) {
+  summary_df <- class_df |>
+    dplyr::count(classification, name = "n_pixels") |>
+    dplyr::mutate(pct = n_pixels / sum(n_pixels) * 100)
+
+  ggplot(summary_df, aes(x = classification, y = pct, fill = classification)) +
+    geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.1f%%", pct)),
+              vjust = -0.4, size = 3.5) +
+    scale_fill_manual(values = .class_palette, guide = "none") +
+    scale_y_continuous(
+      limits = c(0, max(summary_df$pct) * 1.15),
+      labels = scales::percent_format(scale = 1, accuracy = 1)
+    ) +
+    labs(
+      x = NULL,
+      y = "% of eligible pixels",
+      title = "Priority class distribution"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x  = element_text(angle = 25, hjust = 1, size = 9),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+
+# ── Pareto front sensitivity analysis ────────────────────────────────────────
+#
+# Two complementary summaries of how Pareto front *quality* varies across
+# sensitivity dimensions (condition scenarios, policy variants, seeds):
+#
+#   1. collect_pareto_stats()     — extract HV + ideal/nadir per run
+#   2. make_hv_sensitivity_plot() — HV dot plot grouped by dimension
+#   3. make_ideal_nadir_plot()    — heatmap of ideal-point shift per objective
+
+
+# Extract hypervolume, ideal point, and nadir from a named list of run objects.
+#
+# runs_meta : named list, each entry is a list with:
+#               $run        — a run object from load_run_data()
+#               $dim_type   — "indicator" | "policy" | "seed" | "param"
+#               $group_label — e.g. "global_all", "drop_smd", "with_bs"
+# obj_names : character vector of objective column names
+# Returns: data frame with one row per run
+collect_pareto_stats <- function(runs_meta, obj_names) {
+  rows <- lapply(names(runs_meta), function(nm) {
+    m   <- runs_meta[[nm]]
+    run <- m$run
+
+    hv <- tryCatch({
+      if (!is.null(run$df_hv) && nrow(run$df_hv) > 0)
+        tail(run$df_hv$hypervolume, 1)
+      else NA_real_
+    }, error = function(e) NA_real_)
+
+    nd <- tryCatch({
+      if (!is.null(run$df_obj))
+        run$df_obj[run$df_obj$is_nondominated == 1, obj_names, drop = FALSE]
+      else NULL
+    }, error = function(e) NULL)
+
+    ideal_row <- if (!is.null(nd) && nrow(nd) > 0)
+      setNames(as.list(apply(nd, 2, min, na.rm = TRUE)), paste0("ideal_", obj_names))
+    else
+      setNames(as.list(rep(NA_real_, length(obj_names))), paste0("ideal_", obj_names))
+
+    nadir_row <- if (!is.null(nd) && nrow(nd) > 0)
+      setNames(as.list(apply(nd, 2, max, na.rm = TRUE)), paste0("nadir_", obj_names))
+    else
+      setNames(as.list(rep(NA_real_, length(obj_names))), paste0("nadir_", obj_names))
+
+    c(list(
+      run_label   = nm,
+      dim_type    = m$dim_type,
+      group_label = m$group_label,
+      n_nondom    = if (!is.null(nd)) nrow(nd) else NA_integer_,
+      hypervolume = hv
+    ), ideal_row, nadir_row)
+  })
+
+  dplyr::bind_rows(lapply(rows, as.data.frame))
+}
+
+
+# Dot plot of hypervolume across runs, faceted by sensitivity dimension.
+# The reference run (e.g. global_all) is highlighted as a dashed line.
+#
+# stats_df    : output of collect_pareto_stats()
+# ref_label   : run_label of the reference run to draw as baseline
+make_hv_sensitivity_plot <- function(stats_df, ref_label = NULL) {
+  df <- dplyr::filter(stats_df, !is.na(hypervolume))
+  if (nrow(df) == 0) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "No hypervolume data available", size = 5) +
+             theme_void())
+  }
+
+  # Reference HV for baseline line
+  ref_hv <- if (!is.null(ref_label) && ref_label %in% df$run_label)
+    df$hypervolume[df$run_label == ref_label][[1]]
+  else NULL
+
+  # Shared lollipop panel builder (x_col is a column name string)
+  .hv_panel <- function(data, x_col, title) {
+    y_min <- min(data$hypervolume, na.rm = TRUE)
+    p <- ggplot(data, aes(x = reorder(.data[[x_col]], hypervolume),
+                           y = hypervolume)) +
+      geom_segment(aes(xend = reorder(.data[[x_col]], hypervolume),
+                       yend = y_min * 0.999),
+                   linewidth = 0.5, alpha = 0.5, colour = "steelblue") +
+      geom_point(size = 3.5, colour = "steelblue") +
+      scale_y_continuous(labels = scales::scientific) +
+      coord_flip() +
+      labs(x = NULL, y = "Final hypervolume", title = title) +
+      theme_minimal() +
+      theme(panel.grid.major.y = element_blank())
+    if (!is.null(ref_hv))
+      p <- p + geom_hline(yintercept = ref_hv, linetype = "dashed",
+                           colour = "grey40", linewidth = 0.7)
+    p
+  }
+
+  # ── Indicator panel ───────────────────────────────────────────────────────
+  # One point per drop-one scenario (group_label); multiple seed runs overlap
+  # at the same x position, which is fine for a quick spread check.
+  df_ind <- dplyr::filter(df, dim_type == "indicator")
+  p_ind <- if (nrow(df_ind) > 0)
+    .hv_panel(df_ind, "group_label", "Condition / indicator")
+  else NULL
+
+  # ── Policy panel ──────────────────────────────────────────────────────────
+  # Shows upper_q75_all (policy variant) alongside global_all (seed dimension)
+  # as the baseline group so both scenarios appear in the same panel.
+  df_pol <- dplyr::bind_rows(
+    dplyr::filter(df, dim_type == "policy") |>
+      dplyr::mutate(pol_label = group_label),
+    dplyr::filter(df, dim_type == "seed") |>
+      dplyr::mutate(pol_label = "global_all (baseline)")
+  )
+  p_pol <- if (nrow(df_pol) > 0)
+    .hv_panel(df_pol, "pol_label", "Policy")
+  else NULL
+
+  # ── Seed panel ────────────────────────────────────────────────────────────
+  # Labels each run by its seed number extracted from run_label
+  # e.g. "global_all_seed100" → "seed100"
+  df_seed <- dplyr::filter(df, dim_type == "seed") |>
+    dplyr::mutate(seed_label = sub(".*_seed", "seed", run_label))
+  p_seed <- if (nrow(df_seed) > 0)
+    .hv_panel(df_seed, "seed_label", "Seed (stochastic)")
+  else NULL
+
+  plots <- Filter(Negate(is.null), list(p_ind, p_pol, p_seed))
+  if (length(plots) == 0) return(ggplot() + theme_void())
+
+  patchwork::wrap_plots(plots, ncol = 1) +
+    patchwork::plot_annotation(
+      title    = "Pareto front quality across sensitivity dimensions",
+      subtitle = "Each point is one run; dashed line = reference HV (global_all_seed100)"
+    )
+}
+
+
+# Heatmap of ideal-point values per objective × run, normalised relative to
+# the reference run so that cells show % change from baseline.
+# Positive = worse (higher cost or lower gain), Negative = better.
+#
+# stats_df    : output of collect_pareto_stats()
+# obj_names   : character vector of objective names
+# obj_labels  : display labels (same order as obj_names)
+# ref_label   : run_label of the reference run
+# point       : "ideal" (best achieved per objective) or "nadir" (worst ND value)
+make_ideal_nadir_plot <- function(stats_df, obj_names, obj_labels,
+                                  ref_label = NULL,
+                                  point = c("ideal", "nadir")) {
+  point <- match.arg(point)
+  prefix <- paste0(point, "_")
+  cols   <- paste0(prefix, obj_names)
+
+  if (!all(cols %in% names(stats_df))) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = sprintf("No %s-point data found in stats_df", point), size = 5) +
+             theme_void())
+  }
+
+  # Pivot to long
+  long <- stats_df |>
+    dplyr::select(run_label, dim_type, group_label, dplyr::all_of(cols)) |>
+    tidyr::pivot_longer(cols = dplyr::all_of(cols),
+                        names_to = "objective", values_to = "value") |>
+    dplyr::mutate(
+      objective = factor(
+        gsub(prefix, "", objective, fixed = TRUE),
+        levels = obj_names,
+        labels = obj_labels
+      )
+    )
+
+  # Normalise relative to reference run
+  if (!is.null(ref_label) && ref_label %in% long$run_label) {
+    ref_vals <- long |>
+      dplyr::filter(run_label == ref_label) |>
+      dplyr::select(objective, ref_value = value)
+    long <- dplyr::left_join(long, ref_vals, by = "objective") |>
+      dplyr::mutate(pct_change = (value - ref_value) / (abs(ref_value) + 1e-10) * 100)
+    fill_col  <- "pct_change"
+    fill_name <- sprintf("%% change from\n%s", ref_label)
+    lim_sym   <- max(abs(long$pct_change), na.rm = TRUE)
+    fill_scale <- scale_fill_gradient2(
+      low      = "#1976D2",   # blue = improvement
+      mid      = "white",
+      high     = "#C62828",   # red  = degradation
+      midpoint = 0,
+      limits   = c(-lim_sym, lim_sym),
+      name     = fill_name,
+      labels   = scales::percent_format(scale = 1, accuracy = 1)
+    )
+  } else {
+    fill_col   <- "value"
+    fill_name  <- sprintf("%s point value", tools::toTitleCase(point))
+    fill_scale <- scale_fill_distiller(palette = "YlOrRd", direction = 1,
+                                        name = fill_name)
+  }
+
+  dim_labels <- c(indicator = "Condition", policy = "Policy",
+                  seed = "Seed", param = "Parameter")
+  long$dim_label <- dplyr::recode(long$dim_type, !!!dim_labels)
+
+  ggplot(long, aes(x = group_label, y = objective, fill = .data[[fill_col]])) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    fill_scale +
+    facet_wrap(~dim_label, scales = "free_x", nrow = 1) +
+    labs(
+      x        = NULL,
+      y        = NULL,
+      title    = sprintf("%s-point sensitivity across runs",
+                         tools::toTitleCase(point)),
+      subtitle = if (!is.null(ref_label))
+        sprintf("Red = degraded vs %s, Blue = improved", ref_label)
+      else
+        "Raw objective values"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x      = element_text(angle = 40, hjust = 1, size = 8),
+      axis.text.y      = element_text(size = 9),
+      strip.text       = element_text(face = "bold", size = 10),
+      panel.grid       = element_blank(),
+      legend.position  = "right"
+    )
+}
+
+
+# Diverging dot-plot of ideal-point or nadir shift across sensitivity dimensions.
+#
+# Produces three stacked panels (indicator / policy / seed), each faceted by
+# objective.  Within each panel, runs are shown as rows and % change from the
+# reference run is shown on the x-axis.  A vertical zero line and red/blue
+# colouring make direction of change immediately readable.
+#
+# Row labelling per dimension:
+#   indicator — group_label (seeds averaged within each drop-one scenario)
+#   policy    — run_label   (shows each seed of both groups as a distinct row)
+#   seed      — seed suffix extracted from run_label (e.g. "seed100")
+#
+# stats_df    : output of collect_pareto_stats()
+# obj_names   : character vector of objective column names
+# obj_labels  : display labels (same order as obj_names)
+# ref_label   : run_label of the reference run (its row always shows 0 % change)
+# point       : "ideal" or "nadir"
+make_ideal_nadir_dotplot <- function(stats_df, obj_names, obj_labels,
+                                     ref_label = NULL,
+                                     point = c("ideal", "nadir")) {
+  point  <- match.arg(point)
+  prefix <- paste0(point, "_")
+  cols   <- paste0(prefix, obj_names)
+
+  if (!all(cols %in% names(stats_df))) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = sprintf("No %s-point data found in stats_df", point), size = 5) +
+             theme_void())
+  }
+
+  # ── Pivot to long and compute % change from reference ──────────────────────
+  long <- stats_df |>
+    dplyr::select(run_label, dim_type, group_label,
+                  dplyr::all_of(cols)) |>
+    tidyr::pivot_longer(cols = dplyr::all_of(cols),
+                        names_to = "objective", values_to = "value") |>
+    dplyr::mutate(
+      objective = factor(
+        gsub(prefix, "", objective, fixed = TRUE),
+        levels = obj_names,
+        labels = obj_labels
+      )
+    )
+
+  if (!is.null(ref_label) && ref_label %in% long$run_label) {
+    ref_vals <- long |>
+      dplyr::filter(run_label == ref_label) |>
+      dplyr::select(objective, ref_value = value)
+    long <- dplyr::left_join(long, ref_vals, by = "objective") |>
+      dplyr::mutate(pct_change = (value - ref_value) / (abs(ref_value) + 1e-10) * 100)
+  } else {
+    long <- dplyr::mutate(long, pct_change = value, ref_value = NA_real_)
+  }
+
+  # ── Shared panel builder ───────────────────────────────────────────────────
+  .dot_panel <- function(data, title) {
+    ggplot(data, aes(x = pct_change, y = row_label,
+                     colour = pct_change > 0)) +
+      geom_vline(xintercept = 0, linetype = "solid",
+                 colour = "grey60", linewidth = 0.5) +
+      geom_segment(aes(x = 0, xend = pct_change,
+                       y = row_label, yend = row_label),
+                   linewidth = 0.5, alpha = 0.6) +
+      geom_point(size = 3) +
+      scale_colour_manual(values = c("FALSE" = "#1976D2",  # blue  = improved
+                                     "TRUE"  = "#C62828"), # red   = degraded
+                          guide = "none") +
+      scale_x_continuous(labels = function(x) paste0(round(x), "%")) +
+      facet_wrap(~objective, nrow = 1, scales = "free_x") +
+      labs(x = sprintf("%% change from reference (%s)", ref_label),
+           y = NULL, title = title) +
+      theme_minimal() +
+      theme(
+        strip.text         = element_text(face = "bold", size = 9),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        axis.text.y        = element_text(size = 8),
+        axis.text.x        = element_text(size = 8),
+        plot.title         = element_text(face = "bold", size = 10)
+      )
+  }
+
+  # ── Indicator panel: average across seeds within each group ───────────────
+  ind_data <- long |>
+    dplyr::filter(dim_type == "indicator") |>
+    dplyr::group_by(group_label, objective) |>
+    dplyr::summarise(pct_change = mean(pct_change, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(row_label = group_label)
+
+  # ── Policy panel: every run as its own row ─────────────────────────────────
+  pol_data <- long |>
+    dplyr::filter(dim_type %in% c("policy", "seed")) |>
+    dplyr::mutate(row_label = run_label)
+
+  # ── Seed panel: extract seed suffix as row label ───────────────────────────
+  seed_data <- long |>
+    dplyr::filter(dim_type == "seed") |>
+    dplyr::mutate(row_label = sub(".*_seed", "seed", run_label))
+
+  plots <- list()
+
+  if (nrow(ind_data) > 0)
+    plots[["indicator"]] <- .dot_panel(ind_data, "Condition / indicator sensitivity")
+
+  if (nrow(pol_data) > 0)
+    plots[["policy"]] <- .dot_panel(pol_data, "Policy sensitivity (global_all vs upper_q75_all)")
+
+  if (nrow(seed_data) > 0)
+    plots[["seed"]] <- .dot_panel(seed_data, "Seed (stochastic) sensitivity")
+
+  if (length(plots) == 0)
+    return(ggplot() + annotate("text", x = 0.5, y = 0.5,
+                               label = "No data", size = 5) + theme_void())
+
+  patchwork::wrap_plots(plots, ncol = 1) +
+    patchwork::plot_annotation(
+      title    = sprintf("%s-point shift across sensitivity dimensions",
+                         tools::toTitleCase(point)),
+      subtitle = sprintf("x = %% change from reference run (%s) | Blue = improved, Red = degraded",
+                         ref_label)
+    )
+}
+
+
+# Dumbbell plot combining ideal-point and nadir shift in one figure.
+#
+# For each run × objective, a segment connects the ideal-point % change (filled
+# circle, best achievable) to the nadir % change (open circle, worst ND value).
+# Segment length = Pareto front width change; position = overall shift direction.
+#
+# Three stacked panels (indicator / policy / seed), each faceted by objective.
+# The zero line marks no change vs the reference run.
+#
+# stats_df    : output of collect_pareto_stats()
+# obj_names   : character vector of objective column names
+# obj_labels  : display labels (same order as obj_names)
+# ref_label   : run_label of the reference run
+make_ideal_nadir_dumbbell <- function(stats_df, obj_names, obj_labels,
+                                      ref_label = NULL) {
+  ideal_cols <- paste0("ideal_", obj_names)
+  nadir_cols <- paste0("nadir_", obj_names)
+
+  if (!all(c(ideal_cols, nadir_cols) %in% names(stats_df))) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "ideal_ or nadir_ columns missing from stats_df", size = 4) +
+             theme_void())
+  }
+
+  # ── Helper: pivot one point type and compute % change vs reference ─────────
+  .pct_long <- function(cols, point_type) {
+    stats_df |>
+      dplyr::select(run_label, dim_type, group_label, dplyr::all_of(cols)) |>
+      tidyr::pivot_longer(cols = dplyr::all_of(cols),
+                          names_to = "objective", values_to = "value") |>
+      dplyr::mutate(
+        objective  = factor(gsub(paste0("^", point_type, "_"), "", objective),
+                             levels = obj_names, labels = obj_labels),
+        point_type = point_type
+      )
+  }
+
+  long <- dplyr::bind_rows(.pct_long(ideal_cols, "ideal"),
+                            .pct_long(nadir_cols, "nadir"))
+
+  if (!is.null(ref_label) && ref_label %in% long$run_label) {
+    ref_vals <- long |>
+      dplyr::filter(run_label == ref_label) |>
+      dplyr::select(objective, point_type, ref_value = value)
+    long <- dplyr::left_join(long, ref_vals, by = c("objective", "point_type")) |>
+      dplyr::mutate(pct_change = (value - ref_value) / (abs(ref_value) + 1e-10) * 100)
+  } else {
+    long <- dplyr::mutate(long, pct_change = value)
+  }
+
+  # ── Widen back to ideal / nadir columns for segment drawing ───────────────
+  wide <- long |>
+    dplyr::select(run_label, dim_type, group_label, objective, point_type, pct_change) |>
+    tidyr::pivot_wider(names_from = point_type, values_from = pct_change)
+
+  # ── Row labels per dimension ───────────────────────────────────────────────
+  ind_wide  <- dplyr::filter(wide, dim_type == "indicator") |>
+    dplyr::group_by(group_label, objective) |>
+    dplyr::summarise(ideal = mean(ideal, na.rm = TRUE),
+                     nadir = mean(nadir, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(row_label = group_label)
+
+  pol_wide  <- dplyr::filter(wide, dim_type %in% c("policy", "seed")) |>
+    dplyr::mutate(row_label = run_label)
+
+  seed_wide <- dplyr::filter(wide, dim_type == "seed") |>
+    dplyr::mutate(row_label = sub(".*_seed", "seed", run_label))
+
+  # ── Panel builder ──────────────────────────────────────────────────────────
+  .db_panel <- function(data, title) {
+    # Combine ideal and nadir into long for points, keep wide for segments
+    pts <- dplyr::bind_rows(
+      dplyr::mutate(data, pct = ideal, pt = "Ideal (best)"),
+      dplyr::mutate(data, pct = nadir, pt = "Nadir (worst ND)")
+    )
+
+    ggplot(data, aes(y = reorder(row_label, (ideal + nadir) / 2))) +
+      geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.5) +
+      geom_segment(aes(x = ideal, xend = nadir,
+                       yend = reorder(row_label, (ideal + nadir) / 2)),
+                   linewidth = 0.8, colour = "grey50", alpha = 0.7) +
+      geom_point(data = pts, aes(x = pct, shape = pt,
+                                  colour = pct > 0),
+                 size = 3) +
+      scale_colour_manual(values = c("FALSE" = "#1976D2", "TRUE" = "#C62828"),
+                          guide = "none") +
+      scale_shape_manual(values = c("Ideal (best)" = 16, "Nadir (worst ND)" = 1),
+                         name = NULL) +
+      scale_x_continuous(labels = function(x) paste0(round(x), "%")) +
+      facet_wrap(~objective, nrow = 1, scales = "free_x") +
+      labs(x = sprintf("%% change from reference (%s)", ref_label),
+           y = NULL, title = title) +
+      theme_minimal() +
+      theme(
+        strip.text         = element_text(face = "bold", size = 9),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        axis.text.y        = element_text(size = 8),
+        axis.text.x        = element_text(size = 8),
+        plot.title         = element_text(face = "bold", size = 10),
+        legend.position    = "bottom"
+      )
+  }
+
+  plots <- list()
+  if (nrow(ind_wide)  > 0) plots[["indicator"]] <- .db_panel(ind_wide,  "Condition / indicator sensitivity")
+  if (nrow(pol_wide)  > 0) plots[["policy"]]    <- .db_panel(pol_wide,  "Policy sensitivity (global_all vs upper_q75_all)")
+  if (nrow(seed_wide) > 0) plots[["seed"]]      <- .db_panel(seed_wide, "Seed (stochastic) sensitivity")
+
+  if (length(plots) == 0)
+    return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data", size = 5) + theme_void())
+
+  patchwork::wrap_plots(plots, ncol = 1) +
+    patchwork::plot_annotation(
+      title    = "Pareto front range shift across sensitivity dimensions",
+      subtitle = sprintf(
+        "Filled circle = ideal point (best achievable); open circle = nadir (worst ND) | Blue = improved, Red = degraded | ref: %s",
+        ref_label)
+    )
+}
+
+
+# ── Indicator redundancy analysis ─────────────────────────────────────────────
+#
+# Computes the van den Wollenberg redundancy index per EC indicator across all
+# condition scenarios.  With univariate Y (RFOP per eligible pixel), the index
+# simplifies to R² = cor(rfop, indicator)², requiring only base-R cor().
+#
+# Workflow:
+#   1. load_scenario_rfop_avg()     — average RFOP per pixel across seeds
+#   2. extract_indicator_values()   — pull indicator raster values at elig. pixels
+#   3. compute_redundancy_indices() — R² per indicator × scenario × ecosystem
+#   4. make_redundancy_boxplot()    — distribution across scenarios per indicator
+
+
+# Load RFOP for one condition scenario, averaged across multiple seed runs.
+#
+# dirs_list      : named list of r_inputs/ directories, one entry per seed
+# scenario_label : label for this condition scenario (e.g. "global_all", "drop_smd")
+# Returns: data frame (x, y, rfop_avg, n_seeds, scenario_label), or NULL
+load_scenario_rfop_avg <- function(dirs_list, scenario_label) {
+  seed_dfs <- lapply(names(dirs_list), function(nm) {
+    dir <- dirs_list[[nm]]
+    if (!dir.exists(dir)) {
+      message(sprintf("  Skipping missing directory: %s", dir))
+      return(NULL)
+    }
+    load_run_rfop(dir_path    = dir,
+                  label       = nm,
+                  dim_type    = "scenario",
+                  group_label = scenario_label)
+  })
+  seed_dfs <- Filter(Negate(is.null), seed_dfs)
+  if (length(seed_dfs) == 0) {
+    message(sprintf("  No valid seed directories for scenario: %s", scenario_label))
+    return(NULL)
+  }
+
+  dplyr::bind_rows(seed_dfs) |>
+    dplyr::group_by(x, y) |>
+    dplyr::summarise(
+      rfop_avg = mean(rfop_pct, na.rm = TRUE),
+      n_seeds  = dplyr::n(),
+      .groups  = "drop"
+    ) |>
+    dplyr::mutate(scenario_label = scenario_label)
+}
+
+
+# Extract raw indicator raster values at eligible pixel locations and assign
+# each pixel to an ecosystem based on the LULC raster.
+#
+# elig_df         : data frame with columns x, y (EPSG:2056 coordinates)
+# indicator_paths : named list mapping indicator code → path to .tif file
+# lulc_raster     : SpatRaster; LULC class values used to assign ecosystem
+# lulc_classes    : named list mapping ecosystem label → integer LULC class codes
+# Returns: data frame (x, y, ecosystem, <indicator_code>, ...)
+extract_indicator_values <- function(
+    elig_df,
+    indicator_paths,
+    lulc_raster,
+    lulc_classes = list(
+      Forest       = c(12L, 13L),
+      Agricultural = c(15L),
+      Grassland    = c(16L, 17L)
+    )
+) {
+  if (nrow(elig_df) == 0 || length(indicator_paths) == 0) return(NULL)
+
+  pts <- terra::vect(
+    cbind(elig_df$x, elig_df$y),
+    type = "points",
+    crs  = "EPSG:2056"
+  )
+
+  lulc_vals <- terra::extract(lulc_raster, pts)[, 2, drop = TRUE]
+  ecosystem <- dplyr::case_when(
+    lulc_vals %in% lulc_classes$Forest       ~ "Forest",
+    lulc_vals %in% lulc_classes$Agricultural ~ "Agricultural",
+    lulc_vals %in% lulc_classes$Grassland    ~ "Grassland",
+    TRUE                                     ~ NA_character_
+  )
+
+  ind_df <- data.frame(x = elig_df$x, y = elig_df$y, ecosystem = ecosystem,
+                       stringsAsFactors = FALSE)
+
+  for (nm in names(indicator_paths)) {
+    path <- indicator_paths[[nm]]
+    if (!file.exists(path)) {
+      message(sprintf("  Indicator raster not found, skipping: %s", path))
+      ind_df[[nm]] <- NA_real_
+      next
+    }
+    r   <- terra::rast(path)
+    ext <- terra::extract(r, pts)[, 2, drop = TRUE]
+    ind_df[[nm]] <- as.numeric(ext)
+  }
+
+  ind_df
+}
+
+
+# Compute van den Wollenberg redundancy index (R²) for each indicator ×
+# condition scenario × ecosystem.
+#
+# all_scenarios_df  : bind_rows of load_scenario_rfop_avg() results
+# indicator_vals_df : output of extract_indicator_values()
+# indicator_meta    : data frame with cols: code, full_name, ect
+# min_pixels        : skip combos with fewer complete cases than this
+# Returns: data frame (scenario_label, ecosystem, indicator_code,
+#          indicator_label, ect, redundancy_r2, n_pixels)
+compute_redundancy_indices <- function(all_scenarios_df,
+                                       indicator_vals_df,
+                                       indicator_meta,
+                                       min_pixels = 50) {
+  indicator_codes <- intersect(indicator_meta$code, names(indicator_vals_df))
+  if (length(indicator_codes) == 0) {
+    warning("No indicator codes found in indicator_vals_df. Check names match indicator_meta$code.")
+    return(NULL)
+  }
+
+  joined <- dplyr::inner_join(all_scenarios_df, indicator_vals_df, by = c("x", "y"))
+  results <- list()
+
+  for (scen in unique(joined$scenario_label)) {
+    scen_df <- joined[joined$scenario_label == scen, ]
+
+    for (eco in c("Forest", "Agricultural", "Grassland")) {
+      eco_df <- scen_df[!is.na(scen_df$ecosystem) & scen_df$ecosystem == eco, ]
+      if (nrow(eco_df) < min_pixels) next
+
+      y <- eco_df$rfop_avg
+
+      for (code in indicator_codes) {
+        x_vals      <- eco_df[[code]]
+        complete_i  <- !is.na(x_vals) & !is.na(y)
+        if (sum(complete_i) < min_pixels) next
+
+        r2 <- cor(y[complete_i], x_vals[complete_i])^2
+
+        meta_row <- indicator_meta[indicator_meta$code == code, ]
+        results[[length(results) + 1]] <- data.frame(
+          scenario_label  = scen,
+          ecosystem       = eco,
+          indicator_code  = code,
+          indicator_label = if (nrow(meta_row) > 0) meta_row$full_name[[1]] else code,
+          ect             = if (nrow(meta_row) > 0) meta_row$ect[[1]]       else "unknown",
+          redundancy_r2   = r2,
+          n_pixels        = sum(complete_i),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  if (length(results) == 0) return(NULL)
+  dplyr::bind_rows(results)
+}
+
+
+# Box plot: distribution of R² across condition scenarios per indicator.
+# Faceted by ecosystem, coloured by ect category (abiotic / biotic).
+make_redundancy_boxplot <- function(redundancy_df) {
+  if (is.null(redundancy_df) || nrow(redundancy_df) == 0) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "No redundancy data available", size = 5) +
+             theme_void())
+  }
+
+  # Order by overall median R² (descending)
+  ind_order <- redundancy_df |>
+    dplyr::group_by(indicator_label) |>
+    dplyr::summarise(med = median(redundancy_r2, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(med)) |>
+    dplyr::pull(indicator_label)
+
+  redundancy_df$indicator_label <- factor(redundancy_df$indicator_label, levels = ind_order)
+  redundancy_df$ecosystem       <- factor(redundancy_df$ecosystem,
+                                          levels = c("Forest", "Agricultural", "Grassland"))
+
+  ect_palette <- c(abiotic = "#F57C00", biotic = "#00838F")
+
+  ggplot(redundancy_df, aes(x = indicator_label, y = redundancy_r2, fill = ect)) +
+    geom_boxplot(outlier.size = 0.8, width = 0.6, colour = "grey30") +
+    scale_fill_manual(values = ect_palette, name = "Category") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       limits = c(0, NA)) +
+    facet_wrap(~ecosystem, ncol = 1, scales = "free_x") +
+    labs(
+      x        = NULL,
+      y        = expression("Redundancy index (R"^2*")"),
+      title    = "Indicator importance for pixel selection across condition scenarios",
+      subtitle = "Each box spans all 13 condition scenarios; higher = more explanatory power"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x        = element_text(angle = 30, hjust = 1, size = 9),
+      strip.text         = element_text(face = "bold", size = 10),
+      panel.grid.major.x = element_blank(),
+      legend.position    = "bottom"
+    )
+}

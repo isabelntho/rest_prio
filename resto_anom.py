@@ -181,8 +181,8 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
     initial_conditions['n_restoration_patches'] = patch_mappings['restoration_patches']['n_patches']
     initial_conditions['n_conversion_patches'] = patch_mappings['conversion_patches']['n_patches']
     
-    print(f"  Restoration patches: {initial_conditions['n_restoration_patches']}")
-    print(f"  Conversion patches: {initial_conditions['n_conversion_patches']}")
+    #print(f"  Restoration patches: {initial_conditions['n_restoration_patches']}")
+    #print(f"  Conversion patches: {initial_conditions['n_conversion_patches']}")
     
     # Calculate average pixels per patch for information
     if initial_conditions['n_restoration_patches'] > 0:
@@ -190,14 +190,14 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
             initial_conditions['n_restoration_pixels'] / 
             initial_conditions['n_restoration_patches']
         )
-        print(f"  Avg pixels per restoration patch: {avg_pixels_per_restoration_patch:.1f}")
+        #print(f"  Avg pixels per restoration patch: {avg_pixels_per_restoration_patch:.1f}")
     
     if initial_conditions['n_conversion_patches'] > 0:
         avg_pixels_per_conversion_patch = (
             initial_conditions['n_conversion_pixels'] / 
             initial_conditions['n_conversion_patches']
         )
-        print(f"  Avg pixels per conversion patch: {avg_pixels_per_conversion_patch:.1f}")
+        #print(f"  Avg pixels per conversion patch: {avg_pixels_per_conversion_patch:.1f}")
     
     return initial_conditions
 
@@ -728,11 +728,11 @@ class PatchRestorationProblem(RestorationProblem):
         print(f"Patch-based problem initialized:")
         print(f"  Decision variables: {self.n_var} patches "
               f"({self.n_restoration_patches} restoration + {self.n_conversion_patches} conversion)")
-        print(f"  Constraint type: {patch_constraint_type}")
-        print(f"  Target value: {self.target_constraint_value}")
-        if patch_constraint_type == 'pixel_count':
-            print(f"  Tolerance: ±{pixel_tolerance*100:.1f}%")
-        print(f"  (pixel-based equivalent: {self.max_action_pixels} pixels)")
+        #print(f"  Constraint type: {patch_constraint_type}")
+        #print(f"  Target value: {self.target_constraint_value}")
+        #if patch_constraint_type == 'pixel_count':
+            #print(f"  Tolerance: ±{pixel_tolerance*100:.1f}%")
+        #print(f"  (pixel-based equivalent: {self.max_action_pixels} pixels)")
     
     def _evaluate(self, x_patches, out, *args, **kwargs):
         """
@@ -792,8 +792,8 @@ class PatchRestorationProblem(RestorationProblem):
             if not hasattr(self, '_constraint_debug_count'):
                 self._constraint_debug_count = 0
             if self._constraint_debug_count < 5:
-                print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
-                print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
+                #print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
+                #print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
                 with self._eval_lock:
                     self._constraint_debug_count += 1
             

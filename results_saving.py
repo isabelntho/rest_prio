@@ -1048,6 +1048,21 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     }
     _append_to_registry(registry_entry, output_dir=output_dir)
 
+    # ── Auto-export to R-readable format ──────────────────────────────────────
+    # Writes r_inputs/<run_label>/ alongside the pickle so results are
+    # immediately available to the QMD analysis document.
+    try:
+        from export_to_r import export_results as _export_to_r
+        r_label   = run_label_slug if run_label_slug else registry_entry["run_id"]
+        r_out_dir = os.path.join(output_dir, "r_inputs", r_label)
+        _export_to_r(results_filename, output_dir=r_out_dir, nondom_pixels_only=True)
+        generated_files["r_export_dir"] = r_out_dir
+        if verbose:
+            print(f"✓ R export written to: {r_out_dir}")
+    except Exception as e:
+        if verbose:
+            print(f"  Warning: R export failed: {e}")
+
     return generated_files
 
 def save_combined_results(combined_results, output_dir=".", verbose=True, run_label=""):
