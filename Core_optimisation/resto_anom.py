@@ -28,17 +28,17 @@ from pymoo.indicators.hv import HV
 from pymoo.util.ref_dirs import get_reference_directions
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
-from spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache
-from data_loader import load_initial_conditions
-from results_saving import save_results_with_reports
-from patch_approach import (
+from .spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache
+from .data_loader import load_initial_conditions
+from .results_saving import save_results_with_reports
+from .patch_approach import (
     create_patch_mappings,
     PatchRepair,
     PatchAwareSampling,
     aggregate_patch_scores_from_pixel_scores,
     assign_patches_to_regions,
 )
-from scenarios import sample_scenario_parameters
+from .scenarios import sample_scenario_parameters
 from time import time
 
 # --- Weighting ---
@@ -744,7 +744,7 @@ class PatchRestorationProblem(RestorationProblem):
                       Next n_conversion_patches: conversion patch decisions
             out: Output dictionary for objectives and constraints
         """
-        from patch_approach import convert_patch_decisions_to_pixels
+        from .patch_approach import convert_patch_decisions_to_pixels
         
         # Split patch decisions into restoration and conversion
         x_restore_patches = x_patches[:self.n_restoration_patches]
@@ -812,7 +812,7 @@ class PatchRestorationProblem(RestorationProblem):
 
     def evaluate_raw_objectives(self, x_patches):
         """Return raw objectives for patch-level decisions via pixel conversion."""
-        from patch_approach import convert_patch_decisions_to_pixels
+        from .patch_approach import convert_patch_decisions_to_pixels
 
         x_restore_patches = x_patches[:self.n_restoration_patches]
         x_convert_patches = x_patches[self.n_restoration_patches:]
@@ -1531,7 +1531,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             print("  WARNING: max_action_pixels is 0! No actions possible.")
         if not skip_diagnostics:
             from debug_utils import diagnose_optimization_setup
-            from logger_setup import setup_logger
+            from .logger_setup import setup_logger
             setup_logger()  # no-op if already configured by the entry-point script
             diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10)
             print("✓ Optimisation setup verified.")
@@ -1645,7 +1645,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
         dict: Optimization results
     """
 
-    from run_scenarios import run_all_scenarios_optimization
+    from .run_scenarios import run_all_scenarios_optimization
 
     if scenario == "all":
         initial_conditions = load_initial_conditions(

@@ -8,9 +8,9 @@ import cProfile
 import pstats
 import io
 import time
-from resto_anom import run_optimization_instance, main
-from data_loader import load_initial_conditions
-from logger_setup import setup_logger
+from .resto_anom import run_optimization_instance, main
+from .data_loader import load_initial_conditions
+from .logger_setup import setup_logger
 
 # Available ecosystem run modes:
 # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
@@ -22,7 +22,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "baseline_speedcheck"
+RUN_LABEL = "grid_speedcheck_fullbern"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -31,7 +31,7 @@ REGION = "Bern"
 #   "custom"         runs exactly one scenario using custom_scenario_params
 #   "all"            runs scenario="all" using the scenario sampling logic inside main()
 #   "condition_grid" sweeps all 13 condition scenarios x CONDITION_GRID_SEEDS
-SCENARIO_MODE = "custom"
+SCENARIO_MODE = "condition_grid"
 
 # Condition scenario tag — selects pre-computed anomaly rasters from inputs/anomaly_scenarios/
 # Available tags:
@@ -59,7 +59,7 @@ OBJECTIVES = ["abiotic", "biotic", "cost"]
 #   "connectivity" – maximise connectivity gain (precomputed per pixel, conversion pixels)
 #                    Replaces the older "landscape" objective as the default landscape metric.
 #   "landscape"    – legacy landscape anomaly via SN-density recalculation (conversion pixels)
-SAMPLE_FRACTION = 0.1
+SAMPLE_FRACTION = None
 SAMPLE_SEED = 42
 POP_SIZE = 50
 N_GENERATIONS = 100

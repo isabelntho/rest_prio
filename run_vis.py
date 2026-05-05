@@ -5,7 +5,7 @@ import pandas as pd
 from collections import Counter
 
 # Import HVCallback to enable pickle loading
-from resto_anom import HVCallback
+from Core_optimisation.resto_anom import HVCallback
 
 from visualisations import (
     load_results,
@@ -22,7 +22,7 @@ from visualisations import (
     plot_example_solution, 
     plot_eligible_pixels
 )
-from data_loader import load_initial_conditions
+from Core_optimisation.data_loader import load_initial_conditions
 
 
 def run_basic_analysis(pkl_path):

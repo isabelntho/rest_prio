@@ -19,7 +19,7 @@ import numpy as np
 import tempfile
 import rasterio as rio
 import geopandas as gpd
-from spatial_operations import compute_sn_dens, compute_connectivity_gain_array
+from .spatial_operations import compute_sn_dens, compute_connectivity_gain_array
 
 logger = logging.getLogger("resto_prio")
 

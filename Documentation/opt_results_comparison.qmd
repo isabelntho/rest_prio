@@ -61,11 +61,12 @@ source("_plot_functions.R")
 # Set the two export_to_r.py output directories and display labels here.
 # All other parameters are derived automatically from metadata.json.
 
-RUN_DIR_B  <- "../r_inputs/mut200_notseeded_p12_update"          # ← replace with your directory
-RUN_DIR_A  <- "../r_inputs/mut200_seeded_p12_update"
+RUN_DIR_B  <- "../r_inputs/baseline_speedcheck_fullbern"
+#mut200_notseeded_p12_update"          # ← replace with your directory
+RUN_DIR_A  <- "../r_inputs/3obj_seeded"
 RUN_DIR_C  <- "../r_inputs/3obj_frac10"                 # ← replace with your directory
-LABEL_B    <- "Not-seeded"
-LABEL_A    <- "Seeded"
+LABEL_B    <- "sped up" #"Not-seeded"
+LABEL_A    <- "Base" #"Seeded"
 LABEL_C    <- "Seeded + 0.05 area"
 
 ECOSYSTEM  <- "fg"                       # used in plot titles only
@@ -112,6 +113,16 @@ load_run_data <- function(dir_path, label) {
     unlist(meta$algorithm$objective_normalization$scales),
     error = function(e) NULL
   )
+
+  # Invert minimised objectives whose values are negative for easier interpretation.
+  # Objectives containing "anomaly" or "connectivity_gain" were minimised and are
+  # stored as negative; negate them so that larger = better throughout all downstream plots.
+  invert_cols <- grep("anomaly|connectivity_gain", obj_names, value = TRUE)
+  if (length(invert_cols) > 0) {
+    df_obj[, invert_cols] <- -df_obj[, invert_cols]
+    if (!is.null(df_norm)) df_norm[, intersect(invert_cols, names(df_norm))] <-
+      -df_norm[, intersect(invert_cols, names(df_norm))]
+  }
 
   list(
     label        = label,
@@ -691,25 +702,25 @@ if (nrow(runs_all_df) == 0) {
   available_classes <- unique(class_pct$classification)
   print(available_classes)
 
-  #pct_low <- class_pct %>%
-  #dplyr::filter(classification == "low") %>%
-  #dplyr::pull(pct)
+  pct_low <- class_pct %>%
+  dplyr::filter(classification == "Low priority") %>%
+  dplyr::pull(pct)
 
-  #pct_robust <- class_pct %>%
-  #dplyr::filter(classification == "robust") %>%
-  #dplyr::pull(pct)
+  pct_robust <- class_pct %>%
+  dplyr::filter(classification == "Robust priority") %>%
+  dplyr::pull(pct)
 
-  #pct_cond <- class_pct %>%
-  #dplyr::filter(classification == "condition") %>%
-  #dplyr::pull(pct)
+  pct_cond <- class_pct %>%
+  dplyr::filter(classification == "Condition sensitive") %>%
+  dplyr::pull(pct)
 
-  #pct_policy <- class_pct %>%
-  #dplyr::filter(classification == "policy") %>%
-  #dplyr::pull(pct)
+  pct_policy <- class_pct %>%
+  dplyr::filter(classification == "Policy sensitive") %>%
+  dplyr::pull(pct)
 
-  #pct_unstable <- class_pct %>%
-  #dplyr::filter(classification == "unstable") %>%
-  #dplyr::pull(pct)
+  pct_unstable <- class_pct %>%
+  dplyr::filter(classification == "Unstable / noisy") %>%
+  dplyr::pull(pct)
 }
 ```
 

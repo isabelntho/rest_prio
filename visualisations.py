@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from matplotlib.colors import ListedColormap
-from patch_approach import (
+from Core_optimisation.patch_approach import (
     convert_patch_decisions_to_pixels,
     create_patch_mappings,
 )
@@ -1498,7 +1498,7 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
     n_dominated = n_solutions - n_nondominated
 
     # Get objective names
-    from resto_anom import RestorationProblem
+    from Core_optimisation.resto_anom import RestorationProblem
     problem = RestorationProblem(results['initial_conditions'], results['scenario_params'])
     
     # Clean up names for display

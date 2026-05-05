@@ -15,7 +15,7 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         scenario_params: Dict with scenario parameters
         n_samples: Number of sample solutions to test
     """
-    from resto_anom import RestorationProblem
+    from Core_optimisation.resto_anom import RestorationProblem
 
     logger.info("=== Quick problem diagnostics ===")
 

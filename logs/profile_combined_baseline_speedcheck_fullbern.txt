@@ -1,0 +1,38 @@
+         81051538 function calls (77408857 primitive calls) in 421.890 seconds
+
+   Ordered by: cumulative time
+   List reduced from 1972 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.040    0.040  421.899  421.899 C:\Users\inicholson\Documents\rest_prio\run_custom.py:137(_run)
+        1    0.032    0.032  420.261  420.261 C:\Users\inicholson\Documents\rest_prio\resto_anom.py:1445(run_optimization_instance)
+        1    0.004    0.004  377.233  377.233 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\optimize.py:4(minimize)
+        1    0.000    0.000  373.596  373.596 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\algorithm.py:136(run)
+       92    0.001    0.000  373.589    4.061 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\algorithm.py:151(next)
+       92    0.273    0.003  212.311    2.308 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\evaluator.py:38(eval)
+       92    0.002    0.000  212.030    2.305 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\evaluator.py:84(_eval)
+      715  211.591    0.296  211.591    0.296 {method 'acquire' of '_thread.lock' objects}
+      184    0.001    0.000  211.556    1.150 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\threading.py:295(wait)
+      123    0.001    0.000  210.150    1.709 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\threading.py:611(wait)
+       92    0.002    0.000  210.062    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\problem.py:231(evaluate)
+       92    0.002    0.000  210.059    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\problem.py:290(do)
+       92    0.010    0.000  210.055    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\problem.py:309(_evaluate_elementwise)
+       92    0.002    0.000  210.036    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\problem.py:41(__call__)
+       92    0.000    0.000  210.032    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\multiprocessing\pool.py:369(starmap)
+       92    0.000    0.000  210.027    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\multiprocessing\pool.py:767(get)
+       92    0.000    0.000  210.027    2.283 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\multiprocessing\pool.py:764(wait)
+       92    0.000    0.000  160.207    1.741 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\algorithm.py:175(infill)
+       91    0.000    0.000  154.005    1.692 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\algorithms\base\genetic.py:82(_infill)
+       91    0.003    0.000  154.005    1.692 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\infill.py:22(do)
+       92    0.004    0.000   88.740    0.965 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\duplicate.py:19(do)
+      183    0.853    0.005   88.734    0.485 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\duplicate.py:74(_do)
+      183    0.004    0.000   87.876    0.480 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\duplicate.py:62(calc_dist)
+      183    1.165    0.006   82.170    0.449 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\util\misc.py:156(cdist)
+      183    0.003    0.000   74.293    0.406 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\scipy\spatial\distance.py:2606(cdist)
+      183   74.289    0.406   74.289    0.406 {built-in method scipy.spatial._distance_pybind.cdist_euclidean}
+      366    1.662    0.005   71.446    0.195 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\operator.py:26(__call__)
+       91    0.001    0.000   33.992    0.374 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\mating.py:19(_do)
+       92    0.282    0.003   31.628    0.344 C:\Users\inicholson\Documents\rest_prio\.pixi\envs\default\Lib\site-packages\pymoo\core\repair.py:8(do)
+       92    6.737    0.073   26.940    0.293 C:\Users\inicholson\Documents\rest_prio\patch_approach.py:724(_do)
+
+

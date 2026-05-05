@@ -9,9 +9,9 @@ import glob
 import numpy as np
 import matplotlib.pyplot as plt
 
-from data_loader import load_initial_conditions
-from resto_anom import run_single_scenario_optimization
-from patch_approach import create_patch_mappings_for_restoration_and_conversion
+from Core_optimisation.data_loader import load_initial_conditions
+from Core_optimisation.resto_anom import run_single_scenario_optimization
+from Core_optimisation.patch_approach import create_patch_mappings_for_restoration_and_conversion
 from utils import pickle_load as _load_results_pickle
 from visualisations import (
     create_selection_frequency_map,
@@ -113,7 +113,7 @@ def _build_selection_frequency_map(decisions, initial_conditions):
                 f"Got n_var={n_var}, expected pixel={n_rest + n_conv}, patch={expected_patch_var}."
             )
 
-        from patch_approach import convert_patch_decisions_to_pixels
+        from Core_optimisation.patch_approach import convert_patch_decisions_to_pixels
 
         rest_pixel_solutions = np.zeros((decisions.shape[0], n_rest), dtype=np.int8)
         for i in range(decisions.shape[0]):

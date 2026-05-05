@@ -844,7 +844,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
         random_seed: Random seed used for sampling
         verbose: Print save status
     """
-    from resto_anom import define_scenario_parameters, sample_scenario_parameters
+    from .resto_anom import define_scenario_parameters, sample_scenario_parameters
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     
