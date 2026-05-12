@@ -27,7 +27,7 @@ editor: visual
 #| include: false
 
 pkgs <- c("jsonlite", "dplyr", "tidyr", "ggplot2", "gridExtra", "patchwork", "plotly",
-            "scales", "viridis", "grid", "sf", "terra", "hexbin")
+            "scales", "viridis", "grid", "sf", "terra", "hexbin", "ggridges")
 
 missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
@@ -61,11 +61,11 @@ source("_plot_functions.R")
 # Set the two export_to_r.py output directories and display labels here.
 # All other parameters are derived automatically from metadata.json.
 
-RUN_DIR_B  <- "../r_inputs/baseline_speedcheck_fullbern"
+RUN_DIR_B  <- "../r_inputs/check_sbd_directionality"
 #mut200_notseeded_p12_update"          # ← replace with your directory
-RUN_DIR_A  <- "../r_inputs/3obj_seeded"
+RUN_DIR_A  <- "../r_inputs/check_sbd_directionality" # ../r_inputs/3obj_seeded
 RUN_DIR_C  <- "../r_inputs/3obj_frac10"                 # ← replace with your directory
-LABEL_B    <- "sped up" #"Not-seeded"
+LABEL_B    <- "check_sbd" #"Not-seeded"
 LABEL_A    <- "Base" #"Seeded"
 LABEL_C    <- "Seeded + 0.05 area"
 
@@ -178,11 +178,11 @@ implementation_cost <- rast("../inputs/implementation_cost.tif")
 
 ![](../figs/workflow_feb.jpg){fig-cap="Workflow overview"}
 
-------------------------------------------------------------------------
-
-{{< include _restmoo_methods.qmd >}}
-
-------------------------------------------------------------------------
+|                                      |
+|:-------------------------------------|
+| \<!--                                |
+| {{< include _restmoo_methods.qmd >}} |
+| --\>                                 |
 
 # Initial state
 
@@ -248,28 +248,14 @@ cat(sprintf("Objectives: %s\n", paste(obj_names, collapse = ", ")))
 
 #### Hypervolume indicator & objective value per generation
 
-::: panel-tabset
-##### `r LABEL_A`
-
 ```{r}
 #| label: run-a-hv-evo
 make_hv_evo_plot(run_a, obj_names, obj_labels)
 ```
 
-##### `r LABEL_B`
-
-```{r}
-#| label: run-b-hv-evo
-make_hv_evo_plot(run_b, obj_names, obj_labels)
-```
-:::
-
 ## Pareto front and tradeoffs
 
 #### Pareto front
-
-::: panel-tabset
-##### `r LABEL_A`
 
 ```{r}
 #| label: run-a-pareto-extremes
@@ -277,19 +263,7 @@ make_hv_evo_plot(run_b, obj_names, obj_labels)
 make_pareto_extremes_plot(run_a, obj_names, obj_labels)
 ```
 
-##### `r LABEL_B`
-
-```{r}
-#| label: run-b-pareto-extremes
-#| fig-height: 5
-make_pareto_extremes_plot(run_b, obj_names, obj_labels)
-```
-:::
-
 #### Trade-offs between objectives
-
-::: panel-tabset
-##### `r LABEL_A`
 
 ```{r}
 #| label: run-a-pareto-pairwise
@@ -298,20 +272,7 @@ make_pareto_extremes_plot(run_b, obj_names, obj_labels)
 make_pareto_pairwise(run_a, obj_names, obj_labels)
 ```
 
-##### `r LABEL_B`
-
-```{r}
-#| label: run-b-pareto-pairwise
-#| fig-height: 6
-#| fig-width: 12
-make_pareto_pairwise(run_b, obj_names, obj_labels)
-```
-:::
-
 #### Objective correlations
-
-::: panel-tabset
-##### `r LABEL_A`
 
 ```{r}
 #| label: run-a-corr
@@ -320,20 +281,7 @@ make_pareto_pairwise(run_b, obj_names, obj_labels)
 make_corr_plot(run_a, obj_names, obj_labels)
 ```
 
-##### `r LABEL_B`
-
-```{r}
-#| label: run-b-corr
-#| fig-height: 4
-#| fig-width: 8
-make_corr_plot(run_b, obj_names, obj_labels)
-```
-:::
-
 #### Parallel Coordinates
-
-::: panel-tabset
-##### `r LABEL_A`
 
 ```{r}
 #| label: run-a-parcoord
@@ -341,23 +289,222 @@ make_corr_plot(run_b, obj_names, obj_labels)
 make_parcoord_plot(run_a, obj_names, obj_labels)
 ```
 
-##### `r LABEL_B`
+## Objective redundancy: full vs 2-objective models
+```{r}
+#| label: redundancy-2obj-config
+
+# ── Configure the three 2-objective run directories ───────────────────────────
+# Replace each PLACEHOLDER with the actual r_inputs/ export path.
+RUN_2OBJ <- list(
+  list(dir = "../r_inputs/abiotic_biotic",
+       label = "abiotic + biotic", dropped = "cost"),
+  list(dir = "../r_inputs/abiotic_cost",
+       label = "abiotic + cost",   dropped = "biotic"),
+  list(dir = "../r_inputs/biotic_cost",
+       label = "biotic + cost",    dropped = "abiotic")
+)
+
+# Pixels with RFOP >= this threshold are treated as "high priority"
+TOP_RFOP_PCT <- 50
+
+# Load each reduced run — skip gracefully if the directory isn't ready yet
+runs_2obj <- Filter(Negate(is.null), lapply(RUN_2OBJ, function(r) {
+  tryCatch(
+    { rd <- load_run_data(r$dir, r$label); rd$dropped <- r$dropped; rd },
+    error = function(e) {
+      message(sprintf("[redundancy] Could not load '%s': %s", r$label, conditionMessage(e)))
+      NULL
+    }
+  )
+}))
+```
 
 ```{r}
-#| label: run-b-parcoord
-#| fig-height: 5
-make_parcoord_plot(run_b, obj_names, obj_labels)
+#| label: redundancy-2obj-helpers
+#| include: false
+
+# Per-pixel RFOP vector (%) across non-dominated solutions, named by pixel key.
+.rfop_vector <- function(run) {
+  if (is.null(run$df_psel) || is.null(run$df_obj)) return(NULL)
+  nd_ids  <- run$df_obj$solution_id[run$df_obj$is_nondominated == 1]
+  if (length(nd_ids) == 0) return(NULL)
+  psel_nd <- dplyr::filter(run$df_psel, solution_id %in% nd_ids)
+  has_xy  <- all(c("x", "y") %in% names(psel_nd))
+  psel_nd <- dplyr::mutate(
+    psel_nd,
+    pkey = if (has_xy) paste(round(x, 1), round(y, 1), sep = "_")
+           else        paste(pixel_row, pixel_col, sep = "_")
+  )
+  rfop <- psel_nd |>
+    dplyr::count(pkey, name = "n_sel") |>
+    dplyr::mutate(rfop_pct = 100 * n_sel / length(nd_ids))
+  setNames(rfop$rfop_pct, rfop$pkey)
+}
+
+# Pixel keys where RFOP >= threshold
+.top_pixels <- function(v, pct) names(v)[v >= pct]
+
+# Jaccard similarity between two character vectors
+.jaccard <- function(a, b) {
+  if (length(a) == 0 && length(b) == 0) return(NA_real_)
+  length(intersect(a, b)) / length(union(a, b))
+}
+
+rfop_a <- .rfop_vector(run_a)
+top_a  <- .top_pixels(rfop_a, TOP_RFOP_PCT)
 ```
-:::
+
+#### Selected pixels / spatial pattern
+
+Jaccard similarity between the set of pixels with RFOP ≥ `r TOP_RFOP_PCT`% in the full model and each reduced model. A high value means the dropped objective was not needed to identify the same high-priority locations.
+
+```{r}
+#| label: redundancy-jaccard
+#| fig-height: 3
+#| fig-width: 7
+
+if (length(runs_2obj) == 0) {
+  message("[redundancy] No 2-obj runs loaded — populate RUN_2OBJ directories above.")
+} else {
+  jac_df <- dplyr::bind_rows(lapply(runs_2obj, function(r2) {
+    v2    <- .rfop_vector(r2)
+    top_b <- .top_pixels(v2, TOP_RFOP_PCT)
+    data.frame(
+      model          = sprintf("%s\n(drops %s)", r2$label, r2$dropped),
+      n_top_full     = length(top_a),
+      n_top_reduced  = length(top_b),
+      jaccard        = .jaccard(top_a, top_b)
+    )
+  }))
+
+  jac_plot <- ggplot(jac_df, aes(x = jaccard, y = reorder(model, jaccard), fill = jaccard)) +
+    geom_col(width = 0.5, show.legend = FALSE) +
+    geom_text(
+      aes(label = sprintf("J = %.3f  (full: %d px | reduced: %d px)", jaccard, n_top_full, n_top_reduced)),
+      hjust = -0.05, size = 3.2
+    ) +
+    scale_fill_gradient(low = "#d73027", high = "#4dac26", limits = c(0, 1)) +
+    scale_x_continuous(limits = c(0, 1.3),
+                       labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title    = sprintf("Jaccard similarity: top-%d%% RFOP pixels (full vs 2-obj)", TOP_RFOP_PCT),
+      subtitle = "Higher = reduced model identifies the same high-priority pixels, implying the dropped objective is redundant",
+      x = "Jaccard similarity", y = NULL
+    )
+}
+```
+
+```{r}
+#| label: redundancy-rank-corr
+#| fig-height: 3
+#| fig-width: 7
+
+if (length(runs_2obj) == 0 || is.null(rfop_a)) {
+  message("[redundancy] No data available for rank correlation.")
+} else {
+  df_a <- data.frame(pkey = names(rfop_a), rfop_a = unname(rfop_a),
+                     stringsAsFactors = FALSE)
+
+  rcor_df <- dplyr::bind_rows(lapply(runs_2obj, function(r2) {
+    v2 <- .rfop_vector(r2)
+    if (is.null(v2)) {
+      print(sprintf("[redundancy] No RFOP vector for '%s' — pixel_selection.csv missing?", r2$label))
+      return(data.frame(model = sprintf("%s\n(drops %s)", r2$label, r2$dropped),
+                        rho = NA_real_, n_matched = 0L))
+    }
+    df_b   <- data.frame(pkey = names(v2), rfop_b = unname(v2),
+                         stringsAsFactors = FALSE)
+    joined <- dplyr::full_join(df_a, df_b, by = "pkey")
+    joined[is.na(joined$rfop_a), "rfop_a"] <- 0
+    joined[is.na(joined$rfop_b), "rfop_b"] <- 0
+    rho <- cor(joined$rfop_a, joined$rfop_b, method = "spearman")
+    data.frame(
+      model     = sprintf("%s\n(drops %s)", r2$label, r2$dropped),
+      rho       = rho,
+      n_matched = sum(joined$rfop_a > 0 & joined$rfop_b > 0)
+    )
+  }))
+
+  
+  rankcor_plot <- ggplot(rcor_df, aes(x = rho, y = reorder(model, ifelse(is.na(rho), -Inf, rho)), fill = rho)) +
+    geom_col(width = 0.5, show.legend = FALSE) +
+    geom_text(
+      aes(label = ifelse(is.na(rho), "no data",
+                         sprintf("\u03c1 = %.3f  (%d shared px)", rho, n_matched))),
+      hjust = -0.05, size = 3.2
+    ) +
+    scale_fill_gradient(low = "#d73027", high = "#4dac26",
+                        limits = c(0, 1), na.value = "grey80") +
+    scale_x_continuous(limits = c(-1, 1)) +
+    labs(
+      title    = "Spearman rank correlation of RFOP maps (full vs 2-obj models)",
+      subtitle = "Higher = pixel ranking preserved when objective is dropped, i.e. more redundant",
+      x = "Spearman \u03c1", y = NULL
+    )
+}
+
+jac_plot + rankcor_plot + plot_layout(ncol = 2)
+```
+
+#### 3. Objective value distributions
+
+Distribution of non-dominated objective values across the Pareto front, comparing the full model against each 2-objective reduced model. Only the objectives shared by both models are shown in each panel. If the two distributions are similar — same median and spread — the dropped objective was not competing against the others, consistent with redundancy: the algorithm was effectively already ignoring it. If the reduced model achieves clearly better values (a shifted distribution towards lower cost or higher anomaly improvement), the dropped objective was genuinely constraining the optimisation and is non-redundant — removing it allowed the algorithm to improve on the remaining objectives by no longer needing to make trade-offs against the dropped one.
+
+```{r}
+#| label: redundancy-obj-distributions
+#| fig-height: 4
+#| fig-width: 12
+
+if (length(runs_2obj) == 0) {
+  message("[redundancy] No 2-obj runs loaded — configure RUN_2OBJ above.")
+} else {
+  obj_dist_df <- dplyr::bind_rows(lapply(c(list(run_a), runs_2obj), function(r) {
+    nd      <- r$df_obj[r$df_obj$is_nondominated == 1, , drop = FALSE]
+    # shared = objectives present in both this run and the full model
+    shared  <- intersect(obj_names, names(nd))
+    if (length(shared) == 0) return(NULL)
+    dropped_lbl <- if (!is.null(r$dropped)) sprintf("drops %s", r$dropped) else "full model"
+    nd[, shared, drop = FALSE] |>
+      tidyr::pivot_longer(cols = dplyr::everything(),
+                          names_to  = "objective",
+                          values_to = "value") |>
+      dplyr::mutate(
+        model   = r$label,
+        dropped = dropped_lbl,
+        is_full = r$label == run_a$label
+      )
+  }))
+
+  obj_dist_df <- obj_dist_df |>
+    dplyr::mutate(
+      objective = gsub("_", " ", objective) |> tools::toTitleCase(),
+      model     = factor(model, levels = c(run_a$label,
+                                           sapply(runs_2obj, `[[`, "label")))
+    )
+
+  ggplot(obj_dist_df, aes(x = model, y = value, fill = model)) +
+    geom_violin(trim = FALSE, alpha = 0.45, colour = NA, scale = "width") +
+    geom_boxplot(width = 0.12, outlier.shape = NA, colour = "grey30", fill = "white") +
+    facet_wrap(~objective, scales = "free", nrow = 1) +
+    scale_fill_brewer(palette = "Set2", name = "Model") +
+    labs(
+      title    = "Non-dominated objective value distributions: full vs 2-obj models",
+      subtitle = "Each panel shows only the objectives shared between both compared models",
+      x = NULL, y = "Objective value"
+    ) +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom"
+    )
+}
+```
 
 ## Do trade-offs exist in space?
 
 Pairwise spatial similarity (Jaccard index) between non-dominated solutions, plotted against Euclidean distance in normalised objective space.
 
 Negative relationship = solutions with lower spatial overlap correspond to greater differences in objective performance, indicating that trade-offs in the Pareto set are driven by distinct spatial configurations.
-
-::: panel-tabset
-### `r LABEL_A`
 
 ```{r}
 #| label: run-a-jaccard
@@ -366,22 +513,9 @@ Negative relationship = solutions with lower spatial overlap correspond to great
 make_jaccard_plot(run_a, obj_names)
 ```
 
-### `r LABEL_B`
-
-```{r}
-#| label: run-b-jaccard
-#| fig-height: 4
-#| fig-width: 6
-make_jaccard_plot(run_b, obj_names)
-```
-:::
-
 ## Spatial distribution of selected areas
 
 Relative frequency of occurrence in the Pareto front (RFOP): how often each pixel appears across the non-dominated solutions. Coloured pixels were selected in ≥ 1 solution. Grey underlay indicates pixels that were eligible for selection but never selected in any non-dominated solution.
-
-::::: panel-tabset
-### `r LABEL_A`
 
 ::: panel-tabset
 #### Raster
@@ -401,31 +535,7 @@ make_sel_freq_plot_agg_hex(run_a, bins = 30)
 ```
 :::
 
-### `r LABEL_B`
-
-::: panel-tabset
-#### Raster
-
-```{r}
-#| label: run-b-sel-freq-raster
-#| fig-height: 8
-make_sel_freq_plot(run_b)
-```
-
-#### Hex
-
-```{r}
-#| label: run-b-sel-freq-hex
-#| fig-height: 8
-make_sel_freq_plot_agg_hex(run_b, bins = 30)
-```
-:::
-:::::
-
 ## Characteristics of selected pixels
-
-::::: panel-tabset
-### `r LABEL_A`
 
 ::: panel-tabset
 #### LULC
@@ -473,35 +583,16 @@ make_sel_freq_unified_plot(run_a,
 ```
 :::
 
-### `r LABEL_B`
-
-::: panel-tabset
-#### LULC
-
-```{r}
-#| label: run-b-sel-freq-lulc
-#| fig-height: 5
-make_sel_freq_unified_plot(run_b,
-  fill_values = rfop_fill_lulc(run_b, lulc),
-  fill_label  = "LULC Class",
-  subtitle    = "Coloured by Land Use/Land Cover type")
-```
-
-#### Baseline objective values
-
-```{r}
-#| label: run-b-sel-freq-baseline
-#| fig-height: 5
-make_sel_freq_unified_plot(run_b,
-  fill_values = rfop_fill_objective(run_b, abiotic_anomaly),
-  fill_label  = "Abiotic anomaly (quintile)",
-  subtitle    = "Coloured by baseline abiotic condition")
-```
-:::
-:::::
-
 # Sensitivity
 
+| Type | Sources of uncertainty | References |
+|---|---|---|
+| Epistemic uncertainties | Condition index/anomaly construction; Benchmark used for reference condition | Czúcz et al., 2021; Jepsen et al., 2024; Paper 1 |
+| Exogenous uncertainties | LULC/Climate change scenarios; Disturbance regimes | Lempert |
+| Policy levers | Area targets; Municipal burden sharing | Lempert |
+| Model relationships | Objective functions; Restoration response (WP3) | Lempert, Lohmus |
+
+::::: panel-tabset
 ## Change in % area restored
 
 ::: panel-tabset
@@ -559,906 +650,5 @@ Burden sharing forces equal area for restoration across administrative units (he
 
 Burden sharing constrains the optimisation, reducing flexibility and eliminating high performing solutions, while forcing a much higher correlation between objectives.
 :::
+:::::
 
-## Spatial priority classification
-
-Each eligible pixel is classified into one of five priority classes based on (a) its mean selection frequency (RFOP) across all runs, and (b) which sensitivity dimension drives the most variation in that frequency.
-
-
-
-```{r}
-#| label: classification-config
-
-# ── Master run directory list (all condition scenario × seed combinations) ────
-# Keys are used as run labels throughout; _seed### is stripped to derive the
-# scenario group_label for sensitivity comparisons.
-SCENARIO_DIRS <- c(
-  global_all_seed100        = "../r_inputs/global_all_seed100",
-  global_all_seed101        = "../r_inputs/global_all_seed101",
-  global_all_seed102        = "../r_inputs/global_all_seed102",
-  global_drop_smd_seed100   = "../r_inputs/global_drop_smd_seed100",
-  global_drop_smd_seed101   = "../r_inputs/global_drop_smd_seed101",
-  global_drop_smd_seed102   = "../r_inputs/global_drop_smd_seed102",
-  global_drop_sbd_seed100   = "../r_inputs/global_drop_sbd_seed100",
-  global_drop_sbd_seed101   = "../r_inputs/global_drop_sbd_seed101",
-  global_drop_sbd_seed102   = "../r_inputs/global_drop_sbd_seed102",
-  global_drop_soc_seed100   = "../r_inputs/global_drop_soc_seed100",
-  global_drop_soc_seed101   = "../r_inputs/global_drop_soc_seed101",
-  global_drop_soc_seed102   = "../r_inputs/global_drop_soc_seed102",
-  global_drop_uzl_seed100   = "../r_inputs/global_drop_uzl_seed100",
-  global_drop_uzl_seed101   = "../r_inputs/global_drop_uzl_seed101",
-  global_drop_uzl_seed102   = "../r_inputs/global_drop_uzl_seed102",
-  global_drop_tsd_seed100   = "../r_inputs/global_drop_tsd_seed100",
-  global_drop_tsd_seed101   = "../r_inputs/global_drop_tsd_seed101",
-  global_drop_tsd_seed102   = "../r_inputs/global_drop_tsd_seed102",
-  global_drop_can_seed100   = "../r_inputs/global_drop_can_seed100",
-  global_drop_can_seed101   = "../r_inputs/global_drop_can_seed101",
-  global_drop_can_seed102   = "../r_inputs/global_drop_can_seed102",
-  global_drop_cdi_seed100   = "../r_inputs/global_drop_cdi_seed100",
-  global_drop_cdi_seed101   = "../r_inputs/global_drop_cdi_seed101",
-  global_drop_cdi_seed102   = "../r_inputs/global_drop_cdi_seed102",
-  global_drop_swf_h_seed100 = "../r_inputs/global_drop_swf_h_seed100",
-  global_drop_swf_h_seed101 = "../r_inputs/global_drop_swf_h_seed101",
-  global_drop_swf_h_seed102 = "../r_inputs/global_drop_swf_h_seed102",
-  global_drop_swf_t_seed100 = "../r_inputs/global_drop_swf_t_seed100",
-  global_drop_swf_t_seed101 = "../r_inputs/global_drop_swf_t_seed101",
-  global_drop_swf_t_seed102 = "../r_inputs/global_drop_swf_t_seed102",
-  global_drop_lai_seed100   = "../r_inputs/global_drop_lai_seed100",
-  global_drop_lai_seed101   = "../r_inputs/global_drop_lai_seed101",
-  global_drop_lai_seed102   = "../r_inputs/global_drop_lai_seed102",
-  global_drop_ndvi_seed100  = "../r_inputs/global_drop_ndvi_seed100",
-  global_drop_ndvi_seed101  = "../r_inputs/global_drop_ndvi_seed101",
-  global_drop_ndvi_seed102  = "../r_inputs/global_drop_ndvi_seed102",
-  upper_q75_all_seed100     = "../r_inputs/upper_q75_all_seed100",
-  upper_q75_all_seed101     = "../r_inputs/upper_q75_all_seed101",
-  upper_q75_all_seed102     = "../r_inputs/upper_q75_all_seed102"
-)
-
-# Derive dimension-specific lists from SCENARIO_DIRS:
-#   - indicator: drop-one indicator runs + global_all baseline (same spatial scope)
-#   - policy:    global_all (baseline group) + upper_q75_all (policy variant group).
-#                Both groups must be present so sens_policy = range(group means) > 0.
-#                Without the baseline group, only one group exists → range = 0 → no
-#                policy-sensitive pixels ever classified.
-#   - seed:      global_all × 3 seeds (isolates stochastic noise); keys renamed to
-#                seed100/101/102 so each seed is its own group (stripping _seed###
-#                would collapse all three into one group, making nsens_seed = 0)
-INDICATOR_RUNS <- as.list(SCENARIO_DIRS[!grepl("^upper_q75", names(SCENARIO_DIRS))])
-POLICY_RUNS    <- as.list(c(
-  SCENARIO_DIRS[grepl("^global_all_seed", names(SCENARIO_DIRS))],  # baseline group
-  SCENARIO_DIRS[grepl("^upper_q75",       names(SCENARIO_DIRS))]   # policy variant group
-))
-seed_idx       <- grepl("^global_all_seed", names(SCENARIO_DIRS))
-SEED_RUNS      <- as.list(SCENARIO_DIRS[seed_idx])
-names(SEED_RUNS) <- sub("global_all_", "", names(SEED_RUNS))   # seed100, seed101, seed102
-PARAM_RUNS     <- NULL
-
-# Classification thresholds (tune these after inspecting the diagnostic plots)
-THRESH_LOW    <- 20    # % — below this → Low priority
-THRESH_HIGH   <- 60   # % — above this (+ low sensitivity) → Robust priority
-THRESH_STABLE <- 0.3  # normalised sensitivity below which a dimension is negligible
-
-# Which eligible pixel reference to use for grey underlay (must have df_elig loaded)
-ELIG_REFERENCE <- run_a
-```
-
-```{r}
-#| label: classification-load
-#| results: hide
-
-# Helper: load all runs in a named list and bind into a single data frame.
-# group_label is derived by stripping trailing _seed### from the key so that
-# all seeds of the same scenario are averaged into one group before computing
-# cross-scenario sensitivity range.
-.load_dim_runs <- function(run_dirs, dim_type) {
-  if (is.null(run_dirs) || length(run_dirs) == 0) return(NULL)
-  dfs <- lapply(names(run_dirs), function(nm) {
-    dir <- run_dirs[[nm]]
-    if (!dir.exists(dir)) {
-      message(sprintf("Directory not found, skipping: %s", dir))
-      return(NULL)
-    }
-    grp <- sub("_seed\\d+$", "", nm)   # e.g. "global_all_seed100" → "global_all"
-    load_run_rfop(dir_path = dir, label = nm, dim_type = dim_type, group_label = grp)
-  })
-  dplyr::bind_rows(Filter(Negate(is.null), dfs))
-}
-
-runs_all_df <- dplyr::bind_rows(
-  .load_dim_runs(INDICATOR_RUNS, "indicator"),
-  .load_dim_runs(POLICY_RUNS,    "policy"),
-  .load_dim_runs(SEED_RUNS,      "seed"),
-  .load_dim_runs(PARAM_RUNS,     "param")
-)
-
-cat(sprintf(
-  "Loaded %d pixel-run records from %d unique runs across dimensions: %s\n",
-  nrow(runs_all_df),
-  length(unique(runs_all_df$run_label)),
-  paste(sort(unique(runs_all_df$dim_type)), collapse = ", ")
-))
-```
-
-```{r}
-#| label: classification-compute
-
-if (nrow(runs_all_df) == 0) {
-  message("No run data loaded — configure INDICATOR_RUNS / POLICY_RUNS / SEED_RUNS above.")
-  class_df <- NULL
-} else {
-  class_df <- compute_spatial_classification(
-    runs_df       = runs_all_df,
-    elig_df       = ELIG_REFERENCE$df_elig,
-    thresh_low    = THRESH_LOW,
-    thresh_high   = THRESH_HIGH,
-    thresh_stable = THRESH_STABLE
-  )
-
-  class_pct <-  class_df %>%
-      dplyr::count(classification) %>%
-      dplyr::mutate(pct = round(n / sum(n) * 100, 1))
-
-  #identify what values of classification are available
-  available_classes <- unique(class_pct$classification)
-  print(available_classes)
-
-  pct_low <- class_pct %>%
-  dplyr::filter(classification == "Low priority") %>%
-  dplyr::pull(pct)
-
-  pct_robust <- class_pct %>%
-  dplyr::filter(classification == "Robust priority") %>%
-  dplyr::pull(pct)
-
-  pct_cond <- class_pct %>%
-  dplyr::filter(classification == "Condition sensitive") %>%
-  dplyr::pull(pct)
-
-  pct_policy <- class_pct %>%
-  dplyr::filter(classification == "Policy sensitive") %>%
-  dplyr::pull(pct)
-
-  pct_unstable <- class_pct %>%
-  dplyr::filter(classification == "Unstable / noisy") %>%
-  dplyr::pull(pct)
-}
-```
-
-| Classification | Definition | Number of pixels |
-|----|----|----|
-| **Low priority** | Mean RFOP \< `r THRESH_LOW` across all runs: consistently avoided by the algorithm regardless of assumptions. | `r pct_low` |
-| **Robust priority** | Mean RFOP ≥ `r THRESH_HIGH` and low sensitivity across all dimensions: selected under most assumptions. | `r pct_robust` |
-| **Condition sensitive** | Selection frequency varies most with indicator/condition assumptions (which ecological indicators are included). | `r pct_cond` |
-| **Policy sensitive** | Selection frequency varies most with policy decisions | `r pct_policy` |
-| **Unstable / noisy** | Selection frequency varies most with random seed: stochastic algorithm noise dominates. | `r pct_unstable` |
-
-Sensitivity for dimension $d$ is normalised as $s_d = \text{range}(\bar{f}_{d,g}) \,/\, (\bar{f}_{\text{all}} + 1)$ where $\bar{f}_{d,g}$ is the mean RFOP per group $g$ within dimension $d$ and $\bar{f}_{\text{all}}$ is the mean RFOP across all runs. The $+1$ prevents division by zero for low-frequency pixels.
-
-```{r}
-#| label: classification-diagnostics
-#| fig-height: 4
-#| fig-width: 12
-
-# Diagnostic: distributions of mean RFOP and sensitivity scores.
-# Use these to calibrate THRESH_LOW, THRESH_HIGH, and THRESH_STABLE.
-if (!is.null(class_df) && nrow(class_df) > 0) {
-  p1 <- ggplot(class_df, aes(x = mean_rfop_all)) +
-    geom_histogram(binwidth = 5, fill = "steelblue", colour = "white") +
-    geom_vline(xintercept = c(THRESH_LOW, THRESH_HIGH),
-               linetype = "dashed", colour = c("orange", "darkgreen")) +
-    scale_x_continuous(limits = c(0, 100)) +
-    labs(title = "Distribution of mean RFOP across all runs",
-         x = "Mean RFOP (%)", y = "Pixel count")
-
-  p2 <- class_df %>%
-    tidyr::pivot_longer(cols = starts_with("nsens_"),
-                        names_to = "dimension", values_to = "nsens") %>%
-    dplyr::mutate(dimension = sub("nsens_", "", dimension)) %>%
-    ggplot(aes(x = nsens, fill = dimension)) +
-    geom_histogram(binwidth = 0.05, colour = "white", position = "identity", alpha = 0.6) +
-    geom_vline(xintercept = THRESH_STABLE, linetype = "dashed", colour = "grey30") +
-    scale_fill_brewer(palette = "Set1", name = "Dimension") +
-    labs(title = "Distribution of normalised sensitivity",
-         subtitle = sprintf("Dashed line: thresh_stable = %g", THRESH_STABLE),
-         x = "Normalised sensitivity", y = "Pixel count")
-
-  p1 + p2 + patchwork::plot_layout(ncol = 2)
-}
-```
-
-::: panel-tabset
-### Classification map
-
-```{r}
-#| label: classification-map
-#| fig-height: 8
-#| fig-width: 8
-
-if (!is.null(class_df)) {
-  make_classification_map(
-    class_df = class_df,
-    elig_df  = ELIG_REFERENCE$df_elig,
-    title    = sprintf("Spatial priority classification (%s)", ECOSYSTEM)
-  )
-}
-```
-
-### % area per class
-
-```{r}
-#| label: classification-bar
-#| fig-height: 4
-#| fig-width: 7
-
-if (!is.null(class_df)) {
-  make_classification_summary_bar(class_df)
-}
-```
-
-### Sensitivity breakdown
-
-```{r}
-#| label: classification-sensitivity
-#| fig-height: 6
-#| fig-width: 14
-
-if (!is.null(class_df)) {
-  make_sensitivity_breakdown_maps(
-    class_df = class_df,
-    dims     = intersect(
-      c("indicator", "policy", "seed", "param"),
-      unique(runs_all_df$dim_type)
-    )
-  )
-}
-```
-:::
-
-## Pareto front sensitivity
-
-How much does the *quality* of the Pareto front — and the best achievable value on each objective — change across sensitivity dimensions?
-
-Two complementary summaries:
-
-1.  **Hypervolume (HV)** — a scalar indicator of overall Pareto front quality (larger = better). A drop in HV relative to the reference run indicates that removing an indicator or changing a policy assumption restricts the algorithm's ability to find high-quality solutions.
-2.  **Ideal-point shift** — the best value the algorithm achieves on each individual objective across the non-dominated front. A shift away from the reference reveals *which specific objectives* are most affected by each assumption.
-
-```{r}
-#| label: pareto-sensitivity-config
-
-# SCENARIO_DIRS is defined in the classification-config chunk above.
-# Build PARETO_SENSITIVITY_RUNS by loading each run object from those same dirs.
-PARETO_SENSITIVITY_RUNS <- lapply(names(SCENARIO_DIRS), function(nm) {
-  dir <- SCENARIO_DIRS[[nm]]
-  grp <- sub("_seed\\d+$", "", nm)
-  # global_all seeds also appear as the seed dimension
-  dim <- dplyr::case_when(
-    grp == "global_all"  ~ "seed",
-    grepl("^upper_q75",  nm) ~ "policy",
-    TRUE                 ~ "indicator"
-  )
-  run <- tryCatch(load_run_data(dir, nm), error = function(e) {
-    message(sprintf("  Skipping %s: %s", nm, conditionMessage(e))); NULL
-  })
-  if (is.null(run)) return(NULL)
-  list(run = run, dim_type = dim, group_label = grp)
-})
-names(PARETO_SENSITIVITY_RUNS) <- names(SCENARIO_DIRS)
-PARETO_SENSITIVITY_RUNS <- Filter(Negate(is.null), PARETO_SENSITIVITY_RUNS)
-
-# Reference run: global_all_seed100 (the full-indicator baseline)
-PARETO_REF_LABEL <- "global_all_seed100"
-
-if (length(PARETO_SENSITIVITY_RUNS) == 0) {
-  message("No runs configured — populate PARETO_SENSITIVITY_RUNS above.")
-  pareto_stats_df <- NULL
-} else {
-  pareto_stats_df <- collect_pareto_stats(PARETO_SENSITIVITY_RUNS, obj_names)
-}
-```
-
-::: panel-tabset
-### Hypervolume sensitivity
-
-HV for each run, grouped by sensitivity dimension. The dashed line marks the reference run's HV. Points further below the line indicate assumptions that substantially reduce Pareto front quality.
-
-```{r}
-#| label: pareto-hv-plot
-#| fig-height: 14
-#| fig-width: 9
-
-if (!is.null(pareto_stats_df)) {
-  make_hv_sensitivity_plot(pareto_stats_df, ref_label = PARETO_REF_LABEL)
-}
-```
-
-### Ideal & nadir shift
-
-For each run and objective, the **filled circle** marks the ideal-point % change (best achievable value) and the **open circle** marks the nadir % change (worst non-dominated value), both relative to the reference run. The connecting segment shows how the *width* of the Pareto front changes: a long segment means the front is stretching or compressing, while the segment's position on the x-axis shows whether the whole front shifts. Blue = improved, red = degraded.
-
-```{r}
-#| label: pareto-dumbbell-plot
-#| fig-height: 18
-#| fig-width: 12
-
-if (!is.null(pareto_stats_df)) {
-  make_ideal_nadir_dumbbell(
-    pareto_stats_df,
-    obj_names  = obj_names,
-    obj_labels = obj_labels,
-    ref_label  = PARETO_REF_LABEL
-  )
-}
-```
-:::
-
-## Indicator importance for pixel selection
-
-How much of the variance in pixel selection frequency (RFOP) does each EC indicator explain?
-
-We use the van den Wollenberg (1977) redundancy index: correlation between the selection frequency across seeds for a given scenario, and the raw indicator raster value at each pixel.
-
-```{r}
-#| label: redundancy-config
-
-# ── Condition scenario directories ────────────────────────────────────────────
-# One sub-list per scenario tag; each sub-list contains the r_inputs/ dirs
-# for all seeds of that scenario.  Adjust paths / seed labels as needed.
-EC_INDICATOR_BASE <- "C:/Users/inicholson/Documents/Restoration_potential/shinyliveapp/ec_data_aligned"
-
-CONDITION_SCENARIO_DIRS <- list(
-  global_all        = list(seed100 = "../r_inputs/global_all_seed100",
-                           seed101 = "../r_inputs/global_all_seed101"),
-  global_drop_smd   = list(seed100 = "../r_inputs/global_drop_smd_seed100",
-                           seed101 = "../r_inputs/global_drop_smd_seed101"),
-  global_drop_sbd   = list(seed100 = "../r_inputs/global_drop_sbd_seed100",
-                           seed101 = "../r_inputs/global_drop_sbd_seed101"),
-  global_drop_soc   = list(seed100 = "../r_inputs/global_drop_soc_seed100",
-                           seed101 = "../r_inputs/global_drop_soc_seed101"),
-  global_drop_uzl   = list(seed100 = "../r_inputs/global_drop_uzl_seed100",
-                           seed101 = "../r_inputs/global_drop_uzl_seed101"),
-  global_drop_tsd   = list(seed100 = "../r_inputs/global_drop_tsd_seed100",
-                           seed101 = "../r_inputs/global_drop_tsd_seed101"),
-  global_drop_can   = list(seed100 = "../r_inputs/global_drop_can_seed100",
-                           seed101 = "../r_inputs/global_drop_can_seed101"),
-  global_drop_cdi   = list(seed100 = "../r_inputs/global_drop_cdi_seed100",
-                           seed101 = "../r_inputs/global_drop_cdi_seed101"),
-  global_drop_swf_h = list(seed100 = "../r_inputs/global_drop_swf_h_seed100",
-                           seed101 = "../r_inputs/global_drop_swf_h_seed101"),
-  global_drop_swf_t = list(seed100 = "../r_inputs/global_drop_swf_t_seed100",
-                           seed101 = "../r_inputs/global_drop_swf_t_seed101"),
-  global_drop_lai   = list(seed100 = "../r_inputs/global_drop_lai_seed100",
-                           seed101 = "../r_inputs/global_drop_lai_seed101"),
-  global_drop_ndvi  = list(seed100 = "../r_inputs/global_drop_ndvi_seed100",
-                           seed101 = "../r_inputs/global_drop_ndvi_seed101"),
-  upper_q75_all     = list(seed100 = "../r_inputs/upper_q75_all_seed100",
-                           seed101 = "../r_inputs/upper_q75_all_seed101")
-)
-
-# ── Indicator raster paths ────────────────────────────────────────────────────
-INDICATOR_PATHS <- list(
-  smd   = file.path(EC_INDICATOR_BASE, "smd.tif"),
-  sbd   = file.path(EC_INDICATOR_BASE, "sbd.tif"),
-  soc   = file.path(EC_INDICATOR_BASE, "soc.tif"),
-  uzl   = file.path(EC_INDICATOR_BASE, "uzl.tif"),
-  tsd   = file.path(EC_INDICATOR_BASE, "tsd.tif"),
-  can   = file.path(EC_INDICATOR_BASE, "can_lang.tif"),
-  cdi   = file.path(EC_INDICATOR_BASE, "cdi.tif"),
-  swf_h = file.path(EC_INDICATOR_BASE, "swf_h.tif"),
-  swf_t = file.path(EC_INDICATOR_BASE, "swf_t.tif"),
-  lai   = file.path(EC_INDICATOR_BASE, "lai.tif"),
-  ndvi  = file.path(EC_INDICATOR_BASE, "ndvi.tif")
-)
-
-# ── Indicator metadata ────────────────────────────────────────────────────────
-INDICATOR_META <- tibble::tribble(
-  ~code,   ~full_name,                          ~ect,
-  "smd",   "Soil Moisture Deficit",              "abiotic",
-  "sbd",   "Soil Bulk Density",                  "abiotic",
-  "soc",   "Soil Organic Carbon",                "abiotic",
-  "uzl",   "UZL Species",                        "biotic",
-  "tsd",   "Tree Species Diversity",             "biotic",
-  "can",   "Canopy Height",                      "biotic",
-  "cdi",   "Crop Diversity Index",               "biotic",
-  "swf_h", "Small Woody Features (Hedgerows)",   "biotic",
-  "swf_t", "Small Woody Features (Trees)",       "biotic",
-  "lai",   "Leaf Area Index",                    "biotic",
-  "ndvi",  "NDVI",                               "biotic"
-)
-```
-
-```{r}
-#| label: redundancy-load
-#| message: false
-
-# ── Step 1: average RFOP per pixel across seeds for each condition scenario ───
-message("Loading scenario RFOP data...")
-all_scenarios_rfop <- dplyr::bind_rows(lapply(
-  names(CONDITION_SCENARIO_DIRS),
-  function(tag) {
-    message(sprintf("  scenario: %s", tag))
-    load_scenario_rfop_avg(CONDITION_SCENARIO_DIRS[[tag]], scenario_label = tag)
-  }
-))
-all_scenarios_rfop <- dplyr::filter(all_scenarios_rfop, !is.na(rfop_avg))
-```
-
-```{r}
-#| label: redundancy-extract
-#| message: false
-
-# ── Step 2: extract indicator values at eligible pixel locations ──────────────
-# Uses run_a's eligible pixels as the reference pixel set (set in classification
-# config above as ELIG_REFERENCE, which equals run_a).
-message("Extracting indicator raster values at eligible pixel locations...")
-indicator_vals <- extract_indicator_values(
-  elig_df         = ELIG_REFERENCE$df_elig,
-  indicator_paths = INDICATOR_PATHS,
-  lulc_raster     = lulc
-)
-```
-
-```{r}
-#| label: redundancy-compute
-
-# ── Step 3: compute R² per indicator × scenario × ecosystem ──────────────────
-redundancy_df <- compute_redundancy_indices(
-  all_scenarios_df  = all_scenarios_rfop,
-  indicator_vals_df = indicator_vals,
-  indicator_meta    = INDICATOR_META,
-  min_pixels        = 50
-)
-
-if (!is.null(redundancy_df)) {
-
-  # Top 5 indicator × ecosystem combos by median R²
-  top5 <- redundancy_df |>
-    dplyr::group_by(indicator_label, ecosystem) |>
-    dplyr::summarise(median_r2 = median(redundancy_r2, na.rm = TRUE),
-                     .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(median_r2)) |>
-    head(5)
-} else {
-  cat("No redundancy data could be computed — check scenario directories and indicator paths.\n")
-}
-```
-
-Each box spans all 13 condition scenarios, showing how stable an indicator's explanatory importance is across ecological reference assumptions. Indicators ordered by overall median R² (left = most consistently important).
-
-```{r}
-#| label: redundancy-boxplot
-#| fig-height: 12
-#| fig-width: 10
-
-make_redundancy_boxplot(redundancy_df)
-```
-
-# Four-objective run (abiotic × biotic × cost × connectivity)
-
-Connectivity gain is currently included as a precomputed per-pixel metric based on the amount of existing semi-natural habitat within a 100 m neighbourhood of each conversion-eligible pixel.
-
-Restoration is here divided into two action types:
-
--   **restoration** (improving ecological condition in-situ)
--   **conversion** (changing agricultural land use to semi-natural habitat, directly contributing to connectivity gain).
-
-## Connectivity objective function
-
-For each candidate conversion pixel $j$, the precomputed gain is:
-
-$$
-g_j = \sum_{i \,:\, d(i,j) \le R} \mathbf{1}\!\left[\text{LULC}_i \in \mathcal{S}\right]
-$$
-
-where $R = 100\,\text{m}$, $\mathcal{S}$ is the set of semi-natural LULC classes, and $d(i,j)$ is Euclidean distance between pixels $i$ and $j$.
-
-Given a binary decision vector $\mathbf{x}_c$ over conversion-eligible pixels, the objective maximised by the algorithm is:
-
-$$
-f_{\text{conn}}(\mathbf{x}_c) = \sum_j x_{c,j} \cdot g_j
-$$
-
-Pixels embedded in existing semi-natural habitat receive higher $g_j$ and are therefore prioritised over isolated pixels surrounded by agriculture.
-
-```{r}
-#| label: config-4obj
-
-# ── Point this at the export_to_r.py output directory for the 4-objective run ──
-RUN_DIR_4OBJ <- "../r_inputs/4obj_02sample_2ndtry"   # ← update before rendering
-LABEL_4OBJ   <- "4-objective (with connectivity)"
-
-run_4obj <- load_run_data(RUN_DIR_4OBJ, LABEL_4OBJ)
-obj_names_4  <- run_4obj$obj_names
-obj_labels_4 <- gsub("_", " ", obj_names_4) |> tools::toTitleCase()
-
-cat(sprintf("Objectives: %s\n", paste(obj_names_4, collapse = ", ")))
-cat(sprintf("Solutions: %d total, %d non-dominated\n",
-            run_4obj$n_solutions, run_4obj$n_nondom))
-```
-
-## Algorithm convergence
-
-Hypervolume and per-objective mean (± 1 SD) across generations.
-
-```{r}
-#| label: 4obj-convergence
-#| fig-height: 6
-#| fig-width: 12
-make_hv_evo_plot(run_4obj, obj_names_4, obj_labels_4)
-```
-
-## Pareto front — pairwise trade-offs
-
-All six pairwise objective combinations. Note especially the panels involving `connectivity_gain` vs. each ecological and cost objective — these reveal whether connectivity trades off against or aligns with condition improvement.
-
-```{r}
-#| label: 4obj-pairwise
-#| fig-height: 8
-#| fig-width: 18
-
-# Existing make_pareto_pairwise produces one panel per pair; wrap at 3 columns
-# so the 6 panels appear as two rows of three.
-p_pairs <- make_pareto_pairwise(run_4obj, obj_names_4, obj_labels_4)
-
-# Override the default ncol if the function returns a patchwork object
-if (inherits(p_pairs, "patchwork")) {
-  p_pairs + patchwork::plot_layout(ncol = 3)
-} else {
-  p_pairs
-}
-```
-
-## Parallel coordinates
-
-Each axis is min-max normalised across all solutions. Thick coloured lines highlight the solution that is best on each individual objective; thin black lines are other non-dominated solutions; grey lines are dominated solutions.
-
-```{r}
-#| label: 4obj-parcoord
-#| fig-height: 5
-#| fig-width: 13
-
-# Extend best-solution colours to 4 objectives
-best_cols_4 <- c("#E05C2A", "#2A7BE0", "#2AB05C", "#9B59B6")
-make_parcoord_plot(run_4obj, obj_names_4, obj_labels_4, best_colours = best_cols_4)
-```
-
-## Objective correlations
-
-```{r}
-#| label: 4obj-corr
-#| fig-height: 5
-#| fig-width: 10
-make_corr_plot(run_4obj, obj_names_4, obj_labels_4)
-```
-
-## Action mix per solution
-
-Stacked bar showing how many pixels in each non-dominated solution are **restoration** actions vs **conversion** actions. Solutions are ordered by their connectivity gain objective value (ascending = most connectivity gain first), so the leftmost solutions are those that focus most on connectivity improvement via land-use conversion.
-
-```{r}
-#| label: 4obj-action-bar
-#| fig-height: 5
-#| fig-width: 14
-
-# Order by connectivity_gain if present, otherwise by first objective
-order_by <- if ("connectivity_gain" %in% obj_names_4) "connectivity_gain" else obj_names_4[1]
-make_action_stacked_bar(run_4obj, obj_names_4, obj_labels_4, order_obj = order_by)
-```
-
-## Spatial frequency by action type
-
-Selection frequency maps (RFOP %) for restoration and conversion actions separately, showing whether the two action types target different parts of the landscape.
-
-```{r}
-#| label: 4obj-action-maps
-#| fig-height: 6
-#| fig-width: 14
-make_action_split_freq_plot(run_4obj)
-```
-
-## Spatial distribution of selected areas (combined)
-
-Overall selection frequency across both action types.
-
-```{r}
-#| label: 4obj-sel-freq
-#| fig-height: 6
-#| fig-width: 8
-make_sel_freq_plot(run_4obj)
-```
-
-## Composition of selected pixels
-
-```{r}
-#| label: 4obj-composition
-#| fig-height: 5
-#| fig-width: 12
-#| layout-ncol: 2
-
-make_sel_freq_unified_plot(
-  run_4obj,
-  fill_values = rfop_fill_lulc(run_4obj, lulc),
-  fill_label  = "LULC class",
-  title       = "Selection frequency by LULC class"
-)
-
-make_sel_freq_unified_plot(
-  run_4obj,
-  fill_values = rfop_fill_objective(run_4obj, abiotic_anomaly),
-  fill_label  = "Abiotic anomaly quintile",
-  palette     = "YlOrRd",
-  title       = "Selection frequency by abiotic anomaly"
-)
-```
-
-# Effect of seeding on optimisation outcomes
-
-Comparing the effect of seeding with 3 extreme solutions.
-
-```{r}
-#| label: comparison stats
-cat(sprintf("Run A: %s  (%d solutions, %d non-dominated)\n",
-            LABEL_A, run_a$n_solutions, run_a$n_nondom))
-cat(sprintf("Run B: %s  (%d solutions, %d non-dominated)\n",
-            LABEL_B, run_b$n_solutions, run_b$n_nondom))
-```
-
-#### a) Convergence: does seeding accelerate convergence?
-
-Without seeding, the algorithm converges earlier and shows faster improvement over early generations. With seeding, it reaches a higher hypervolume.
-
-```{r}
-#| label: compare-hv
-#| fig-height: 4
-
-compare_hv_plot <- function(run_a, run_b) {
-  if (is.null(run_a$df_hv) && is.null(run_b$df_hv)) {
-    cat("hypervolume_evolution.csv not available for either run.\n")
-    return(invisible(NULL))
-  }
-  hv_df <- bind_rows(
-    if (!is.null(run_a$df_hv)) mutate(run_a$df_hv, run = run_a$label) else NULL,
-    if (!is.null(run_b$df_hv)) mutate(run_b$df_hv, run = run_b$label) else NULL
-  ) %>% mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
-
-  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
-
-  hv_a  <- if (!is.null(run_a$df_hv)) tail(run_a$df_hv$hypervolume, 1) else NA_real_
-  hv_b  <- if (!is.null(run_b$df_hv)) tail(run_b$df_hv$hypervolume, 1) else NA_real_
-  ratio <- if (!is.na(hv_a) && hv_a != 0) hv_b / hv_a else NA_real_
-
-  sub_txt <- sprintf(
-    "Final HV: %s = %.4g | %s = %.4g | ratio B/A = %.3f",
-    run_a$label, hv_a, run_b$label, hv_b,
-    if (!is.na(ratio)) ratio else NaN
-  )
-
-  ggplot(hv_df, aes(x = generation, y = hypervolume, colour = run)) +
-    geom_line(linewidth = 0.9) +
-    geom_point(size = 1.2, alpha = 0.6) +
-    scale_colour_manual(values = run_cols, name = "Run") +
-    scale_y_continuous(labels = scales::scientific) +
-    labs(
-      subtitle = sub_txt,
-      x = "Generation", y = "Hypervolume"
-    )
-}
-
-compare_hv_plot(run_a, run_b)
-```
-
-#### b) Pareto quality: does seeding improve the Pareto front?
-
-Non-dominated solutions from both runs plotted together.
-
-```{r}
-#| label: compare-pareto
-#| fig-height: 4
-
-compare_pareto_overlay <- function(run_a, run_b, obj_names, obj_labels) {
-  k <- length(obj_names)
-  if (k < 2) { cat("Need >= 2 objectives.\n"); return(invisible(NULL)) }
-
-  nd_a <- run_a$df_obj[run_a$df_obj$is_nondominated == 1, ] %>% mutate(run = run_a$label)
-  nd_b <- run_b$df_obj[run_b$df_obj$is_nondominated == 1, ] %>% mutate(run = run_b$label)
-  df   <- bind_rows(nd_a, nd_b) %>%
-    mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
-
-  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
-  pairs    <- combn(k, 2, simplify = FALSE)
-
-  plots <- lapply(pairs, function(p) {
-    xi <- obj_names[p[1]]; yi <- obj_names[p[2]]
-    xl <- obj_labels[p[1]]; yl <- obj_labels[p[2]]
-    ggplot(df, aes(x = .data[[xi]], y = .data[[yi]], colour = run)) +
-      geom_point(size = 2.5, alpha = 0.7) +
-      scale_colour_manual(values = run_cols, name = "Run") +
-      labs(x = xl, y = yl)
-  })
-
-  wrap_plots(plots, ncol = length(plots), guides = "collect") +
-    plot_annotation(
-      title    = sprintf("Pareto Front Overlay \u2014 %s", toupper(ECOSYSTEM)),
-      subtitle = sprintf("%d ND (%s)  +  %d ND (%s)",
-                         run_a$n_nondom, run_a$label,
-                         run_b$n_nondom, run_b$label),
-      theme = theme(plot.title    = element_text(size = 13, face = "bold"),
-                    plot.subtitle = element_text(size = 11, colour = "grey40"))
-    )
-}
-
-compare_pareto_overlay(run_a, run_b, obj_names, obj_labels)
-```
-
-The C-metric table below quantifies mutual domination. Seeded run outperformed the not-seeded run in terms of dominance.
-
-```{r}
-#| label: coverage-table
-
-# C(B, A): proportion of run_a's ND front dominated by at least one solution in run_b
-coverage_stats <- function(run_a, run_b, obj_names) {
-  nd_a <- as.matrix(run_a$df_obj[run_a$df_obj$is_nondominated == 1, obj_names])
-  nd_b <- as.matrix(run_b$df_obj[run_b$df_obj$is_nondominated == 1, obj_names])
-
-  dom_by_b <- mean(apply(nd_a, 1, function(a)
-    any(apply(nd_b, 1, function(b) all(b <= a) && any(b < a)))))
-  dom_by_a <- mean(apply(nd_b, 1, function(b)
-    any(apply(nd_a, 1, function(a) all(a <= b) && any(a < b)))))
-
-  hv_a <- if (!is.null(run_a$df_hv)) tail(run_a$df_hv$hypervolume, 1) else NA_real_
-  hv_b <- if (!is.null(run_b$df_hv)) tail(run_b$df_hv$hypervolume, 1) else NA_real_
-
-  # Generational Distance (GD): mean distance from each run's ND front to the
-  # combined reference front (union of both ND sets, re-filtered for dominance).
-  # GD(A) < GD(B) means run A's front is closer to the combined best-known front.
-  combined <- rbind(nd_a, nd_b)
-  # Keep only non-dominated rows of the combined set
-  is_nd_combined <- !apply(combined, 1, function(p)
-    any(apply(combined, 1, function(q) all(q <= p) && any(q < p))))
-  ref <- combined[is_nd_combined, , drop = FALSE]
-
-  gd <- function(approx, reference) {
-    mean(apply(approx, 1, function(p)
-      sqrt(min(colSums((t(reference) - p)^2)))))
-  }
-
-  gd_a <- gd(nd_a, ref)
-  gd_b <- gd(nd_b, ref)
-
-  tibble::tibble(
-    Metric = c(
-      sprintf("C(B\u2192A): %% of %s solutions dominated by %s", run_a$label, run_b$label),
-      sprintf("C(A\u2192B): %% of %s solutions dominated by %s", run_b$label, run_a$label),
-      sprintf("GD (%s): mean dist to combined reference front", run_a$label),
-      sprintf("GD (%s): mean dist to combined reference front", run_b$label)
-    ),
-    Value = c(
-      sprintf("%.1f%%", dom_by_b * 100),
-      sprintf("%.1f%%", dom_by_a * 100),
-      sprintf("%.4g", gd_a),
-      sprintf("%.4g", gd_b)
-    )
-  )
-}
-
-knitr::kable(coverage_stats(run_a, run_b, obj_names),
-             caption = "C-metric and Generational Distance comparison between runs")
-```
-
-#### c) Bias: does seeding shift which part of objective space is explored?
-
-All solutions from both runs for each pair of objectives (colour = run). A systematic positional shift or difference in cloud shape indicates seeding biases the search towards a different region of objective space.
-
-```{r}
-#| label: compare-pairwise
-#| fig-height: 5
-
-compare_pairwise_scatter <- function(run_a, run_b, obj_names, obj_labels) {
-  k <- length(obj_names)
-  if (k < 2) { cat("Need at least 2 objectives.\n"); return(invisible(NULL)) }
-
-  df <- bind_rows(
-    run_a$df_obj %>% select(all_of(obj_names)) %>% mutate(run = run_a$label),
-    run_b$df_obj %>% select(all_of(obj_names)) %>% mutate(run = run_b$label)
-  ) %>% mutate(run = factor(run, levels = c(run_a$label, run_b$label)))
-
-  run_cols <- setNames(c("#E05C2A", "steelblue"), c(run_a$label, run_b$label))
-  pairs    <- combn(k, 2, simplify = FALSE)
-
-  plots <- lapply(seq_along(pairs), function(pi) {
-    p  <- pairs[[pi]]
-    xi <- obj_names[p[1]]; yi <- obj_names[p[2]]
-    xl <- obj_labels[p[1]]; yl <- obj_labels[p[2]]
-    ggplot(df, aes(x = .data[[xi]], y = .data[[yi]], colour = run)) +
-      geom_point(size = 1.5, alpha = 0.35) +
-      scale_colour_manual(values = run_cols, name = "Run") +
-      labs(x = xl, y = yl) +
-      theme(legend.position = if (pi == 1) "top" else "none",
-            axis.title = element_text(size = 9))
-  })
-
-  do.call(gridExtra::grid.arrange,
-          c(plots, list(ncol = min(3L, length(plots)),
-                        top  = textGrob(
-                          sprintf("Pairwise Objective Scatter \u2014 %s", toupper(ECOSYSTEM)),
-                          gp = gpar(fontsize = 13, fontface = "bold")))))
-}
-
-compare_pairwise_scatter(run_a, run_b, obj_names, obj_labels)
-```
-
-#### d) Spatial robustness: does seeding change which pixels are selected?
-
-Pairwise Jaccard similarity of pixel selections across three groups: within run A's Pareto front, within run B's Pareto front, and cross-run (one solution from each front). If the cross-run distribution resembles within-run distributions, seeding does not substantially alter which pixels are chosen.
-
-```{r}
-#| label: compare-spatial
-#| fig-height: 4
-
-compute_cross_jaccard <- function(run_a, run_b) {
-  if (is.null(run_a$df_psel) || is.null(run_b$df_psel)) {
-    message("pixel_selection.csv not available for one or both runs.")
-    return(NULL)
-  }
-
-  make_pixel_sets <- function(run) {
-    psel   <- run$df_psel
-    has_xy <- all(c("x", "y") %in% names(psel))
-    psel   <- psel %>% mutate(
-      pkey = if (has_xy) paste(round(x, 1), round(y, 1), sep = "_")
-             else paste(pixel_row, pixel_col, sep = "_")
-    )
-    split(psel$pkey, psel$solution_id)
-  }
-
-  sets_a <- make_pixel_sets(run_a)
-  sets_b <- make_pixel_sets(run_b)
-  if (length(sets_a) == 0 || length(sets_b) == 0) return(NULL)
-
-  rows <- lapply(names(sets_a), function(i)
-    lapply(names(sets_b), function(j) {
-      s1    <- sets_a[[i]]; s2 <- sets_b[[j]]
-      inter <- length(intersect(s1, s2))
-      uni   <- length(union(s1, s2))
-      data.frame(jaccard = if (uni == 0) 0 else inter / uni,
-                 type    = sprintf("Cross (%s \u00d7 %s)", run_a$label, run_b$label))
-    })
-  )
-  bind_rows(unlist(rows, recursive = FALSE))
-}
-
-plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
-  jac_a <- compute_jaccard_pairs(run_a, obj_names)
-  jac_b <- compute_jaccard_pairs(run_b, obj_names)
-  jac_x <- compute_cross_jaccard(run_a, run_b)
-
-  parts <- Filter(Negate(is.null), list(
-    if (!is.null(jac_a) && nrow(jac_a) > 0)
-      data.frame(jaccard = jac_a$jaccard_similarity,
-                 type    = sprintf("Within %s", run_a$label)),
-    if (!is.null(jac_b) && nrow(jac_b) > 0)
-      data.frame(jaccard = jac_b$jaccard_similarity,
-                 type    = sprintf("Within %s", run_b$label)),
-    if (!is.null(jac_x) && nrow(jac_x) > 0) jac_x
-  ))
-
-  if (length(parts) == 0) { cat("Jaccard data not available.\n"); return(invisible(NULL)) }
-
-  df_all <- bind_rows(parts) %>%
-    mutate(type = factor(type, levels = unique(type)))
-
-  ggplot(df_all, aes(x = type, y = jaccard, fill = type)) +
-    geom_violin(trim = FALSE, alpha = 0.45, colour = NA) +
-    geom_boxplot(width = 0.15, outlier.size = 0.8, fill = "white") +
-    scale_fill_manual(values = c("#E05C2A", "steelblue", "grey50"), guide = "none") +
-    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
-                       limits = c(0, 1)) +
-    labs(
-      title    = sprintf("Spatial Similarity (Jaccard) \u2014 %s", toupper(ECOSYSTEM)),
-      subtitle = "Pairwise Jaccard within each run's Pareto front and across runs",
-      x = NULL, y = "Jaccard similarity"
-    )
-}
-
-plot_jaccard_comparison(run_a, run_b, obj_names)
-```

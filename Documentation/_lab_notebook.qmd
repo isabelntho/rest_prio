@@ -1,5 +1,5 @@
-
-# Meeting 28.08.2026
+::: {.callout-note collapse="true"}
+# Meeting 28.04.2026
 Discussed priorities over the next 6 weeks:
 
 * Scenarios & uncertainty
@@ -10,6 +10,8 @@ Discussed priorities over the next 6 weeks:
 * Towards WP3
   + Outline of plan to move framework towards dynamic spatial optimisation model
   + Full understanding of results
+
+Less immediate priorities: 
 * Complete implementation of 4-objective version
   + Implement simple approach but not needed to be perfect
   + Implementation of convolution-based connectivity metric
@@ -25,3 +27,32 @@ Discussed priorities over the next 6 weeks:
 * Algorithm fine-tuning
   + Systematic runs varying algorithm parameters (population size, number of generations, mutation/crossover rates, etc.) and their influence on convergence and solution quality.
   + Sensitivity analysis to understand how robust the Pareto front is to algorithm settings (minimum = random seed).
+:::
+::: {.callout-note collapse="true"}
+# 30.04.2026
+* Updated code to improve speed but had to revert because of changes to output. Identified that this was due to threading/parallelisation making some stochasiticty in output.
+:::
+::: {.callout-note collapse="true"}
+# Week of 04.05.2026
+
+* Updated framework to run multiple scenarios to test different sensitivity dimensions - starting with construction of ecosystem condition indicators/anomalies (indicator choice/weighting; baseline conditions).
+* Updated opt_results_comparison with initial visualisations of results across scenarios. 
+* Improved speed of code - from approx 90 mins to 10 mins for KB. Previous versions were doing expensive sorting for selection of repair candidates, which was not necessary due to changes in how repair is done (mostly random selection). 
+
+Trying to base the approach in literature
+
+https://doi.org/10.1007/978-3-030-05252-2_2 Lambert: Robust Decision-Making
+
+The basis used for Roman et al., 2026
+
+X: exogenous uncertainties: 
+L: Policy levers: area target, municipal burden sharing, cost constraint etc.
+
+Roman et al., 2026 adds stochasticity. 
+
+R: Relationships: optimisation model, objective functions, restoration response assumptions
+
+From (https://doi.org/10.1029/2021EF002322):
+"The authors of (Marchau et al., 2019) characterize different levels of uncertainty, and describe the condition of deep uncertainty. Problems are deeply uncertain when impacts analysts cannot agree on the conceptual models that could be used to represent probable futures, the probability distributions representing uncertainty of parameters in the future, and/or how to value the different outcomes.""
+
+:::

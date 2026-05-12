@@ -70,3 +70,5 @@ eligible_pixels_fg.tif
 *global_all.tif
 *upper_q75_all.tif
 logs/profile_combined_baseline_speedcheck.txt
+
+*.qmd
