@@ -72,3 +72,6 @@ eligible_pixels_fg.tif
 logs/profile_combined_baseline_speedcheck.txt
 
 *.qmd
+~$WP3_framework.pptx
+logs/profile_combined_grid_speedcheck_fullbern.txt
+WP3_framework.pptx
