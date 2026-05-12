@@ -179,7 +179,7 @@ make_corr_plot <- function(run, obj_names, obj_labels, title = NULL, maximize = 
     geom_text(data = tiles, aes(x = x_label, y = y_label, label = r_text,
                                 colour = abs(r) > 0.5),
               size = 8, fontface = "bold") +
-    facet_wrap(~panel, ncol = 1) +
+    facet_wrap(~panel, ncol = 2) +
     scale_fill_distiller(palette = "RdBu", direction = -1, limits = c(-1, 1),
                          name = "Pearson r") +
     scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "black"), guide = "none") +
@@ -728,7 +728,7 @@ make_action_stacked_bar <- function(run, obj_names, obj_labels,
     labs(
       title    = sprintf("Action mix per non-dominated solution — %s", run$label),
       subtitle = sprintf("Solutions ordered by %s (ascending)", order_label),
-      x = sprintf("Solution rank (by %s, best → worst)", order_label),
+      x = sprintf("Solution rank (by %s, best to worst)", order_label),
       y = "Number of pixels"
     ) +
     theme(legend.position = "top")
@@ -1062,22 +1062,26 @@ load_run_rfop <- function(dir_path, label, dim_type, group_label) {
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
 
-# Classify each eligible pixel into one of five priority classes based on
-# its mean RFOP across all runs and the sensitivity profile across dimensions.
+# Classify each eligible pixel into one of four priority classes based on
+# condition-scenario mean RFOP and sensitivity to indicator / policy assumptions.
+# Seed variation (algorithm stochasticity) is excluded from the classification —
+# it represents estimation noise, not true ecological uncertainty. It is retained
+# as a diagnostic column (sens_seed) and used separately in compute_seed_snr().
 #
 # runs_df       : bind_rows() of load_run_rfop() outputs; columns
 #                 x, y, rfop_pct, run_label, dim_type, group_label
 # elig_df       : eligible_pixels.csv data frame (x, y) — used to ensure every
 #                 eligible pixel receives a class (pixels absent from all runs
 #                 are treated as rfop_pct = 0 and classified as "Low priority")
-# thresh_low    : pixels with mean_rfop < thresh_low across all runs → "Low priority"
-# thresh_high   : pixels with mean_rfop >= thresh_high AND low sensitivity → "Robust priority"
-# thresh_stable : normalised sensitivity threshold below which a dimension is
-#                 considered negligible; nsens = range(group means) / (mean_rfop + 1)
+# thresh_low    : pixels with mean_rfop_cond < thresh_low  -> "Low priority"
+# thresh_high   : pixels with mean_rfop_cond >= thresh_high AND low sensitivity -> "Robust priority"
+# thresh_stable : normalised sensitivity threshold; nsens = range(group means) / (mean_rfop + 1)
 #
 # Returns a data frame with one row per eligible pixel:
-#   x, y, mean_rfop_all, sens_indicator, sens_policy, sens_seed, sens_param,
-#   dominant_dim, classification (ordered factor)
+#   x, y, mean_rfop_cond, sens_indicator, sens_policy, sens_seed,
+#   nsens_ind, nsens_pol, dominant_cond_dim, classification (ordered factor)
+# DEPRECATED — replaced by compute_rfop_sensitivity() below.
+# Kept to avoid breaking any calls outside the main QMD section.
 compute_spatial_classification <- function(
     runs_df,
     elig_df       = NULL,
@@ -1087,92 +1091,74 @@ compute_spatial_classification <- function(
 ) {
   stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
 
-  # ── Step 1: mean RFOP per pixel per (dim_type × group_label) ─────────────
-  # For each sensitivity dimension, compute the mean rfop_pct across all runs
-  # that belong to the same group, then take the range across groups.
-  # This separates within-group noise from between-group signal.
-  per_dim_sens <- runs_df |>
-    dplyr::group_by(x, y, dim_type, group_label) |>
-    dplyr::summarise(group_mean_rfop = mean(rfop_pct, na.rm = TRUE), .groups = "drop") |>
-    dplyr::group_by(x, y, dim_type) |>
-    dplyr::summarise(
-      sens_raw = max(group_mean_rfop, na.rm = TRUE) -
-                 min(group_mean_rfop, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
+  cond_runs <- dplyr::filter(runs_df, dim_type %in% c("indicator", "benchmark", "policy"))
+
+  per_dim_sens <- cond_runs %>%
+    dplyr::group_by(x, y, dim_type, group_label) %>%
+    dplyr::summarise(group_mean_rfop = mean(rfop_pct, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::group_by(x, y, dim_type) %>%
+    dplyr::summarise(sens_raw = sd(group_mean_rfop), .groups = "drop") %>%
     tidyr::pivot_wider(names_from = dim_type, values_from = sens_raw,
                        names_prefix = "sens_", values_fill = 0)
 
-  # Ensure all four dimension columns exist (fill 0 when a dimension has no runs)
-  for (dim in c("sens_indicator", "sens_policy", "sens_seed", "sens_param")) {
-    if (!dim %in% names(per_dim_sens))
-      per_dim_sens[[dim]] <- 0
+  for (dim in c("sens_indicator", "sens_benchmark", "sens_policy")) {
+    if (!dim %in% names(per_dim_sens)) per_dim_sens[[dim]] <- 0
   }
 
-  # ── Step 2: mean RFOP across ALL runs ─────────────────────────────────────
-  mean_rfop <- runs_df |>
-    dplyr::group_by(x, y) |>
-    dplyr::summarise(mean_rfop_all = mean(rfop_pct, na.rm = TRUE), .groups = "drop")
+  seed_runs <- dplyr::filter(runs_df, dim_type == "seed")
+  if (nrow(seed_runs) > 0) {
+    seed_sens <- seed_runs %>%
+      dplyr::group_by(x, y, group_label) %>%
+      dplyr::summarise(group_mean_rfop = mean(rfop_pct, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::group_by(x, y) %>%
+      dplyr::summarise(sens_seed = max(group_mean_rfop) - min(group_mean_rfop), .groups = "drop")
+  } else {
+    seed_sens <- dplyr::distinct(runs_df, x, y) %>%
+      dplyr::mutate(sens_seed = NA_real_)
+  }
 
-  # ── Step 3: join and add eligible pixels that never appeared (rfop = 0) ──
-  class_df <- mean_rfop |>
-    dplyr::left_join(per_dim_sens, by = c("x", "y"))
+  mean_rfop <- cond_runs %>%
+    dplyr::group_by(x, y) %>%
+    dplyr::summarise(mean_rfop_cond = mean(rfop_pct, na.rm = TRUE), .groups = "drop")
+
+  class_df <- mean_rfop %>%
+    dplyr::left_join(per_dim_sens, by = c("x", "y")) %>%
+    dplyr::left_join(seed_sens,    by = c("x", "y"))
 
   if (!is.null(elig_df) && nrow(elig_df) > 0) {
-    never_selected <- dplyr::anti_join(elig_df[, c("x", "y")], class_df, by = c("x", "y")) |>
-      dplyr::mutate(
-        mean_rfop_all  = 0,
-        sens_indicator = 0,
-        sens_policy    = 0,
-        sens_seed      = 0,
-        sens_param     = 0
-      )
+    never_selected <- dplyr::anti_join(elig_df[, c("x", "y")], class_df, by = c("x", "y")) %>%
+      dplyr::mutate(mean_rfop_cond = 0, sens_indicator = 0,
+                    sens_benchmark = 0, sens_policy = 0, sens_seed = NA_real_)
     class_df <- dplyr::bind_rows(class_df, never_selected)
   }
 
-  class_df[is.na(class_df)] <- 0
-
-  # ── Step 4: normalised sensitivity (avoids /0 for low-rfop pixels) ────────
-  class_df <- class_df |>
+  class_df <- class_df %>%
+    dplyr::mutate(dplyr::across(c(mean_rfop_cond, sens_indicator, sens_benchmark, sens_policy),
+                                \(v) dplyr::coalesce(v, 0))) %>%
     dplyr::mutate(
-      denom        = mean_rfop_all + 1,
-      nsens_ind    = sens_indicator / denom,
-      nsens_pol    = sens_policy    / denom,
-      nsens_seed   = sens_seed      / denom,
-      nsens_param  = sens_param     / denom
-    )
-
-  # ── Step 5: classify ──────────────────────────────────────────────────────
-  # Priority: Low → Robust → sensitivity dimensions (indicator > policy > seed > param)
-  class_df <- class_df |>
-    dplyr::mutate(
+      denom       = mean_rfop_cond + 1,
+      nsens_ind   = sens_indicator / denom,
+      nsens_bench = sens_benchmark / denom,
+      nsens_pol   = sens_policy    / denom,
+      dominant_cond_dim = dplyr::case_when(
+        nsens_ind   >= pmax(nsens_bench, nsens_pol) & nsens_ind   >= thresh_stable ~ "indicator",
+        nsens_bench >= nsens_pol                    & nsens_bench >= thresh_stable ~ "benchmark",
+        nsens_pol   >= thresh_stable                                               ~ "policy",
+        TRUE                                                                       ~ NA_character_
+      ),
       classification = dplyr::case_when(
-        mean_rfop_all < thresh_low
-          ~ "Low priority",
-        mean_rfop_all >= thresh_high &
-          nsens_ind   < thresh_stable &
-          nsens_pol   < thresh_stable &
-          nsens_seed  < thresh_stable &
-          nsens_param < thresh_stable
-          ~ "Robust priority",
-        nsens_ind >= pmax(nsens_pol, nsens_seed, nsens_param) &
-          nsens_ind >= thresh_stable
-          ~ "Condition sensitive",
-        nsens_pol >= pmax(nsens_ind, nsens_seed, nsens_param) &
-          nsens_pol >= thresh_stable
-          ~ "Policy sensitive",
-        nsens_seed >= pmax(nsens_ind, nsens_pol, nsens_param) &
-          nsens_seed >= thresh_stable
-          ~ "Unstable / noisy",
-        nsens_param >= thresh_stable
-          ~ "Condition sensitive",  # fold param sensitivity into condition
-        TRUE
-          ~ "Robust priority"       # medium freq, no dominant sensitivity
+        mean_rfop_cond < thresh_low                                               ~ "Low priority",
+        mean_rfop_cond >= thresh_high & nsens_ind < thresh_stable &
+          nsens_bench < thresh_stable & nsens_pol < thresh_stable                 ~ "Robust priority",
+        nsens_ind >= pmax(nsens_bench, nsens_pol) & nsens_ind >= thresh_stable    ~ "Indicator sensitive",
+        nsens_bench >= nsens_pol & nsens_bench >= thresh_stable                   ~ "Benchmark sensitive",
+        nsens_pol >= thresh_stable                                                ~ "Policy sensitive",
+        TRUE                                                                      ~ "Robust priority"
       ),
       classification = factor(
         classification,
-        levels = c("Robust priority", "Condition sensitive", "Policy sensitive",
-                   "Unstable / noisy", "Low priority"),
+        levels = c("Robust priority", "Indicator sensitive", "Benchmark sensitive",
+                   "Policy sensitive", "Low priority"),
         ordered = TRUE
       )
     )
@@ -1181,19 +1167,898 @@ compute_spatial_classification <- function(
 }
 
 
-# Palette for the five priority classes (consistent across map + bar).
-# Chosen for maximum hue + lightness separation at small pixel sizes:
-#   Robust      — deep teal       (high priority, clearly distinct from orange/red)
-#   Condition   — vivid amber     (warm, distinct from teal and purple)
-#   Policy      — strong violet   (cool, separates from amber and teal)
-#   Unstable    — bright magenta  (very distinct from all others; flags caution)
-#   Low         — off-white/cream (recedes clearly; avoids confusion with map background)
+# ── Unified RFOP sensitivity and robustness classification ───────────────────
+#
+# Distinguishes five pixel types:
+#   1. Robust high-priority areas
+#   2. Areas sensitive to condition (indicator) assumptions
+#   3. Areas sensitive to policy levers
+#   4. Areas sensitive to benchmarking method
+#   5. Areas uncertain because of NSGA-III stochastic noise
+#
+# Per-pixel statistics computed:
+#   mean_RFOP        — equal-weighted average of the three per-dimension means
+#                      (condition-mean, policy-mean, benchmark-mean)
+#   SD_condition     — SD of scenario-mean RFOP across condition (indicator) scenarios
+#   SD_policy        — SD of scenario-mean RFOP across policy scenarios
+#   SD_benchmark     — SD of scenario-mean RFOP across benchmark scenarios
+#   mean_seed_SD     — mean within-scenario seed SD, pooled from indicator + benchmark
+#                      multi-seed runs (policy excluded when only 1 seed per policy scenario)
+#   SNR_condition    — SD_condition / (mean_seed_SD + snr_denominator_constant)
+#   SNR_policy       — SD_policy    / (mean_seed_SD + snr_denominator_constant);
+#                      always computed; noise floor from indicator seed runs
+#   SNR_benchmark    — SD_benchmark / (mean_seed_SD + snr_denominator_constant)
+#
+# Flags:
+#   high_priority         — mean_RFOP >= rfop_cutoff  (percentile-based threshold)
+#   seed_stable           — mean_seed_SD <= seed_sd_threshold
+#   condition_detectable  — SNR_condition > snr_threshold
+#   policy_detectable     — SNR_policy > snr_threshold  (FALSE when SNR_policy is NA)
+#   benchmark_detectable  — SNR_benchmark > snr_threshold
+#
+# dominant_sensitivity: the epistemic dimension with the largest detectable SNR.
+#   "mixed sensitive"            — >1 detectable SNR and top two within mixed_tolerance
+#   "condition sensitive"        — SNR_condition is the uniquely largest detectable SNR
+#   "policy sensitive"           — SNR_policy is the uniquely largest detectable SNR
+#   "benchmark sensitive"        — SNR_benchmark is the uniquely largest detectable SNR
+#   "low substantive sensitivity"— no SNR is detectable
+#
+# Outputs:
+#   priority_status + dominant_sensitivity + seed_status  → classification  (3-part string)
+#   map_class                                             → simplified class for figures
+#
+# Arguments:
+#   runs_df                 : bind_rows() of load_run_rfop() outputs
+#   elig_df                 : eligible_pixels data frame (x, y) for zero-filling absent pixels
+#   high_priority_threshold : percentile (0–100) of mean_RFOP among selected pixels
+#                             used as the "high priority" cutoff; default 80 = top 20%
+#   snr_threshold           : SNR threshold above which a dimension is "detectable" (default 1)
+#   seed_sd_threshold       : mean_seed_SD threshold; above this → "seed uncertain" (default 5)
+#   mixed_tolerance         : fractional tolerance for calling "mixed sensitive" (default 0.2)
+#   snr_denominator_constant: added to mean_seed_SD before dividing (default 1)
+compute_rfop_sensitivity <- function(
+    runs_df,
+    elig_df                  = NULL,
+    high_priority_threshold  = 80,
+    snr_threshold            = 1,
+    seed_sd_threshold        = 5,
+    mixed_tolerance          = 0.2,
+    snr_denominator_constant = 1
+) {
+  stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+
+  # ── Step 1: per-dimension SD of scenario-means ──────────────────────────────
+  # For each dimension, average across seeds within each scenario (group_label),
+  # then take the SD of those scenario-means across scenarios.
+  epistemic_dims <- c("indicator", "policy", "benchmark")
+
+  scenario_means <- runs_df |>
+    dplyr::filter(dim_type %in% epistemic_dims) |>
+    dplyr::group_by(x, y, dim_type, group_label) |>
+    dplyr::summarise(scenario_mean = mean(rfop_pct, na.rm = TRUE), .groups = "drop")
+
+  dim_sd <- scenario_means |>
+    dplyr::group_by(x, y, dim_type) |>
+    dplyr::summarise(
+      dim_mean = mean(scenario_mean, na.rm = TRUE),
+      dim_sd   = sd(scenario_mean,   na.rm = TRUE),
+      n_groups = dplyr::n(),
+      .groups  = "drop"
+    ) |>
+    tidyr::pivot_wider(
+      id_cols     = c(x, y),
+      names_from  = dim_type,
+      values_from = c(dim_mean, dim_sd, n_groups)
+    )
+
+  # Ensure all expected columns exist even when a dimension has no runs
+  for (dim in epistemic_dims) {
+    for (pfx in c("dim_mean_", "dim_sd_", "n_groups_")) {
+      col <- paste0(pfx, dim)
+      if (!col %in% names(dim_sd)) dim_sd[[col]] <- NA_real_
+    }
+  }
+
+  # ── Step 2: mean_RFOP — equal-weighted average of three dimension-means ─────
+  dim_sd <- dim_sd |>
+    dplyr::mutate(
+      mean_RFOP = rowMeans(
+        cbind(dim_mean_indicator, dim_mean_policy, dim_mean_benchmark),
+        na.rm = TRUE
+      )
+    )
+
+  # Rename SD columns for readability
+  dim_sd <- dim_sd |>
+    dplyr::rename(
+      SD_condition = dim_sd_indicator,
+      SD_policy    = dim_sd_policy,
+      SD_benchmark = dim_sd_benchmark
+    )
+
+  # ── Step 3: mean_seed_SD — pooled within-scenario seed noise ─────────────
+  # Computed from indicator + benchmark multi-seed runs only.
+  # Policy runs are excluded here: they typically have only 1 seed per scenario,
+  # making within-scenario SD undefined.
+  seed_noise_dims <- c("indicator", "benchmark")
+
+  within_sd <- runs_df |>
+    dplyr::filter(dim_type %in% seed_noise_dims) |>
+    dplyr::group_by(x, y, dim_type, group_label) |>
+    dplyr::summarise(
+      within_sd = sd(rfop_pct, na.rm = TRUE),
+      n_seeds   = dplyr::n(),
+      .groups   = "drop"
+    ) |>
+    dplyr::filter(n_seeds > 1)    # exclude single-seed scenarios (SD would be NA)
+
+  if (nrow(within_sd) > 0) {
+    mean_seed_sd_df <- within_sd |>
+      dplyr::group_by(x, y) |>
+      dplyr::summarise(mean_seed_SD = mean(within_sd, na.rm = TRUE), .groups = "drop")
+  } else {
+    mean_seed_sd_df <- dplyr::distinct(runs_df, x, y) |>
+      dplyr::mutate(mean_seed_SD = NA_real_)
+  }
+
+  # ── Step 4: detect whether policy has any seed replication ──────────────────
+  policy_has_seeds <- runs_df |>
+    dplyr::filter(dim_type == "policy") |>
+    dplyr::group_by(group_label) |>
+    dplyr::summarise(n_seeds = dplyr::n_distinct(run_label), .groups = "drop") |>
+    dplyr::summarise(any_multi = any(n_seeds > 1)) |>
+    dplyr::pull(any_multi)
+  if (length(policy_has_seeds) == 0) policy_has_seeds <- FALSE
+
+  # ── Step 5: join everything and compute SNRs ─────────────────────────────
+  sens_df <- dim_sd |>
+    dplyr::left_join(mean_seed_sd_df, by = c("x", "y")) |>
+    dplyr::mutate(
+      dplyr::across(c(mean_RFOP, SD_condition, SD_policy, SD_benchmark),
+                    \(v) dplyr::coalesce(v, 0)),
+      mean_seed_SD = dplyr::coalesce(mean_seed_SD, 0),
+      snr_denom    = mean_seed_SD + snr_denominator_constant,
+      SNR_condition = SD_condition / snr_denom,
+      SNR_benchmark = SD_benchmark / snr_denom,
+      # SNR_policy is NA (suppressed) when policy runs lack seed replication.
+      # Use base-R if/else (not dplyr::if_else) so a scalar condition can return
+      # either a full-length vector or a recycled NA without a length mismatch.
+      SNR_policy    = if (policy_has_seeds) SD_policy / snr_denom else NA_real_
+    ) |>
+    dplyr::select(-snr_denom)
+
+  # ── Step 5b: percentile-based high-priority cutoff ──────────────────────────
+  rfop_cutoff <- as.numeric(quantile(
+    sens_df$mean_RFOP[sens_df$mean_RFOP > 0],
+    high_priority_threshold / 100,
+    na.rm = TRUE
+  ))
+
+  # ── Step 6: boolean flags ───────────────────────────────────────────────────
+  sens_df <- sens_df |>
+    dplyr::mutate(
+      high_priority        = mean_RFOP     >= rfop_cutoff,
+      seed_stable          = mean_seed_SD  <= seed_sd_threshold,
+      condition_detectable = !is.na(SNR_condition) & SNR_condition > snr_threshold,
+      policy_detectable    = !is.na(SNR_policy)    & SNR_policy    > snr_threshold,
+      benchmark_detectable = !is.na(SNR_benchmark) & SNR_benchmark > snr_threshold
+    )
+
+  # ── Step 7: dominant_sensitivity ─────────────────────────────────────────
+  sens_df <- sens_df |>
+    dplyr::mutate(
+      dominant_sensitivity = purrr::pmap_chr(
+        list(
+          snr_c = SNR_condition,
+          snr_p = SNR_policy,
+          snr_b = SNR_benchmark,
+          det_c = condition_detectable,
+          det_p = policy_detectable,
+          det_b = benchmark_detectable
+        ),
+        function(snr_c, snr_p, snr_b, det_c, det_p, det_b) {
+          # Collect detectable SNR values (suppress NAs)
+          vals <- c(
+            if (det_c) c(condition = snr_c) else NULL,
+            if (det_p) c(policy    = snr_p) else NULL,
+            if (det_b) c(benchmark = snr_b) else NULL
+          )
+          if (length(vals) == 0) return("low substantive sensitivity")
+          if (length(vals) == 1) return(paste(names(vals), "sensitive"))
+          # More than one detectable: check if top two are within mixed_tolerance
+          sorted  <- sort(vals, decreasing = TRUE)
+          top_two_close <- (sorted[1] - sorted[2]) / sorted[1] <= mixed_tolerance
+          if (top_two_close) return("mixed sensitive")
+          return(paste(names(sorted)[1], "sensitive"))
+        }
+      )
+    )
+
+  # ── Step 8: priority_status, seed_status, detailed classification ──────────
+  sens_df <- sens_df |>
+    dplyr::mutate(
+      priority_status = dplyr::if_else(high_priority, "high priority", "low priority"),
+      seed_status     = dplyr::if_else(seed_stable,   "seed stable",   "seed uncertain"),
+      classification  = paste(priority_status, dominant_sensitivity, seed_status, sep = ", ")
+    )
+
+  # ── Step 9: map_class variants ───────────────────────────────────────────────
+  # map_class          : combined (condition + policy + benchmark + seed)
+  # map_class_cond_bench: condition/benchmark only — ignores policy dimension
+  # map_class_policy   : policy only — no mixed category
+  sens_df <- sens_df |>
+    dplyr::mutate(
+      # ── 9a: full combined map_class ──────────────────────────────────────────
+      map_class = dplyr::case_when(
+        !high_priority                                ~ "low priority",
+        !seed_stable                                  ~ "seed uncertain",
+        dominant_sensitivity == "condition sensitive" ~ "condition sensitive",
+        dominant_sensitivity == "policy sensitive"    ~ "policy sensitive",
+        dominant_sensitivity == "benchmark sensitive" ~ "benchmark sensitive",
+        dominant_sensitivity == "mixed sensitive"     ~ "mixed sensitive",
+        dominant_sensitivity == "low substantive sensitivity" ~ "core robust priority",
+        TRUE                                          ~ "unclassified"
+      ),
+      map_class = factor(
+        map_class,
+        levels = c("core robust priority", "condition sensitive", "policy sensitive",
+                   "benchmark sensitive", "mixed sensitive", "seed uncertain", "low priority")
+      ),
+
+      # ── 9b: condition/benchmark map_class ────────────────────────────────────
+      # Re-derive dominant signal from only condition and benchmark SNRs.
+      .dom_cb = purrr::pmap_chr(
+        list(snr_c = SNR_condition, snr_b = SNR_benchmark,
+             det_c = condition_detectable, det_b = benchmark_detectable),
+        function(snr_c, snr_b, det_c, det_b) {
+          vals <- c(
+            if (isTRUE(det_c)) c(condition = snr_c) else NULL,
+            if (isTRUE(det_b)) c(benchmark = snr_b) else NULL
+          )
+          if (length(vals) == 0) return("low substantive sensitivity")
+          if (length(vals) == 1) return(paste(names(vals), "sensitive"))
+          sorted <- sort(vals, decreasing = TRUE)
+          if ((sorted[1] - sorted[2]) / sorted[1] <= mixed_tolerance)
+            return("mixed sensitive")
+          return(paste(names(sorted)[1], "sensitive"))
+        }
+      ),
+      map_class_cond_bench = dplyr::case_when(
+        !high_priority              ~ "low priority",
+        !seed_stable                ~ "seed uncertain",
+        .dom_cb == "condition sensitive" ~ "condition sensitive",
+        .dom_cb == "benchmark sensitive" ~ "benchmark sensitive",
+        .dom_cb == "mixed sensitive"     ~ "mixed sensitive",
+        TRUE                             ~ "core robust priority"
+      ),
+      map_class_cond_bench = factor(
+        map_class_cond_bench,
+        levels = c("core robust priority", "condition sensitive",
+                   "benchmark sensitive", "mixed sensitive",
+                   "seed uncertain", "low priority")
+      ),
+
+      # ── 9c: policy map_class (no mixed category) ─────────────────────────────
+      map_class_policy = dplyr::case_when(
+        !high_priority    ~ "low priority",
+        !seed_stable      ~ "seed uncertain",
+        policy_detectable ~ "policy sensitive",
+        TRUE              ~ "policy robust"
+      ),
+      map_class_policy = factor(
+        map_class_policy,
+        levels = c("policy robust", "policy sensitive", "seed uncertain", "low priority")
+      )
+    ) |>
+    dplyr::select(-.dom_cb)
+
+  # ── Step 10: fill eligible pixels never selected in any run ──────────────
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    never_selected <- dplyr::anti_join(elig_df[, c("x", "y")], sens_df, by = c("x", "y")) |>
+      dplyr::mutate(
+        mean_RFOP            = 0,
+        SD_condition         = 0,  SD_policy    = 0,  SD_benchmark  = 0,
+        mean_seed_SD         = 0,
+        SNR_condition        = 0,  SNR_policy   = NA_real_, SNR_benchmark = 0,
+        high_priority        = FALSE, seed_stable = TRUE,
+        condition_detectable = FALSE, policy_detectable = FALSE,
+        benchmark_detectable = FALSE,
+        dominant_sensitivity = "low substantive sensitivity",
+        priority_status      = "low priority",
+        seed_status          = "seed stable",
+        classification       = "low priority, low substantive sensitivity, seed stable",
+        map_class            = factor("low priority",
+                                      levels = levels(sens_df$map_class)),
+        map_class_cond_bench = factor("low priority",
+                                      levels = levels(sens_df$map_class_cond_bench)),
+        map_class_policy     = factor("low priority",
+                                      levels = levels(sens_df$map_class_policy))
+      )
+    # Drop auxiliary pivot columns from never_selected that may not match sens_df
+    extra_cols <- setdiff(names(sens_df), names(never_selected))
+    for (col in extra_cols) never_selected[[col]] <- NA_real_
+    sens_df <- dplyr::bind_rows(sens_df, never_selected)
+  }
+
+  attr(sens_df, "rfop_cutoff") <- rfop_cutoff
+  sens_df
+}
+
+
+# Compute a per-pixel signal-to-noise ratio to assess where the condition
+# sensitivity signal is detectable above algorithm stochasticity.
+#
+# ── Visualisation functions for compute_rfop_sensitivity() output ─────────────
+
+# Colour palette for map_class (7 classes)
+.sensitivity_map_palette <- c(
+  "core robust priority" = "#0c7b85",
+  "condition sensitive"  = "#bd8c12",
+  "policy sensitive"     = "#910b9b",
+  "benchmark sensitive"  = "#da3114",
+  "mixed sensitive"      = "#e07e30",
+  "seed uncertain"       = "#7f7f7f",
+  "low priority"         = "#bec2bf"
+)
+
+# Colour palette for dominant_sensitivity (used in scatter and bar charts)
+.dominance_palette <- c(
+  "condition sensitive"         = "#bd8c12",
+  "policy sensitive"            = "#910b9b",
+  "benchmark sensitive"         = "#da3114",
+  "mixed sensitive"             = "#e07e30",
+  "low substantive sensitivity" = "#0c7b85"
+)
+
+
+# Colour palette for map_class_cond_bench (6 classes; no policy)
+.cond_bench_palette <- c(
+  "core robust priority" = "#0c7b85",
+  "condition sensitive"  = "#bd8c12",
+  "benchmark sensitive"  = "#da3114",
+  "mixed sensitive"      = "#e07e30",
+  "seed uncertain"       = "#7f7f7f",
+  "low priority"         = "#bec2bf"
+)
+
+# Colour palette for map_class_policy (4 classes)
+.policy_palette <- c(
+  "policy robust"    = "#0c7b85",
+  "policy sensitive" = "#910b9b",
+  "seed uncertain"   = "#7f7f7f",
+  "low priority"     = "#bec2bf"
+)
+
+
+# 1a. Single spatial map from a named map_class column and a named palette.
+.make_one_sensitivity_map <- function(sens_df, elig_df, col, palette, title) {
+  p <- ggplot() +
+    theme_void() +
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.title       = element_text(size = 11, face = "bold", hjust = 0.5),
+      legend.position  = "right",
+      legend.title     = element_text(size = 8),
+      legend.text      = element_text(size = 7)
+    ) +
+    labs(title = title)
+
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    bg <- dplyr::anti_join(elig_df[, c("x", "y")], sens_df, by = c("x", "y"))
+    if (nrow(bg) > 0)
+      p <- p + geom_raster(data = bg, aes(x = x, y = y), fill = "#EEEEEE")
+  }
+
+  plot_df <- sens_df
+  plot_df[["__fill__"]] <- plot_df[[col]]
+
+  p <- p +
+    geom_raster(data = plot_df, aes(x = x, y = y, fill = .data[[col]])) +
+    scale_fill_manual(
+      values = palette,
+      name   = NULL,
+      drop   = FALSE,
+      guide  = guide_legend(
+        keywidth  = unit(0.7, "cm"),
+        keyheight = unit(0.4, "cm"),
+        label.hjust = 0
+      )
+    )
+
+  if (exists("BE"))
+    p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                     linewidth = 0.4, inherit.aes = FALSE)
+  p
+}
+
+
+# 1b. Dual map: condition/benchmark (left) + policy (right) side by side.
+# Uses patchwork to combine.
+make_dual_sensitivity_map <- function(
+    sens_df,
+    elig_df    = NULL,
+    ecosystem  = NULL,
+    title_cb   = "Condition & benchmark sensitivity",
+    title_pol  = "Policy sensitivity"
+) {
+  p_cb <- .make_one_sensitivity_map(
+    sens_df, elig_df,
+    col     = "map_class_cond_bench",
+    palette = .cond_bench_palette,
+    title   = title_cb
+  )
+  p_pol <- .make_one_sensitivity_map(
+    sens_df, elig_df,
+    col     = "map_class_policy",
+    palette = .policy_palette,
+    title   = title_pol
+  )
+  p_cb + p_pol +
+    patchwork::plot_layout(ncol = 2) +
+    patchwork::plot_annotation(
+      title = "RFOP sensitivity and robustness",
+      theme = theme(plot.title = element_text(size = 13, face = "bold", hjust = 0.5))
+    )
+}
+
+
+# 1. Main classification map using map_class (all dimensions combined).
+make_sensitivity_classification_map <- function(
+    sens_df,
+    elig_df = NULL,
+    title   = "RFOP sensitivity and robustness classification"
+) {
+  p <- ggplot() +
+    theme_void() +
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.title       = element_text(size = 12, face = "bold", hjust = 0.5),
+      plot.subtitle    = element_text(size = 9, hjust = 0.5, colour = "grey40"),
+      legend.position  = "right",
+      legend.title     = element_text(size = 9),
+      legend.text      = element_text(size = 8)
+    ) +
+    labs(title = title)
+
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    unclassified_bg <- dplyr::anti_join(elig_df[, c("x", "y")], sens_df, by = c("x", "y"))
+    if (nrow(unclassified_bg) > 0)
+      p <- p + geom_raster(data = unclassified_bg, aes(x = x, y = y), fill = "#EEEEEE")
+  }
+
+  p <- p +
+    geom_raster(data = sens_df, aes(x = x, y = y, fill = map_class)) +
+    scale_fill_manual(
+      values = .sensitivity_map_palette,
+      name   = NULL,
+      drop   = FALSE,
+      guide  = guide_legend(
+        override.aes = list(size = 4),
+        keywidth     = unit(0.8, "cm"),
+        keyheight    = unit(0.4, "cm"),
+        label.hjust  = 0
+      )
+    )
+
+  if (exists("BE"))
+    p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                     linewidth = 0.4, inherit.aes = FALSE)
+  p
+}
+
+
+# 2. Four-panel diagnostic map: SNR_condition, SNR_policy, SNR_benchmark, mean_seed_SD.
+# All panels use the same spatial layout; SNR panels share a diverging scale
+# centred on snr_threshold; mean_seed_SD uses a sequential scale.
+#
+# sens_df      : output of compute_rfop_sensitivity()
+# elig_df      : eligible pixels for grey underlay
+# snr_threshold: threshold value for the SNR panel midpoint (default 1)
+# snr_cap      : upper cap for display of SNR values (default 4)
+make_snr_diagnostic_panels <- function(
+    sens_df,
+    elig_df           = NULL,
+    snr_threshold     = 1,
+    seed_sd_threshold = 5
+) {
+  snr_cols <- c(
+    "SNR_condition" = "Condition SNR",
+    "SNR_policy"    = "Policy SNR",
+    "SNR_benchmark" = "Benchmark SNR"
+  )
+
+  # Three-class SNR palette: below threshold = red, at/near threshold = yellow, above = green
+  .snr_class <- function(snr_vec, threshold) {
+    dplyr::case_when(
+      is.na(snr_vec)          ~ NA_character_,
+      snr_vec > threshold     ~ "above threshold",
+      snr_vec < threshold     ~ "below threshold",
+      TRUE                    ~ "at threshold"
+    ) |> factor(levels = c("below threshold", "at threshold", "above threshold"))
+  }
+
+  snr_colours <- c(
+    "below threshold" = "#d73027",
+    "at threshold"    = "#ffffbf",
+    "above threshold" = "#1a9850"
+  )
+
+  .snr_panel <- function(col, label) {
+    plot_df <- sens_df |>
+      dplyr::filter(!is.na(.data[[col]])) |>
+      dplyr::mutate(snr_class = .snr_class(.data[[col]], snr_threshold))
+
+    p <- ggplot()
+    if (!is.null(elig_df) && nrow(elig_df) > 0)
+      p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#e6e6e6")
+
+    if (nrow(plot_df) > 0) {
+      p <- p +
+        geom_raster(data = plot_df, aes(x = x, y = y, fill = snr_class)) +
+        scale_fill_manual(
+          values   = snr_colours,
+          name     = "SNR",
+          drop     = FALSE,
+          na.value = "#e6e6e6",
+          labels   = c(
+            "below threshold" = paste0("< ", snr_threshold, " (noise dominates)"),
+            "at threshold"    = paste0("= ", snr_threshold),
+            "above threshold" = paste0("> ", snr_threshold, " (signal detectable)")
+          )
+        )
+    } else {
+      p <- p + annotate("text", x = Inf, y = Inf, label = "no data",
+                        hjust = 1, vjust = 1, colour = "grey50", size = 3)
+    }
+
+    if (exists("BE"))
+      p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                       linewidth = 0.3, inherit.aes = FALSE)
+
+    p + theme_void() +
+      theme(
+        plot.title        = element_text(size = 10, face = "bold", hjust = 0.5),
+        panel.background  = element_rect(fill = "white", colour = NA),
+        legend.position   = "right",
+        legend.key.height = unit(0.5, "cm")
+      ) +
+      labs(title = label,
+           subtitle = paste0("Threshold = ", snr_threshold, " (signal > noise)"))
+  }
+
+  .seed_sd_panel <- function() {
+    plot_df <- sens_df |>
+      dplyr::filter(!is.na(mean_seed_SD))
+
+    p <- ggplot()
+    if (!is.null(elig_df) && nrow(elig_df) > 0)
+      p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#e6e6e6")
+
+    if (nrow(plot_df) > 0) {
+      p <- p +
+        geom_raster(data = plot_df, aes(x = x, y = y, fill = mean_seed_SD)) +
+        scale_fill_viridis_c(
+          option    = "plasma",
+          direction = -1,
+          name      = "Seed SD\n(pp)",
+          limits    = c(0, NA)
+        )
+    }
+
+    if (exists("BE"))
+      p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                       linewidth = 0.3, inherit.aes = FALSE)
+
+    p <- p +  theme_void() +
+      theme(
+        plot.title        = element_text(size = 10, face = "bold", hjust = 0.5),
+        panel.background  = element_rect(fill = "white", colour = NA),
+        legend.position   = "right",
+        legend.key.height = unit(0.5, "cm")
+      ) +
+      labs(title = "Mean seed SD")
+  }
+
+  panels <- c(
+    lapply(names(snr_cols), function(col) .snr_panel(col, snr_cols[[col]])),
+    list(.seed_sd_panel())
+  )
+
+  patchwork::wrap_plots(panels, ncol = 2)
+}
+
+
+# 2b. Histogram of per-pixel mean RFOP, faceted by run type (condition / policy / benchmark).
+# For each dim_type, the mean RFOP is computed by first averaging seeds within each
+# scenario (group_label) and then averaging across scenarios for each pixel.
+# An optional vertical dashed line shows rfop_cutoff (pass the value from
+# attr(sens_df, "rfop_cutoff") or NULL to omit).
+#
+# runs_df    : bind_rows() of load_run_rfop() outputs
+# rfop_cutoff: actual RFOP value (%) to show as dashed threshold line, or NULL
+# binwidth   : histogram bin width in RFOP percentage points
+make_rfop_histogram <- function(
+    runs_df,
+    rfop_cutoff = NULL,
+    binwidth    = 5
+) {
+  dim_labels <- c(
+    indicator = "Condition (indicator)",
+    policy    = "Policy",
+    benchmark = "Benchmark"
+  )
+
+  plot_df <- runs_df |>
+    dplyr::filter(dim_type %in% names(dim_labels)) |>
+    # Step 1: average seeds within each scenario
+    dplyr::group_by(x, y, dim_type, group_label) |>
+    dplyr::summarise(scenario_mean = mean(rfop_pct, na.rm = TRUE), .groups = "drop") |>
+    # Step 2: average scenarios within each dim_type
+    dplyr::group_by(x, y, dim_type) |>
+    dplyr::summarise(mean_rfop_dim = mean(scenario_mean, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(
+      dim_label = factor(dim_labels[dim_type], levels = unname(dim_labels))
+    )
+
+  vline_layer <- if (!is.null(rfop_cutoff))
+    geom_vline(xintercept = rfop_cutoff, linetype = "dashed", colour = "grey20", linewidth = 0.7)
+  else
+    NULL
+
+  cutoff_label <- if (!is.null(rfop_cutoff))
+    paste0(" Dashed line: high-priority cutoff (", round(rfop_cutoff, 1), "%).")
+  else ""
+
+  ggplot(plot_df, aes(x = mean_rfop_dim, fill = dim_label)) +
+    geom_histogram(binwidth = binwidth, colour = "white", linewidth = 0.2) +
+    vline_layer +
+    scale_fill_brewer(palette = "Set2", guide = "none") +
+    scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+    facet_wrap(~dim_label, ncol = 1, scales = "free_y") +
+    labs(
+      title    = "Distribution of mean RFOP by run type",
+      subtitle = paste0("Each pixel's mean RFOP averaged within each epistemic dimension.",
+                        cutoff_label),
+      x        = "Mean RFOP (%)",
+      y        = "Pixel count"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position  = "none",
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(size = 9, face = "bold")
+    )
+}
+
+
+# 3. Scatter plot: mean_RFOP (x) × mean_seed_SD (y), coloured by dominant_sensitivity.
+# Vertical line at rfop_cutoff (extracted from attr(sens_df, "rfop_cutoff") if not supplied);
+# horizontal line at seed_sd_threshold.
+make_stability_scatter <- function(
+    sens_df,
+    rfop_cutoff       = NULL,
+    seed_sd_threshold = 5,
+    max_points        = 10000
+) {
+  if (is.null(rfop_cutoff)) rfop_cutoff <- attr(sens_df, "rfop_cutoff")
+
+  plot_df <- sens_df |>
+    dplyr::filter(!is.na(mean_RFOP), !is.na(mean_seed_SD))
+
+  if (nrow(plot_df) > max_points)
+    plot_df <- dplyr::slice_sample(plot_df, n = max_points)
+
+  vline_layer <- if (!is.null(rfop_cutoff))
+    geom_vline(xintercept = rfop_cutoff, linetype = "dashed", colour = "grey30", linewidth = 0.7)
+  else NULL
+
+  cutoff_text <- if (!is.null(rfop_cutoff))
+    paste0("high-priority\ncutoff (", round(rfop_cutoff, 1), "%)")
+  else NULL
+
+  p <- ggplot(plot_df,
+         aes(x = mean_RFOP, y = mean_seed_SD, colour = dominant_sensitivity)) +
+    geom_point(alpha = 0.35, size = 0.7) +
+    vline_layer +
+    geom_hline(yintercept = seed_sd_threshold,
+               linetype = "dashed", colour = "grey30", linewidth = 0.7) +
+    scale_colour_manual(
+      values = .dominance_palette,
+      name   = "Dominant\nsensitivity",
+      na.value = "grey70"
+    )
+
+  if (!is.null(rfop_cutoff) && !is.null(cutoff_text))
+    p <- p + annotate("text", x = rfop_cutoff + 1, y = max(plot_df$mean_seed_SD, na.rm = TRUE),
+             label = cutoff_text,
+             hjust = 0, vjust = 1, size = 3, colour = "grey30")
+
+  p +
+    annotate("text", x = 0, y = seed_sd_threshold + 0.3,
+             label = paste0("seed-stable threshold (", seed_sd_threshold, " pp)"),
+             hjust = 0, vjust = 0, size = 3, colour = "grey30") +
+    labs(
+      title    = "Priority vs seed stability",
+      subtitle = "Colour = dominant sensitivity dimension",
+      x        = "Mean RFOP (%)",
+      y        = "Mean seed SD (pp)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    )
+}
+
+
+# 4. Stacked bar: for each dominant_sensitivity class, proportion seed stable vs uncertain.
+make_seed_stability_bar <- function(sens_df) {
+  bar_df <- sens_df |>
+    dplyr::count(dominant_sensitivity, seed_status) |>
+    dplyr::group_by(dominant_sensitivity) |>
+    dplyr::mutate(prop = n / sum(n), total = sum(n)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      dominant_sensitivity = factor(dominant_sensitivity,
+                                    levels = names(.dominance_palette)),
+      seed_status = factor(seed_status, levels = c("seed stable", "seed uncertain"))
+    )
+
+  ggplot(bar_df,
+         aes(x = dominant_sensitivity, y = prop, fill = seed_status)) +
+    geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+    geom_text(
+      data = dplyr::distinct(bar_df, dominant_sensitivity, total),
+      aes(x = dominant_sensitivity, y = 1.04, label = scales::comma(total), fill = NULL),
+      size = 3, colour = "grey30", vjust = 0
+    ) +
+    scale_fill_manual(
+      values = c("seed stable" = "#3a9fbd", "seed uncertain" = "#c94040"),
+      name   = NULL
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1.12),
+      expand = c(0, 0)
+    ) +
+    labs(
+      title    = "Seed stability within each sensitivity class",
+      subtitle = "Numbers above bars = pixel count",
+      x        = NULL,
+      y        = "Proportion of pixels"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x        = element_text(angle = 30, hjust = 1, size = 9),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+
+# 5. Stacked bar: within high-priority pixels, proportion assigned to each map_class.
+make_high_priority_breakdown_bar <- function(sens_df) {
+  hp_df <- sens_df |>
+    dplyr::filter(high_priority) |>
+    dplyr::count(map_class) |>
+    dplyr::mutate(
+      prop      = n / sum(n),
+      map_class = factor(map_class, levels = levels(sens_df$map_class))
+    )
+
+  total_hp <- sum(hp_df$n)
+
+  rfop_cutoff <- attr(sens_df, "rfop_cutoff")
+  cutoff_str  <- if (!is.null(rfop_cutoff))
+    sprintf(" (mean RFOP \u2265 %.1f%%)", rfop_cutoff)
+  else ""
+
+  ggplot(hp_df, aes(x = "", y = prop, fill = map_class)) +
+    geom_col(width = 0.6, colour = "white", linewidth = 0.3) +
+    geom_text(aes(label = ifelse(prop >= 0.02,
+                                 paste0(round(prop * 100, 1), "%"), "")),
+              position = position_stack(vjust = 0.5),
+              size = 3.2, colour = "white", fontface = "bold") +
+    scale_fill_manual(values = .sensitivity_map_palette, name = NULL, drop = FALSE) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = c(0, 0)) +
+    labs(
+      title    = "Classification of high-priority pixels",
+      subtitle = sprintf("n = %s high-priority pixels%s",
+                         scales::comma(total_hp), cutoff_str),
+      x        = NULL,
+      y        = "Proportion"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x        = element_blank(),
+      axis.ticks.x       = element_blank(),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+
+# ── DEPRECATED — replaced by compute_rfop_sensitivity() and per-dim SNRs ─────
+# "Signal" = SD of scenario-mean RFOPs across indicator scenarios (how much
+#   pixel selection shifts when indicator assumptions change, after averaging
+#   out within-scenario seed noise).
+# "Noise"  = pooled within-scenario SD of RFOP across seeds (how much
+#   selection varies just from re-running the same scenario with a new seed).
+# "SNR"    = signal / (noise + 1)  — +1 avoids inflation at very low noise.
+#
+# SNR > 1 : condition signal exceeds algorithm noise -> claims are reliable.
+# SNR < 1 : seed noise dominates  -> more seeds needed before firm conclusions.
+#
+# runs_df : runs_all_df (must contain indicator and seed dim_type rows)
+# Returns data frame: x, y, signal, noise, snr
+compute_seed_snr <- function(runs_df) {
+  stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+
+  # Signal: SD of scenario-mean RFOP across indicator scenarios
+  signal_df <- runs_df |>
+    dplyr::filter(dim_type == "indicator") |>
+    dplyr::group_by(x, y, group_label) |>
+    dplyr::summarise(scenario_mean = mean(rfop_pct, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(x, y) |>
+    dplyr::summarise(signal = sd(scenario_mean, na.rm = TRUE), .groups = "drop")
+
+  # Noise: pooled within-scenario seed SD across indicator scenarios
+  noise_df <- runs_df |>
+    dplyr::filter(dim_type == "indicator") |>
+    dplyr::group_by(x, y, group_label) |>
+    dplyr::summarise(within_sd = sd(rfop_pct, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(x, y) |>
+    dplyr::summarise(noise = mean(within_sd, na.rm = TRUE), .groups = "drop")
+
+  signal_df |>
+    dplyr::left_join(noise_df, by = c("x", "y")) |>
+    dplyr::mutate(
+      signal = dplyr::coalesce(signal, 0),
+      noise  = dplyr::coalesce(noise,  0),
+      snr    = signal / (noise + 1)
+    )
+}
+
+
+# DEPRECATED — replaced by make_snr_diagnostic_panels().
+# Map of SNR values with a diverging palette centred on 1 (signal = noise).
+# Grey underlay = eligible pixels not appearing in indicator runs.
+#
+# snr_df  : output of compute_seed_snr()
+# elig_df : eligible pixels data frame for grey underlay (can be NULL)
+make_snr_map <- function(snr_df, elig_df = NULL,
+                         title = "Condition signal vs algorithm noise (SNR)") {
+  plot_df <- snr_df |>
+    dplyr::mutate(snr_capped = pmin(snr, 4))  # cap display at 4 for readability
+
+  p <- ggplot()
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#e6e6e6")
+  }
+  p +
+    geom_raster(data = plot_df, aes(x = x, y = y, fill = snr_capped)) +
+    scale_fill_gradient2(
+      low      = "#d73027",
+      mid      = "#ffffbf",
+      high     = "#1a9850",
+      midpoint = 1,
+      limits   = c(0, 4),
+      oob      = scales::squish,
+      name     = "SNR\n(signal/noise)",
+      labels   = c("0", "1\n(equal)", "2", "3", "4+")
+    ) +
+    coord_equal() +
+    theme_sp +
+    labs(
+      title    = title,
+      subtitle = "SNR > 1 (green): condition signal detectable. SNR < 1 (red): seed noise dominates."
+    )
+}
+
 .class_palette <- c(
-  "Robust priority"      = "#006D77",   # deep teal
-  "Condition sensitive"  = "#E9C46A",   # vivid amber
-  "Policy sensitive"     = "#6A0572",   # strong violet
-  "Unstable / noisy"     = "#E63946",   # bright red-pink
-  "Low priority"         = "#F0EDE4"    # off-white / cream
+  "Robust priority"      = "#0c7b85",   # deep teal
+  "Indicator sensitive"  = "#bd8c12",   # vivid amber
+  "Benchmark sensitive"  = "#da3114",   # warm orange
+  "Policy sensitive"     = "#910b9b",   # strong violet
+  "Low priority"         = "#bec2bf"    # off-white / cream
 )
 
 
@@ -1248,9 +2113,110 @@ make_classification_map <- function(class_df, elig_df = NULL,
 }
 
 
+# Structured 2×3 grid of per-dimension classification maps.
+#
+# Row 1 — sensitivity maps: one panel per epistemic dimension showing only the
+#   pixels classified as sensitive to that dimension (in its palette colour).
+# Row 2 — dimension-specific robustness maps: pixels that are high-RFOP AND
+#   not sensitive to *that* dimension (regardless of the other two), shown in
+#   the Robust priority teal. These differ from the global "Robust priority"
+#   class (which requires low sensitivity on ALL dimensions simultaneously).
+#
+# class_df     : output of compute_spatial_classification() — must contain
+#                mean_rfop_cond, nsens_ind, nsens_bench, nsens_pol, classification
+# elig_df      : optional eligible-pixel data frame (x, y) for the grey underlay
+# thresh_high  : RFOP threshold above which a pixel can be considered robust
+# thresh_stable: normalised sensitivity threshold (same value used in classification)
+make_classification_maps_per_class <- function(
+    class_df,
+    elig_df      = NULL,
+    thresh_high  = 60,
+    thresh_stable = 0.3
+) {
+  other_grey <- "#e4e4e4b9"
+
+  # Helper: build one spatial panel
+  .one_map <- function(focal_df, fill_col, title_txt) {
+    p <- ggplot() +
+      theme_void() +
+      theme(
+        panel.background = element_rect(fill = "white", colour = NA),
+        plot.title       = element_text(size = 10, face = "bold", hjust = 0.5),
+        legend.position  = "none"
+      ) +
+      labs(title = title_txt)
+
+    # 1. All eligible pixels — lightest grey underlay
+    if (!is.null(elig_df) && nrow(elig_df) > 0)
+      p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#EEEEEE")
+
+    # 2. Non-focal classified pixels — mid grey
+    non_focal <- dplyr::anti_join(class_df[, c("x", "y")], focal_df[, c("x", "y")],
+                                  by = c("x", "y"))
+    if (nrow(non_focal) > 0)
+      p <- p + geom_raster(data = non_focal, aes(x = x, y = y), fill = other_grey)
+
+    # 3. Focal pixels — class colour
+    if (nrow(focal_df) > 0)
+      p <- p + geom_raster(data = focal_df, aes(x = x, y = y), fill = fill_col)
+
+    # 4. Canton boundary
+    if (exists("BE"))
+      p <- p + geom_sf(data = BE, fill = NA, color = "black",
+                       linewidth = 0.2, inherit.aes = FALSE)
+    p
+  }
+
+  # ── Row 1: sensitive pixels per dimension ──────────────────────────────────
+  dims <- list(
+    list(cls  = "Indicator sensitive",
+         nsens = "nsens_ind",
+         col  = .class_palette[["Indicator sensitive"]],
+         title = "Indicator sensitive"),
+    list(cls  = "Benchmark sensitive",
+         nsens = "nsens_bench",
+         col  = .class_palette[["Benchmark sensitive"]],
+         title = "Benchmark sensitive"),
+    list(cls  = "Policy sensitive",
+         nsens = "nsens_pol",
+         col  = .class_palette[["Policy sensitive"]],
+         title = "Policy sensitive")
+  )
+
+  row1 <- lapply(dims, function(d) {
+    if (!d$nsens %in% names(class_df)) {
+      return(ggplot() + theme_void() +
+               labs(title = paste0(d$title, "\n(no data)")))
+    }
+    focal <- dplyr::filter(class_df, .data[[d$nsens]] >= thresh_stable)
+    .one_map(focal, d$col, d$title)
+  })
+
+  # ── Row 2: dimension-specific robust pixels ────────────────────────────────
+  # "Robust vs [dim]" = high RFOP AND not sensitive on that specific dimension.
+  # This is looser than the global Robust class (which requires ALL dims stable).
+  robust_col <- .class_palette[["Robust priority"]]
+
+  row2 <- lapply(dims, function(d) {
+    if (!d$nsens %in% names(class_df)) {
+      # Dimension has no data — empty placeholder
+      return(ggplot() + theme_void() +
+               labs(title = paste0("Robust | ", d$title, "\n(no data)")))
+    }
+    focal <- dplyr::filter(
+      class_df,
+      mean_rfop_cond >= thresh_high,
+      .data[[d$nsens]] < thresh_stable
+    )
+    .one_map(focal, robust_col, paste0("Robust | ", d$title))
+  })
+
+  patchwork::wrap_plots(c(row1, row2), ncol = 3)
+}
+
+
 # Faceted heatmaps of raw sensitivity scores per dimension.
 # Useful for diagnosing which dimension drives variability where.
-#
 # class_df : output of compute_spatial_classification()
 # dims     : which sensitivity dimensions to show (subset if some have no runs)
 make_sensitivity_breakdown_maps <- function(
@@ -1287,21 +2253,30 @@ make_sensitivity_breakdown_maps <- function(
   plot_data$dimension <- factor(plot_data$dimension,
                                 levels = dim_labels[available_dims])
 
-  ggplot(plot_data, aes(x = x, y = y, fill = sens)) +
-    geom_raster() +
-    scale_fill_distiller(
-      palette   = "YlOrRd",
-      direction = 1,
-      name      = "Sensitivity\n(RFOP range)",
-      limits    = c(0, NA)
-    ) +
-    facet_wrap(~dimension, ncol = 2) +
-    theme_void() +
-    theme(
-      panel.background = element_rect(fill = "white", colour = NA),
-      strip.text       = element_text(size = 9, face = "bold", hjust = 0.5),
-      legend.position  = "right"
-    )
+  plots <- plot_data %>%
+  filter(sens>0) %>%
+  split(.$dimension) %>%
+  lapply(function(df) {
+    ggplot(df, aes(x = x, y = y, fill = sens)) +
+      geom_raster() +
+      scale_fill_viridis_c(
+        option    = "viridis",
+        direction = 1,
+        name      = "Sensitivity\n(RFOP range)",
+        limits    = c(0, NA)
+      ) +
+      coord_equal() +
+      theme_void() +
+      ggtitle(unique(df$dimension)) +
+      theme(
+        plot.title        = element_text(size = 9, face = "bold", hjust = 0.5),
+        panel.background  = element_rect(fill = "white", colour = NA),
+        legend.position   = "right"
+      )
+  })
+
+  combined_plot <- wrap_plots(plots, ncol = 3)
+  combined_plot
 }
 
 
@@ -1456,7 +2431,6 @@ make_hv_sensitivity_plot <- function(stats_df, ref_label = NULL) {
 
   # ── Seed panel ────────────────────────────────────────────────────────────
   # Labels each run by its seed number extracted from run_label
-  # e.g. "global_all_seed100" → "seed100"
   df_seed <- dplyr::filter(df, dim_type == "seed") |>
     dplyr::mutate(seed_label = sub(".*_seed", "seed", run_label))
   p_seed <- if (nrow(df_seed) > 0)
@@ -1470,222 +2444,6 @@ make_hv_sensitivity_plot <- function(stats_df, ref_label = NULL) {
     patchwork::plot_annotation(
       title    = "Pareto front quality across sensitivity dimensions",
       subtitle = "Each point is one run; dashed line = reference HV (global_all_seed100)"
-    )
-}
-
-
-# Heatmap of ideal-point values per objective × run, normalised relative to
-# the reference run so that cells show % change from baseline.
-# Positive = worse (higher cost or lower gain), Negative = better.
-#
-# stats_df    : output of collect_pareto_stats()
-# obj_names   : character vector of objective names
-# obj_labels  : display labels (same order as obj_names)
-# ref_label   : run_label of the reference run
-# point       : "ideal" (best achieved per objective) or "nadir" (worst ND value)
-make_ideal_nadir_plot <- function(stats_df, obj_names, obj_labels,
-                                  ref_label = NULL,
-                                  point = c("ideal", "nadir")) {
-  point <- match.arg(point)
-  prefix <- paste0(point, "_")
-  cols   <- paste0(prefix, obj_names)
-
-  if (!all(cols %in% names(stats_df))) {
-    return(ggplot() +
-             annotate("text", x = 0.5, y = 0.5,
-                      label = sprintf("No %s-point data found in stats_df", point), size = 5) +
-             theme_void())
-  }
-
-  # Pivot to long
-  long <- stats_df |>
-    dplyr::select(run_label, dim_type, group_label, dplyr::all_of(cols)) |>
-    tidyr::pivot_longer(cols = dplyr::all_of(cols),
-                        names_to = "objective", values_to = "value") |>
-    dplyr::mutate(
-      objective = factor(
-        gsub(prefix, "", objective, fixed = TRUE),
-        levels = obj_names,
-        labels = obj_labels
-      )
-    )
-
-  # Normalise relative to reference run
-  if (!is.null(ref_label) && ref_label %in% long$run_label) {
-    ref_vals <- long |>
-      dplyr::filter(run_label == ref_label) |>
-      dplyr::select(objective, ref_value = value)
-    long <- dplyr::left_join(long, ref_vals, by = "objective") |>
-      dplyr::mutate(pct_change = (value - ref_value) / (abs(ref_value) + 1e-10) * 100)
-    fill_col  <- "pct_change"
-    fill_name <- sprintf("%% change from\n%s", ref_label)
-    lim_sym   <- max(abs(long$pct_change), na.rm = TRUE)
-    fill_scale <- scale_fill_gradient2(
-      low      = "#1976D2",   # blue = improvement
-      mid      = "white",
-      high     = "#C62828",   # red  = degradation
-      midpoint = 0,
-      limits   = c(-lim_sym, lim_sym),
-      name     = fill_name,
-      labels   = scales::percent_format(scale = 1, accuracy = 1)
-    )
-  } else {
-    fill_col   <- "value"
-    fill_name  <- sprintf("%s point value", tools::toTitleCase(point))
-    fill_scale <- scale_fill_distiller(palette = "YlOrRd", direction = 1,
-                                        name = fill_name)
-  }
-
-  dim_labels <- c(indicator = "Condition", policy = "Policy",
-                  seed = "Seed", param = "Parameter")
-  long$dim_label <- dplyr::recode(long$dim_type, !!!dim_labels)
-
-  ggplot(long, aes(x = group_label, y = objective, fill = .data[[fill_col]])) +
-    geom_tile(colour = "white", linewidth = 0.4) +
-    fill_scale +
-    facet_wrap(~dim_label, scales = "free_x", nrow = 1) +
-    labs(
-      x        = NULL,
-      y        = NULL,
-      title    = sprintf("%s-point sensitivity across runs",
-                         tools::toTitleCase(point)),
-      subtitle = if (!is.null(ref_label))
-        sprintf("Red = degraded vs %s, Blue = improved", ref_label)
-      else
-        "Raw objective values"
-    ) +
-    theme_minimal() +
-    theme(
-      axis.text.x      = element_text(angle = 40, hjust = 1, size = 8),
-      axis.text.y      = element_text(size = 9),
-      strip.text       = element_text(face = "bold", size = 10),
-      panel.grid       = element_blank(),
-      legend.position  = "right"
-    )
-}
-
-
-# Diverging dot-plot of ideal-point or nadir shift across sensitivity dimensions.
-#
-# Produces three stacked panels (indicator / policy / seed), each faceted by
-# objective.  Within each panel, runs are shown as rows and % change from the
-# reference run is shown on the x-axis.  A vertical zero line and red/blue
-# colouring make direction of change immediately readable.
-#
-# Row labelling per dimension:
-#   indicator — group_label (seeds averaged within each drop-one scenario)
-#   policy    — run_label   (shows each seed of both groups as a distinct row)
-#   seed      — seed suffix extracted from run_label (e.g. "seed100")
-#
-# stats_df    : output of collect_pareto_stats()
-# obj_names   : character vector of objective column names
-# obj_labels  : display labels (same order as obj_names)
-# ref_label   : run_label of the reference run (its row always shows 0 % change)
-# point       : "ideal" or "nadir"
-make_ideal_nadir_dotplot <- function(stats_df, obj_names, obj_labels,
-                                     ref_label = NULL,
-                                     point = c("ideal", "nadir")) {
-  point  <- match.arg(point)
-  prefix <- paste0(point, "_")
-  cols   <- paste0(prefix, obj_names)
-
-  if (!all(cols %in% names(stats_df))) {
-    return(ggplot() +
-             annotate("text", x = 0.5, y = 0.5,
-                      label = sprintf("No %s-point data found in stats_df", point), size = 5) +
-             theme_void())
-  }
-
-  # ── Pivot to long and compute % change from reference ──────────────────────
-  long <- stats_df |>
-    dplyr::select(run_label, dim_type, group_label,
-                  dplyr::all_of(cols)) |>
-    tidyr::pivot_longer(cols = dplyr::all_of(cols),
-                        names_to = "objective", values_to = "value") |>
-    dplyr::mutate(
-      objective = factor(
-        gsub(prefix, "", objective, fixed = TRUE),
-        levels = obj_names,
-        labels = obj_labels
-      )
-    )
-
-  if (!is.null(ref_label) && ref_label %in% long$run_label) {
-    ref_vals <- long |>
-      dplyr::filter(run_label == ref_label) |>
-      dplyr::select(objective, ref_value = value)
-    long <- dplyr::left_join(long, ref_vals, by = "objective") |>
-      dplyr::mutate(pct_change = (value - ref_value) / (abs(ref_value) + 1e-10) * 100)
-  } else {
-    long <- dplyr::mutate(long, pct_change = value, ref_value = NA_real_)
-  }
-
-  # ── Shared panel builder ───────────────────────────────────────────────────
-  .dot_panel <- function(data, title) {
-    ggplot(data, aes(x = pct_change, y = row_label,
-                     colour = pct_change > 0)) +
-      geom_vline(xintercept = 0, linetype = "solid",
-                 colour = "grey60", linewidth = 0.5) +
-      geom_segment(aes(x = 0, xend = pct_change,
-                       y = row_label, yend = row_label),
-                   linewidth = 0.5, alpha = 0.6) +
-      geom_point(size = 3) +
-      scale_colour_manual(values = c("FALSE" = "#1976D2",  # blue  = improved
-                                     "TRUE"  = "#C62828"), # red   = degraded
-                          guide = "none") +
-      scale_x_continuous(labels = function(x) paste0(round(x), "%")) +
-      facet_wrap(~objective, nrow = 1, scales = "free_x") +
-      labs(x = sprintf("%% change from reference (%s)", ref_label),
-           y = NULL, title = title) +
-      theme_minimal() +
-      theme(
-        strip.text         = element_text(face = "bold", size = 9),
-        panel.grid.major.y = element_blank(),
-        panel.grid.minor   = element_blank(),
-        axis.text.y        = element_text(size = 8),
-        axis.text.x        = element_text(size = 8),
-        plot.title         = element_text(face = "bold", size = 10)
-      )
-  }
-
-  # ── Indicator panel: average across seeds within each group ───────────────
-  ind_data <- long |>
-    dplyr::filter(dim_type == "indicator") |>
-    dplyr::group_by(group_label, objective) |>
-    dplyr::summarise(pct_change = mean(pct_change, na.rm = TRUE), .groups = "drop") |>
-    dplyr::mutate(row_label = group_label)
-
-  # ── Policy panel: every run as its own row ─────────────────────────────────
-  pol_data <- long |>
-    dplyr::filter(dim_type %in% c("policy", "seed")) |>
-    dplyr::mutate(row_label = run_label)
-
-  # ── Seed panel: extract seed suffix as row label ───────────────────────────
-  seed_data <- long |>
-    dplyr::filter(dim_type == "seed") |>
-    dplyr::mutate(row_label = sub(".*_seed", "seed", run_label))
-
-  plots <- list()
-
-  if (nrow(ind_data) > 0)
-    plots[["indicator"]] <- .dot_panel(ind_data, "Condition / indicator sensitivity")
-
-  if (nrow(pol_data) > 0)
-    plots[["policy"]] <- .dot_panel(pol_data, "Policy sensitivity (global_all vs upper_q75_all)")
-
-  if (nrow(seed_data) > 0)
-    plots[["seed"]] <- .dot_panel(seed_data, "Seed (stochastic) sensitivity")
-
-  if (length(plots) == 0)
-    return(ggplot() + annotate("text", x = 0.5, y = 0.5,
-                               label = "No data", size = 5) + theme_void())
-
-  patchwork::wrap_plots(plots, ncol = 1) +
-    patchwork::plot_annotation(
-      title    = sprintf("%s-point shift across sensitivity dimensions",
-                         tools::toTitleCase(point)),
-      subtitle = sprintf("x = %% change from reference run (%s) | Blue = improved, Red = degraded",
-                         ref_label)
     )
 }
 
@@ -1864,9 +2622,9 @@ load_scenario_rfop_avg <- function(dirs_list, scenario_label) {
 # each pixel to an ecosystem based on the LULC raster.
 #
 # elig_df         : data frame with columns x, y (EPSG:2056 coordinates)
-# indicator_paths : named list mapping indicator code → path to .tif file
+# indicator_paths : named list mapping indicator code to path to .tif file
 # lulc_raster     : SpatRaster; LULC class values used to assign ecosystem
-# lulc_classes    : named list mapping ecosystem label → integer LULC class codes
+# lulc_classes    : named list mapping ecosystem label to integer LULC class codes
 # Returns: data frame (x, y, ecosystem, <indicator_code>, ...)
 extract_indicator_values <- function(
     elig_df,
@@ -1982,10 +2740,10 @@ make_redundancy_boxplot <- function(redundancy_df) {
   }
 
   # Order by overall median R² (descending)
-  ind_order <- redundancy_df |>
-    dplyr::group_by(indicator_label) |>
-    dplyr::summarise(med = median(redundancy_r2, na.rm = TRUE), .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(med)) |>
+  ind_order <- redundancy_df %>%
+    dplyr::group_by(indicator_label) %>%
+    dplyr::summarise(med = median(redundancy_r2, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(med)) %>%
     dplyr::pull(indicator_label)
 
   redundancy_df$indicator_label <- factor(redundancy_df$indicator_label, levels = ind_order)
@@ -1999,12 +2757,10 @@ make_redundancy_boxplot <- function(redundancy_df) {
     scale_fill_manual(values = ect_palette, name = "Category") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1),
                        limits = c(0, NA)) +
-    facet_wrap(~ecosystem, ncol = 1, scales = "free_x") +
+    facet_wrap(~ecosystem, ncol = 2, scales = "free_x") +
     labs(
       x        = NULL,
       y        = expression("Redundancy index (R"^2*")"),
-      title    = "Indicator importance for pixel selection across condition scenarios",
-      subtitle = "Each box spans all 13 condition scenarios; higher = more explanatory power"
     ) +
     theme_minimal() +
     theme(
@@ -2013,4 +2769,228 @@ make_redundancy_boxplot <- function(redundancy_df) {
       panel.grid.major.x = element_blank(),
       legend.position    = "bottom"
     )
+}
+
+
+# ── ANOVA variance decomposition ──────────────────────────────────────────────
+#
+# For each eligible pixel, RFOP varies across runs that differ in three
+# sensitivity dimensions: indicator assumption, policy assumption, and random
+# seed.  An ANOVA decomposes the total variance in RFOP (across all 39 runs)
+# into the share attributable to each dimension (eta²) plus residual.
+#
+# This gives a comparable effect-size measure across all sensitivity dimensions,
+# using only the runs that already exist — no additional model evaluations needed.
+#
+# Workflow:
+#   1. compute_rfop_anova()      — pixel-wise SD of group-mean RFOP per dimension
+#   2. make_anova_map()          — spatial map of dominant dimension
+#   3. make_anova_eta2_ridges()  — distribution of SD across pixels per dim
+#   4. make_anova_summary_bar()  — mean SD per dimension (global summary)
+
+
+# Pixel-wise variance attribution across sensitivity dimensions.
+#
+# ── Metric: SD of group-mean RFOP ─────────────────────────────────────────────
+# For each pixel p and dimension d, we compute the standard deviation of
+# group-averaged RFOP across the distinct groups within that dimension:
+#
+#   group_mean_g(p) = mean(rfop_pct) across all runs in group g
+#   rfop_sd_d(p)    = SD of {group_mean_g(p)} across groups g in dimension d
+#
+# This is in RFOP percentage-point units and is directly comparable across
+# dimensions regardless of how many runs each dimension has, and regardless
+# of whether groups have 1 run (seeds) or many (indicator scenarios).
+#
+# For the seed dimension this measures "how much does the choice of random
+# seed shift average pixel RFOP?"; for indicator it measures "how much does
+# dropping one indicator shift average pixel RFOP?".  Both are on the same
+# scale — a pixel with rfop_sd_seed = 20 is just as unstable to seed choice
+# as a pixel with rfop_sd_indicator = 20 is to indicator choice.
+#
+# runs_df : bind_rows of load_run_rfop() — cols x, y, rfop_pct, dim_type, group_label
+# dims    : character vector of dim_type values to decompose (default all present)
+# Returns a data frame with one row per eligible pixel:
+#   x, y, rfop_sd_<dim>, rfop_mean_<dim>, n_groups_<dim>, dominant_dim
+compute_rfop_anova <- function(runs_df,
+                               dims = c("indicator", "policy", "seed")) {
+  stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+
+  dims_present <- intersect(dims, unique(runs_df$dim_type))
+
+  result_list <- lapply(dims_present, function(d) {
+    runs_df |>
+      dplyr::filter(dim_type == d) |>
+      # Average within each group to remove within-scenario seed noise
+      # (for indicator/policy dims each group already has multiple seeds;
+      #  for seed dim each group_label is one seed so this is a no-op mean)
+      dplyr::group_by(x, y, group_label) |>
+      dplyr::summarise(g_mean = mean(rfop_pct, na.rm = TRUE), .groups = "drop") |>
+      dplyr::group_by(x, y) |>
+      dplyr::summarise(
+        !!paste0("rfop_sd_",   d) := sd(g_mean,   na.rm = TRUE),
+        !!paste0("rfop_mean_", d) := mean(g_mean, na.rm = TRUE),
+        !!paste0("n_groups_",  d) := dplyr::n(),
+        .groups = "drop"
+      )
+  })
+
+  result <- Reduce(function(a, b) dplyr::full_join(a, b, by = c("x", "y")),
+                   result_list)
+
+  # Dominant dimension: the one with the largest SD of group-mean RFOP
+  sd_cols <- paste0("rfop_sd_", dims_present)
+  result$dominant_dim <- apply(
+    result[, sd_cols, drop = FALSE], 1,
+    function(row) {
+      if (all(is.na(row) | row == 0)) return(NA_character_)
+      dims_present[which.max(row)]
+    }
+  )
+
+  result
+}
+
+
+# Colour palette for ANOVA dimensions (matches classification palette tone).
+.anova_palette <- c(
+  indicator  = "#E9C46A",   # amber  — condition/indicator sensitivity
+  policy     = "#6A0572",   # violet — policy sensitivity
+  seed       = "#E63946",   # red    — stochastic noise
+  residual   = "grey70"
+)
+
+.anova_labels <- c(
+  indicator = "Indicator assumption",
+  policy    = "Policy assumption",
+  seed      = "Random seed",
+  residual  = "Residual"
+)
+
+
+# Spatial map: for each pixel colour by dominant dimension (largest SD of group-mean RFOP).
+# Grey underlay = eligible pixels where dominant_dim is NA (zero SD in all dimensions —
+# always or never selected regardless of assumptions).
+#
+# anova_df : output of compute_rfop_anova()
+# elig_df  : eligible_pixels.csv data frame for grey underlay (can be NULL)
+make_anova_map <- function(anova_df, elig_df = NULL,
+                           title = "Dominant source of RFOP variation") {
+  plot_df <- anova_df |>
+    dplyr::filter(!is.na(dominant_dim)) |>
+    dplyr::mutate(
+      dominant_dim = factor(dominant_dim, levels = names(.anova_palette)),
+      label        = .anova_labels[as.character(dominant_dim)]
+    )
+
+  p <- ggplot()
+
+  if (!is.null(elig_df) && nrow(elig_df) > 0) {
+    p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#e6e6e6")
+  }
+
+  p +
+    geom_raster(data = plot_df, aes(x = x, y = y, fill = label)) +
+    scale_fill_manual(
+      values = setNames(.anova_palette[names(.anova_labels)],
+                        unname(.anova_labels)),
+      name   = "Dominant dimension",
+      na.value = "grey85"
+    ) +
+    coord_equal() +
+    theme_sp +
+    labs(title    = title,
+         subtitle = "Pixels coloured by the dimension with the largest SD of group-mean RFOP")
+}
+
+
+# Ridge plot: distribution of SD of group-mean RFOP across pixels, one ridge per dimension.
+# x-axis is in RFOP percentage-point units — directly comparable across dimensions.
+#
+# anova_df : output of compute_rfop_anova()
+# dims     : which dimensions to include
+make_anova_eta2_ridges <- function(anova_df,
+                                   dims = c("indicator", "policy", "seed")) {
+  dims_present <- intersect(dims, sub("rfop_sd_", "",
+                                      grep("^rfop_sd_", names(anova_df), value = TRUE)))
+  if (length(dims_present) == 0) return(NULL)
+
+  long_df <- dplyr::bind_rows(lapply(dims_present, function(d) {
+    sd_col <- paste0("rfop_sd_", d)
+    anova_df |>
+      dplyr::select(x, y, rfop_sd = dplyr::all_of(sd_col)) |>
+      dplyr::filter(!is.na(rfop_sd)) |>
+      dplyr::mutate(
+        dimension = d,
+        dim_label = factor(.anova_labels[d], levels = unname(.anova_labels[dims_present]))
+      )
+  }))
+
+  ggplot(long_df, aes(x = rfop_sd, y = dim_label, fill = dimension)) +
+    ggridges::geom_density_ridges(
+      alpha = 0.75, scale = 1.2,
+      quantile_lines = TRUE, quantiles = 0.5,
+      colour = "grey30"
+    ) +
+    scale_fill_manual(values = .anova_palette[dims_present], guide = "none") +
+    scale_x_continuous(labels = scales::label_number(suffix = " pp"),
+                       expand = c(0.01, 0)) +
+    labs(
+      title    = "Distribution of RFOP variation across pixels",
+      subtitle = "SD of group-mean RFOP per dimension. Vertical line = median. Units: percentage points.",
+      x        = "SD of group-mean RFOP (percentage points)",
+      y        = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.y = element_blank(),
+      strip.text         = element_text(face = "bold")
+    )
+}
+
+
+# Summary bar chart: mean SD of group-mean RFOP (± SD across pixels) per dimension.
+# All bars are on the same scale (RFOP percentage points) — directly comparable.
+#
+# anova_df : output of compute_rfop_anova()
+# dims     : which dimensions to include
+make_anova_summary_bar <- function(anova_df,
+                                   dims = c("indicator", "policy", "seed")) {
+  dims_present <- intersect(dims, sub("rfop_sd_", "",
+                                      grep("^rfop_sd_", names(anova_df), value = TRUE)))
+
+  summary_df <- dplyr::bind_rows(lapply(dims_present, function(d) {
+    sd_col <- paste0("rfop_sd_", d)
+    anova_df |>
+      dplyr::select(rfop_sd = dplyr::all_of(sd_col)) |>
+      dplyr::filter(!is.na(rfop_sd)) |>
+      dplyr::summarise(
+        mean_sd = mean(rfop_sd, na.rm = TRUE),
+        se_sd   = sd(rfop_sd,   na.rm = TRUE) / sqrt(dplyr::n())
+      ) |>
+      dplyr::mutate(dimension = d)
+  })) |>
+    dplyr::mutate(
+      dim_label = factor(.anova_labels[dimension],
+                         levels = rev(unname(.anova_labels[dims_present])))
+    )
+
+  ggplot(summary_df, aes(x = mean_sd, y = dim_label, fill = dimension)) +
+    geom_col(width = 0.6, colour = "grey30") +
+    geom_errorbar(
+      aes(xmin = pmax(0, mean_sd - se_sd),
+          xmax = mean_sd + se_sd),
+      width = 0.25, colour = "grey30"
+    ) +
+    scale_fill_manual(values = .anova_palette[dims_present], guide = "none") +
+    scale_x_continuous(labels = scales::label_number(suffix = " pp"),
+                       expand = c(0.01, 0)) +
+    labs(
+      title    = "Mean RFOP variation per sensitivity dimension",
+      subtitle = "Mean (\u00b1 SE) SD of group-mean RFOP across all eligible pixels.\nAll dimensions use the same scale (percentage points) \u2014 directly comparable.",
+      x        = "Mean SD of group-mean RFOP (pp)",
+      y        = NULL
+    ) +
+    theme_minimal() +
+    theme(panel.grid.major.y = element_blank())
 }
