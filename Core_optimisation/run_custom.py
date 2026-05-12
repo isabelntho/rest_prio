@@ -22,7 +22,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "grid_speedcheck_fullbern"
+RUN_LABEL = "policy_seed_expansion"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -30,8 +30,9 @@ REGION = "Bern"
 # Choose scenario mode:
 #   "custom"         runs exactly one scenario using custom_scenario_params
 #   "all"            runs scenario="all" using the scenario sampling logic inside main()
-#   "condition_grid" sweeps all 13 condition scenarios x CONDITION_GRID_SEEDS
-SCENARIO_MODE = "condition_grid"
+#   "condition_grid" sweeps all 13 condition scenarios x SEEDS
+#   "policy_grid"    runs each entry in POLICY_VARIANTS once against CONDITION_SCENARIO
+SCENARIO_MODE = "policy_grid"
 
 # Condition scenario tag — selects pre-computed anomaly rasters from inputs/anomaly_scenarios/
 # Available tags:
@@ -41,8 +42,10 @@ SCENARIO_MODE = "condition_grid"
 #   upper_q75_all
 CONDITION_SCENARIO = "global_all"
 
-# Seeds used in condition_grid mode (one run per scenario x seed combination)
-CONDITION_GRID_SEEDS = [100, 101, 102]
+# Seeds used by both condition_grid and policy_grid modes.
+#   List[int] — runs each scenario/variant once per seed; labels: <name>_seed<n>
+#   None       — runs each scenario/variant once using RANDOM_SEED; labels: <name>
+SEEDS = [100, 101, 102, 103, 104] # None
 
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
@@ -64,7 +67,7 @@ SAMPLE_SEED = 42
 POP_SIZE = 50
 N_GENERATIONS = 100
 N_JOBS = 12
-RANDOM_SEED = 42
+RANDOM_SEED = 100 #42
 N_SAMPLES_PER_PARAM = 3
 N_PARTITIONS = 12
 WARM_SEEDING = True
@@ -80,6 +83,24 @@ custom_scenario_params = {
     "patch_repair_top_k": 100,
     "burden_sharing": "no",
 }
+
+# Named policy scenarios for SCENARIO_MODE == "policy_grid".
+# Each entry is a dict of parameter overrides applied on top of custom_scenario_params.
+# An empty dict {} means "no overrides" — mirrors the condition baseline run.
+# Run labels will be the key name (e.g. "policy_ambitious"), with no seed suffix,
+# using CONDITION_SCENARIO and RANDOM_SEED defined above.
+POLICY_VARIANTS = {
+    "policy_baseline":         {},                                                  # mirrors condition baseline
+    "policy_ambitious":        {"max_restoration_fraction": 0.10},                 # double the budget
+    "policy_very_ambitious":   {"max_restoration_fraction": 0.20},                 # 4x the budget
+    "policy_burden_shared":    {"burden_sharing": "yes"},                          # equal burden across regions
+    "policy_ambitious_burden": {"max_restoration_fraction": 0.10,
+                                "burden_sharing": "yes"},                          # ambitious + burden shared
+}
+
+# Benchmark condition scenarios run in policy_grid mode with baseline params × SEEDS.
+# Labels: <tag>_seed<n>  (or <tag> when SEEDS is None).
+BENCHMARK_SCENARIOS = ["upper_q75_all"]
 
 # Patch approach settings
 USE_PATCH_APPROACH = True
@@ -97,7 +118,7 @@ SAVE_SNAPSHOTS = False
 
 # Set to True to profile the run with cProfile and print the top 30 hotspots afterwards.
 # Results are also written to logs/profile_<run_label>.txt
-PROFILE = True
+PROFILE = False
 PROFILE_TOP_N = 30
 
 # Snapshot of the full configuration block — written to run_registry.jsonl alongside results.
@@ -120,6 +141,8 @@ run_config = {
     "save_snapshots": SAVE_SNAPSHOTS,
     "aggregation_factor": AGGREGATION_FACTOR,
     "custom_scenario_params": custom_scenario_params,
+    "seeds": SEEDS,
+    "benchmark_scenarios": BENCHMARK_SCENARIOS,
 }
 
 if ECOSYSTEM_TO_RUN == "all":
@@ -163,7 +186,9 @@ def _run():
                     lulc_path=None,
                 )
             elif SCENARIO_MODE == "condition_grid":
-                # Sweep all 13 condition scenario tags × CONDITION_GRID_SEEDS
+                # Sweep all 13 condition scenario tags.
+                # If SEEDS is a list, run each tag × seed.
+                # If SEEDS is None, run each tag once with RANDOM_SEED.
                 _condition_tags = [
                     "global_all",
                     "global_drop_smd", "global_drop_sbd", "global_drop_soc",
@@ -172,14 +197,16 @@ def _run():
                     "global_drop_lai", "global_drop_ndvi",
                     "upper_q75_all",
                 ]
+                _use_seeds = SEEDS is not None
+                _seeds     = SEEDS if _use_seeds else [RANDOM_SEED]
                 results = None
                 _grid_start = time.perf_counter()
-                _grid_total = len(_condition_tags) * len(CONDITION_GRID_SEEDS)
+                _grid_total = len(_condition_tags) * len(_seeds)
                 _grid_done = 0
                 _grid_times = {}
                 for _tag in _condition_tags:
-                    for _seed in CONDITION_GRID_SEEDS:
-                        _run_label = f"{_tag}_seed{_seed}"
+                    for _seed in _seeds:
+                        _run_label = f"{_tag}_seed{_seed}" if _use_seeds else _tag
                         _item_start = time.perf_counter()
                         print(f"  condition_grid [{_grid_done + 1}/{_grid_total}]: {_run_label}")
                         try:
@@ -227,8 +254,7 @@ def _run():
                         _grid_done += 1
 
                 _grid_elapsed = time.perf_counter() - _grid_start
-                _grid_succeeded = sum(1 for t in _condition_tags for s in CONDITION_GRID_SEEDS
-                                      if f"{t}_seed{s}" in all_results)
+                _grid_succeeded = sum(1 for lbl in all_results)
                 print(f"\n=== CONDITION GRID COMPLETE ===")
                 print(f"  {_grid_succeeded}/{_grid_total} runs succeeded")
                 print(f"  Total grid time: {_grid_elapsed/60:.1f} min ({_grid_elapsed:.0f} s)")
@@ -236,6 +262,144 @@ def _run():
                     _avg = sum(_grid_times.values()) / len(_grid_times)
                     print(f"  Average per run: {_avg/60:.1f} min ({_avg:.0f} s)")
                 print(f"  Results PKLs: results_files/res_<timestamp>_<run_label>.pkl (one per grid element)")
+            elif SCENARIO_MODE == "policy_grid":
+                # Run each named policy variant × SEEDS against CONDITION_SCENARIO.
+                # Also run BENCHMARK_SCENARIOS × SEEDS with baseline params.
+                # Labels: <variant>_seed<n>  /  <benchmark_tag>_seed<n>
+                # (no seed suffix when SEEDS is None — uses RANDOM_SEED)
+                _pg_use_seeds = SEEDS is not None
+                _pg_seeds     = SEEDS if _pg_use_seeds else [RANDOM_SEED]
+                _pg_total     = len(POLICY_VARIANTS) * len(_pg_seeds) + len(BENCHMARK_SCENARIOS) * len(_pg_seeds)
+
+                print(f"\n  Policy variants to run ({len(POLICY_VARIANTS)} × {len(_pg_seeds)} seeds):")
+                for _vname, _vparams in POLICY_VARIANTS.items():
+                    _diff = {k: v for k, v in _vparams.items()} or {"(baseline — no overrides)": ""}
+                    print(f"    {_vname}: {_diff}")
+                if BENCHMARK_SCENARIOS:
+                    print(f"  Benchmark scenarios ({len(BENCHMARK_SCENARIOS)} × {len(_pg_seeds)} seeds):")
+                    for _btag in BENCHMARK_SCENARIOS:
+                        print(f"    {_btag}")
+
+                results    = None
+                _grid_start = time.perf_counter()
+                _grid_done  = 0
+                _grid_times = {}
+
+                # ── policy variants ──────────────────────────────────────────────
+                _ic_policy = load_initial_conditions(
+                    ".",
+                    objectives=OBJECTIVES,
+                    region=REGION,
+                    ecosystem=ecosystem_for_loader,
+                    sample_fraction=SAMPLE_FRACTION,
+                    sample_seed=SAMPLE_SEED,
+                    aggregation_factor=AGGREGATION_FACTOR,
+                    condition_scenario=CONDITION_SCENARIO,
+                )
+
+                for _vname, _vparams in POLICY_VARIANTS.items():
+                    for _seed in _pg_seeds:
+                        _run_lbl = f"{_vname}_seed{_seed}" if _pg_use_seeds else _vname
+                        _item_start    = time.perf_counter()
+                        _merged_params = {**custom_scenario_params, **_vparams}
+                        _grid_config   = {**run_config, "policy_variant": _vname,
+                                          "condition_scenario": CONDITION_SCENARIO,
+                                          "random_seed": _seed}
+                        _grid_done += 1
+                        print(f"  policy_grid [{_grid_done}/{_pg_total}]: {_run_lbl}")
+                        try:
+                            _presults = run_optimization_instance(
+                                initial_conditions=_ic_policy,
+                                scenario_params=_merged_params,
+                                pop_size=POP_SIZE,
+                                n_generations=N_GENERATIONS,
+                                save_results=True,
+                                verbose=True,
+                                n_jobs=N_JOBS,
+                                random_seed=_seed,
+                                use_repair=True,
+                                use_patch_approach=USE_PATCH_APPROACH,
+                                patch_size=PATCH_SIZE,
+                                patch_constraint_type=PATCH_CONSTRAINT_TYPE,
+                                pixel_tolerance=PIXEL_TOLERANCE,
+                                save_snapshots=SAVE_SNAPSHOTS,
+                                n_partitions=N_PARTITIONS,
+                                warm_seeding=WARM_SEEDING,
+                                run_label=_run_lbl,
+                                run_config=_grid_config,
+                            )
+                            _item_elapsed = time.perf_counter() - _item_start
+                            _grid_times[_run_lbl] = _item_elapsed
+                            if _presults is not None:
+                                all_results[_run_lbl] = _presults
+                                print(f"  ✓ {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
+                            else:
+                                print(f"  ✗ {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
+                        except Exception as _e:
+                            _grid_times[_run_lbl] = time.perf_counter() - _item_start
+                            print(f"  ✗ {_run_lbl} failed: {_e}")
+
+                # ── benchmark scenarios ──────────────────────────────────────────
+                for _btag in BENCHMARK_SCENARIOS:
+                    _ic_bench = load_initial_conditions(
+                        ".",
+                        objectives=OBJECTIVES,
+                        region=REGION,
+                        ecosystem=ecosystem_for_loader,
+                        sample_fraction=SAMPLE_FRACTION,
+                        sample_seed=SAMPLE_SEED,
+                        aggregation_factor=AGGREGATION_FACTOR,
+                        condition_scenario=_btag,
+                    )
+                    for _seed in _pg_seeds:
+                        _run_lbl   = f"{_btag}_seed{_seed}" if _pg_use_seeds else _btag
+                        _item_start = time.perf_counter()
+                        _grid_config = {**run_config, "benchmark_scenario": _btag,
+                                        "condition_scenario": _btag,
+                                        "random_seed": _seed}
+                        _grid_done += 1
+                        print(f"  policy_grid [{_grid_done}/{_pg_total}]: {_run_lbl} (benchmark)")
+                        try:
+                            _bresults = run_optimization_instance(
+                                initial_conditions=_ic_bench,
+                                scenario_params=custom_scenario_params,
+                                pop_size=POP_SIZE,
+                                n_generations=N_GENERATIONS,
+                                save_results=True,
+                                verbose=True,
+                                n_jobs=N_JOBS,
+                                random_seed=_seed,
+                                use_repair=True,
+                                use_patch_approach=USE_PATCH_APPROACH,
+                                patch_size=PATCH_SIZE,
+                                patch_constraint_type=PATCH_CONSTRAINT_TYPE,
+                                pixel_tolerance=PIXEL_TOLERANCE,
+                                save_snapshots=SAVE_SNAPSHOTS,
+                                n_partitions=N_PARTITIONS,
+                                warm_seeding=WARM_SEEDING,
+                                run_label=_run_lbl,
+                                run_config=_grid_config,
+                            )
+                            _item_elapsed = time.perf_counter() - _item_start
+                            _grid_times[_run_lbl] = _item_elapsed
+                            if _bresults is not None:
+                                all_results[_run_lbl] = _bresults
+                                print(f"  ✓ {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
+                            else:
+                                print(f"  ✗ {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
+                        except Exception as _e:
+                            _grid_times[_run_lbl] = time.perf_counter() - _item_start
+                            print(f"  ✗ {_run_lbl} failed: {_e}")
+
+                _grid_elapsed   = time.perf_counter() - _grid_start
+                _grid_succeeded = len(all_results)
+                print(f"\n=== POLICY GRID COMPLETE ===")
+                print(f"  {_grid_succeeded}/{_pg_total} runs succeeded")
+                print(f"  Total time: {_grid_elapsed/60:.1f} min ({_grid_elapsed:.0f} s)")
+                if _grid_times:
+                    _avg = sum(_grid_times.values()) / len(_grid_times)
+                    print(f"  Average per run: {_avg/60:.1f} min ({_avg:.0f} s)")
+                print(f"  Results PKLs: results_files/res_<timestamp>_<label>.pkl")
             else:
                 initial_conditions = load_initial_conditions(
                     ".",
@@ -291,10 +455,10 @@ def _run():
     print(f"{'='*80}")
     _total_elapsed = time.perf_counter() - _script_start
 
-    if SCENARIO_MODE == "condition_grid":
-        # Grid mode has its own per-run summary printed inline; just show wall time.
-        grid_succeeded = sum(1 for k in all_results if "_seed" in k)
-        print(f"condition_grid: {grid_succeeded} runs stored in all_results")
+    if SCENARIO_MODE in ("condition_grid", "policy_grid"):
+        # Grid modes have their own per-run summary printed inline; just show wall time.
+        grid_succeeded = len(all_results)
+        print(f"{SCENARIO_MODE}: {grid_succeeded} runs stored in all_results")
         print(f"\nTotal wall-clock time: {_total_elapsed/60:.1f} min ({_total_elapsed:.0f} s)")
     else:
         successful_runs = len(all_results)
