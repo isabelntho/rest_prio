@@ -83,21 +83,24 @@ def build_repair_scores(initial_conditions, scenario_params):
     Higher score means keep or add this pixel when enforcing the count constraint.
     """
     elig = initial_conditions["eligible_mask"]
-
-    a0 = initial_conditions["abiotic_anomaly"][elig]
-    b0 = initial_conditions["biotic_anomaly"][elig]
+    n_elig = int(elig.sum())
 
     wshape = scenario_params.get("anomaly_weight_shape", "exponential")
     wscale = scenario_params.get("anomaly_weight_scale", 0.5)  # 0.5 spreads score signal across more mildly-degraded pixels vs. old default of 1.0
 
-    wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
-    wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
+    scores = np.zeros(n_elig, dtype=np.float64)
 
-    # keep consistent with your restoration parameterisation
-    sa = float(scenario_params.get("abiotic_effect", 0.0)) * wa
-    sb = float(scenario_params.get("biotic_effect", 0.0)) * wb
+    if "abiotic_anomaly" in initial_conditions:
+        a0 = initial_conditions["abiotic_anomaly"][elig]
+        wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
+        sa = float(scenario_params.get("abiotic_effect", 0.0)) * wa
+        scores = scores + sa
 
-    scores = sa + sb
+    if "biotic_anomaly" in initial_conditions:
+        b0 = initial_conditions["biotic_anomaly"][elig]
+        wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
+        sb = float(scenario_params.get("biotic_effect", 0.0)) * wb
+        scores = scores + sb
 
     # Optional: small cost penalty if cost exists in initial_conditions and scenario uses it
     if "implementation_cost" in initial_conditions:
@@ -119,15 +122,22 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
       - cost:    inverted, normalised cost  (lower cost → higher score)
     """
     elig = initial_conditions["eligible_mask"]
+    n_elig = int(elig.sum())
 
     wshape = scenario_params.get("anomaly_weight_shape", "exponential")
     wscale = scenario_params.get("anomaly_weight_scale", 0.5)
 
-    a0 = initial_conditions["abiotic_anomaly"][elig]
-    b0 = initial_conditions["biotic_anomaly"][elig]
+    if "abiotic_anomaly" in initial_conditions:
+        a0 = initial_conditions["abiotic_anomaly"][elig]
+        wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
+    else:
+        wa = np.zeros(n_elig, dtype=np.float64)
 
-    wa = anomaly_improvement_weight(a0, shape=wshape, scale=wscale)
-    wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
+    if "biotic_anomaly" in initial_conditions:
+        b0 = initial_conditions["biotic_anomaly"][elig]
+        wb = anomaly_improvement_weight(b0, shape=wshape, scale=wscale)
+    else:
+        wb = np.zeros(n_elig, dtype=np.float64)
 
     if "implementation_cost" in initial_conditions:
         c = initial_conditions["implementation_cost"][elig].astype(np.float64)
