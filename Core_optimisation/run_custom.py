@@ -22,7 +22,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "policy_seed_expansion"
+RUN_LABEL = "testing_es_objectives"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -45,7 +45,7 @@ CONDITION_SCENARIO = "global_all"
 # Seeds used by both condition_grid and policy_grid modes.
 #   List[int] — runs each scenario/variant once per seed; labels: <name>_seed<n>
 #   None       — runs each scenario/variant once using RANDOM_SEED; labels: <name>
-SEEDS = [100, 101, 102, 103, 104] # None
+SEEDS = [103, 104, 105, 106, 108, 109] #None #[100, 101, 102, 103, 104] # None
 
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
@@ -54,23 +54,34 @@ log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.l
 if log_path:
     print(f"Verbose output → {log_path}")
 
+#OBJECTIVES = ["restoration_potential", "cost", "landscape_context"]# # "landscape" is legacy, replaced by "connectivity"
 OBJECTIVES = ["abiotic", "biotic", "cost"]
+#["restoration_potential", "cost", "es_future_val", "es_future_robustness"] # test ES future value as an objective
 # Available objective names:
-#   "abiotic"      – minimise abiotic condition anomaly (restoration pixels)
-#   "biotic"       – minimise biotic condition anomaly (restoration pixels)
-#   "cost"         – minimise implementation cost
-#   "connectivity" – maximise connectivity gain (precomputed per pixel, conversion pixels)
-#                    Replaces the older "landscape" objective as the default landscape metric.
-#   "landscape"    – legacy landscape anomaly via SN-density recalculation (conversion pixels)
+#   "abiotic"               – minimise abiotic condition anomaly (restoration pixels)
+#   "biotic"                – minimise biotic condition anomaly (restoration pixels)
+#   "cost"                  – minimise implementation cost
+#   "connectivity"          – maximise connectivity gain (precomputed per pixel, conversion pixels)
+#                             Replaces the older "landscape" objective as the default landscape metric.
+#   "landscape"             – legacy landscape anomaly via SN-density recalculation (conversion pixels)
+#   "landscape_context"     – minimise mean abiotic anomaly of eligible neighbours within 500 m;
+#                             rewards selecting pixels whose surroundings are already in good condition
+#   "restoration_potential" – minimise mean of per-pixel abiotic + biotic baseline anomaly;
+#                             single combined ecological condition score (lower = more degraded = higher potential)
+#   "es_future_val"         – maximise total ES performance of selected pixels under future scenarios
+#                             (source: Mean_sum_of_change_ES.tif; higher sum = greater future ES gain)
+#   "es_future_robustness"  – minimise total ES instability of selected pixels under future scenarios
+#                             (source: Undesirable_deviation_sum_of_change_ES.tif; lower sum = more robust)
 SAMPLE_FRACTION = None
 SAMPLE_SEED = 42
-POP_SIZE = 50
+POP_SIZE = 92 #previously 50?
 N_GENERATIONS = 100
 N_JOBS = 12
 RANDOM_SEED = 100 #42
 N_SAMPLES_PER_PARAM = 3
-N_PARTITIONS = 12
+N_PARTITIONS = 12 #6 # for 4 objectives 6
 WARM_SEEDING = True
+#previously n partitions 12, pop size 50
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
 custom_scenario_params = {
@@ -204,6 +215,13 @@ def _run():
                 _grid_total = len(_condition_tags) * len(_seeds)
                 _grid_done = 0
                 _grid_times = {}
+                # One parent dir for the whole grid: r_inputs/{timestamp}_{RUN_LABEL}/
+                import os as _os
+                from datetime import datetime as _dt
+                _grid_ts = _dt.now().strftime('%Y%m%d_%H%M')
+                _grid_r_parent = _os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _os.makedirs(_grid_r_parent, exist_ok=True)
+                print(f"  Grid R export parent: {_grid_r_parent}/")
                 for _tag in _condition_tags:
                     for _seed in _seeds:
                         _run_label = f"{_tag}_seed{_seed}" if _use_seeds else _tag
@@ -240,6 +258,7 @@ def _run():
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_label,
                                 run_config=_grid_config,
+                                r_export_parent=_grid_r_parent,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_label] = _item_elapsed
@@ -283,8 +302,13 @@ def _run():
                 results    = None
                 _grid_start = time.perf_counter()
                 _grid_done  = 0
-                _grid_times = {}
-
+                _grid_times = {}                # One parent dir for the whole grid: r_inputs/{timestamp}_{RUN_LABEL}/
+                import os as _os
+                from datetime import datetime as _dt
+                _grid_ts = _dt.now().strftime('%Y%m%d_%H%M')
+                _pg_r_parent = _os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _os.makedirs(_pg_r_parent, exist_ok=True)
+                print(f"  Grid R export parent: {_pg_r_parent}/")
                 # ── policy variants ──────────────────────────────────────────────
                 _ic_policy = load_initial_conditions(
                     ".",
@@ -327,6 +351,7 @@ def _run():
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_lbl,
                                 run_config=_grid_config,
+                                r_export_parent=_pg_r_parent,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed
@@ -379,6 +404,7 @@ def _run():
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_lbl,
                                 run_config=_grid_config,
+                                r_export_parent=_pg_r_parent,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed

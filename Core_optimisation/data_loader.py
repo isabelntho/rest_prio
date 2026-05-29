@@ -356,6 +356,233 @@ def load_admin_regions(workspace_dir, region='Bern'):
         logger.error(f"Error loading admin shapefile: {e}")
         return None
 
+
+# =============================================================================
+# PLANNING UNIT LOADING
+# =============================================================================
+
+def load_planning_units(initial_conditions, mode='grid', unit_size_px=20,
+                        workspace_dir=None, region='Bern', admin_data=None,
+                        max_unit_pixels=None):
+    """
+    Build planning unit mappings from either a regular pixel grid or admin boundaries.
+
+    Planning units are coarse decision entities (much larger than patches).  When
+    a unit is selected during optimisation ALL restoration-eligible AND conversion-
+    eligible pixels within it are activated.
+
+    Parameters
+    ----------
+    initial_conditions : dict
+        Standard initial_conditions dict (must be fully populated by
+        ``load_initial_conditions``).
+    mode : {'grid', 'admin'}
+        'grid'  – regular non-overlapping blocks of ``unit_size_px × unit_size_px`` pixels.
+        'admin' – one unit per non-empty administrative boundary polygon.
+    unit_size_px : int
+        Side-length in pixels for grid mode (e.g. 20 → 20×20 px = 2 km at 100 m resolution).
+        Ignored in admin mode.
+    workspace_dir : str, optional
+        Workspace directory; required for admin mode when ``admin_data`` is not
+        already provided.
+    region : str
+        Region identifier passed to ``load_admin_regions`` when loading admin data
+        automatically ('Bern' or 'CH').  Ignored when ``admin_data`` is supplied.
+    admin_data : dict, optional
+        Pre-loaded admin data dict (from ``load_admin_regions``).  When supplied,
+        ``workspace_dir`` and ``region`` are not used.
+    max_unit_pixels : int, optional
+        Admin mode only.  Units with more eligible pixels than this threshold are
+        split into two halves along their longer axis.  None = no splitting.
+
+    Returns
+    -------
+    dict
+        Planning unit mapping with keys:
+        - 'n_units'                     : int
+        - 'unit_ids'                    : list[int]
+        - 'unit_names'                  : list[str]
+        - 'unit_mode'                   : 'grid' or 'admin'
+        - 'unit_size_px'                : int or None
+        - 'unit_to_restoration_pixels'  : dict[int, np.ndarray]  (eligible index space)
+        - 'unit_to_conversion_pixels'   : dict[int, np.ndarray]  (eligible index space)
+        - 'unit_pixel_counts'           : np.ndarray  (restoration + conversion per unit)
+        - 'unit_restoration_counts'     : np.ndarray
+        - 'unit_conversion_counts'      : np.ndarray
+    """
+    shape = initial_conditions['shape']
+    restoration_eligible_indices = initial_conditions['restoration_eligible_indices']
+    conversion_eligible_indices  = initial_conditions['conversion_eligible_indices']
+
+    # Build fast lookup: global pixel index → position in eligible array
+    rest_global_to_elig = {int(g): e for e, g in enumerate(restoration_eligible_indices)}
+    conv_global_to_elig = {int(g): e for e, g in enumerate(conversion_eligible_indices)}
+
+    if mode == 'grid':
+        unit_mappings = _define_grid_units(
+            shape, unit_size_px, rest_global_to_elig, conv_global_to_elig
+        )
+        logger.info(
+            f"Grid planning units: {unit_mappings['n_units']} units "
+            f"({unit_size_px}×{unit_size_px} px each)"
+        )
+
+    elif mode == 'admin':
+        # Load admin data if not supplied
+        if admin_data is None:
+            if workspace_dir is None:
+                raise ValueError("load_planning_units admin mode: supply admin_data or workspace_dir")
+            admin_data = load_admin_regions(workspace_dir, region)
+            if admin_data is None:
+                raise RuntimeError(
+                    f"load_planning_units: could not load admin regions for region='{region}'. "
+                    "Check that the admin shapefiles are accessible."
+                )
+        unit_mappings = _define_admin_units(
+            shape, initial_conditions['transform'], admin_data,
+            rest_global_to_elig, conv_global_to_elig, max_unit_pixels
+        )
+        logger.info(
+            f"Admin planning units: {unit_mappings['n_units']} units "
+            f"from {admin_data['n_regions']} regions"
+        )
+    else:
+        raise ValueError(f"load_planning_units: unknown mode '{mode}'. Use 'grid' or 'admin'.")
+
+    return unit_mappings
+
+
+def _define_grid_units(shape, unit_size_px, rest_global_to_elig, conv_global_to_elig):
+    """Build planning units from a regular pixel grid."""
+    n_rows, n_cols = shape
+    n_unit_rows = int(np.ceil(n_rows / unit_size_px))
+    n_unit_cols = int(np.ceil(n_cols / unit_size_px))
+
+    unit_to_rest = {}
+    unit_to_conv = {}
+    unit_names   = []
+    uid = 0
+
+    for i in range(n_unit_rows):
+        for j in range(n_unit_cols):
+            r0, r1 = i * unit_size_px, min((i + 1) * unit_size_px, n_rows)
+            c0, c1 = j * unit_size_px, min((j + 1) * unit_size_px, n_cols)
+
+            rows_idx = np.arange(r0, r1)
+            cols_idx = np.arange(c0, c1)
+            rr, cc   = np.meshgrid(rows_idx, cols_idx, indexing='ij')
+            global_px = rr.ravel() * n_cols + cc.ravel()
+
+            re = np.array([rest_global_to_elig[g] for g in global_px if g in rest_global_to_elig],
+                          dtype=np.int64)
+            ce = np.array([conv_global_to_elig[g] for g in global_px if g in conv_global_to_elig],
+                          dtype=np.int64)
+
+            if re.size == 0 and ce.size == 0:
+                continue
+
+            unit_to_rest[uid] = re
+            unit_to_conv[uid] = ce
+            unit_names.append(f"grid_{i}_{j}")
+            uid += 1
+
+    return _assemble_unit_dict(uid, unit_names, unit_to_rest, unit_to_conv, 'grid', unit_size_px)
+
+
+def _define_admin_units(shape, transform, admin_data,
+                        rest_global_to_elig, conv_global_to_elig,
+                        max_unit_pixels):
+    """Build planning units from administrative boundary polygons."""
+    from rasterio.features import rasterize as rio_rasterize
+
+    gdf        = admin_data['gdf']
+    region_col = admin_data['region_column']
+    n_cols     = shape[1]
+
+    unit_to_rest = {}
+    unit_to_conv = {}
+    unit_names   = []
+    uid = 0
+
+    for region_name in admin_data['unique_regions']:
+        region_geom = gdf[gdf[region_col] == region_name]
+        region_mask = rio_rasterize(
+            region_geom.geometry,
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            default_value=1,
+            dtype=np.uint8,
+        ).astype(bool)
+
+        global_flat = np.where(region_mask.flatten())[0]
+        re = np.array([rest_global_to_elig[g] for g in global_flat if g in rest_global_to_elig],
+                      dtype=np.int64)
+        ce = np.array([conv_global_to_elig[g] for g in global_flat if g in conv_global_to_elig],
+                      dtype=np.int64)
+
+        if re.size == 0 and ce.size == 0:
+            continue
+
+        total_px = re.size + ce.size
+
+        if max_unit_pixels is not None and total_px > max_unit_pixels:
+            # Split along the longer axis of the bounding box
+            rows_in, cols_in = np.where(region_mask)
+            r_range = int(rows_in.max() - rows_in.min()) + 1
+            c_range = int(cols_in.max() - cols_in.min()) + 1
+            flat_idx = np.arange(region_mask.size)
+            if r_range >= c_range:
+                mid = int(rows_in.min()) + r_range // 2
+                splits_mask = [
+                    region_mask.flatten() & (flat_idx // n_cols < mid),
+                    region_mask.flatten() & (flat_idx // n_cols >= mid),
+                ]
+            else:
+                mid = int(cols_in.min()) + c_range // 2
+                splits_mask = [
+                    region_mask.flatten() & (flat_idx % n_cols < mid),
+                    region_mask.flatten() & (flat_idx % n_cols >= mid),
+                ]
+            for part_i, pmask in enumerate(splits_mask):
+                gpix = np.where(pmask)[0]
+                re_p = np.array([rest_global_to_elig[g] for g in gpix if g in rest_global_to_elig],
+                                dtype=np.int64)
+                ce_p = np.array([conv_global_to_elig[g] for g in gpix if g in conv_global_to_elig],
+                                dtype=np.int64)
+                if re_p.size == 0 and ce_p.size == 0:
+                    continue
+                unit_to_rest[uid] = re_p
+                unit_to_conv[uid] = ce_p
+                unit_names.append(f"{region_name}_part{part_i}")
+                uid += 1
+        else:
+            unit_to_rest[uid] = re
+            unit_to_conv[uid] = ce
+            unit_names.append(str(region_name))
+            uid += 1
+
+    return _assemble_unit_dict(uid, unit_names, unit_to_rest, unit_to_conv, 'admin', None)
+
+
+def _assemble_unit_dict(n_units, unit_names, unit_to_rest, unit_to_conv, mode, unit_size_px):
+    """Assemble the canonical planning unit mapping dict."""
+    rest_counts = np.array([len(unit_to_rest.get(i, [])) for i in range(n_units)], dtype=np.int64)
+    conv_counts = np.array([len(unit_to_conv.get(i, [])) for i in range(n_units)], dtype=np.int64)
+    return {
+        'n_units'                    : n_units,
+        'unit_ids'                   : list(range(n_units)),
+        'unit_names'                 : unit_names,
+        'unit_mode'                  : mode,
+        'unit_size_px'               : unit_size_px,
+        'unit_to_restoration_pixels' : unit_to_rest,
+        'unit_to_conversion_pixels'  : unit_to_conv,
+        'unit_pixel_counts'          : rest_counts + conv_counts,
+        'unit_restoration_counts'    : rest_counts,
+        'unit_conversion_counts'     : conv_counts,
+    }
+
+
 # =============================================================================
 # MAIN DATA LOADING FUNCTION
 # =============================================================================
@@ -394,8 +621,26 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         'biotic':  f'inputs/anomaly_scenarios/biotic_{condition_scenario}.tif',
         'landscape': 'inputs/sn_dens.tif',
         'connectivity': None,  # Computed in-memory from landscape LULC; no file required
+        # landscape_context / restoration_potential: load from pre-computed file only for the
+        # baseline scenario ('global_all'), because the pre-computed files are derived from
+        # the global_all abiotic/biotic rasters.  Any other condition_scenario must force
+        # in-memory computation from the scenario-specific abiotic/biotic rasters (None → computed).
+        'landscape_context': (
+            'inputs/landscape_context.tif'
+            if (condition_scenario == 'global_all'
+                and os.path.exists(os.path.join(workspace_dir, 'inputs/landscape_context.tif')))
+            else None
+        ),
+        'restoration_potential': (
+            'inputs/restoration_potential.tif'
+            if (condition_scenario == 'global_all'
+                and os.path.exists(os.path.join(workspace_dir, 'inputs/restoration_potential.tif')))
+            else None
+        ),
         'cost': 'inputs/implementation_cost_corrected.tif',
-        'population_proximity': 'inputs/population_proximity.tif'
+        'population_proximity': 'inputs/population_proximity.tif',
+        'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',
+        'es_future_robustness': 'robustness/blce-robustness-data-archive/Undesirable_deviation_sum_of_change_ES.tif',
     }
     
     # Use all objectives if none specified
@@ -415,11 +660,26 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 computed_objectives.add(obj)
             elif obj == 'cost':
                 data_files['implementation_cost'] = os.path.join(workspace_dir, filename)
+            elif obj in ('landscape_context', 'restoration_potential', 'es_future_val', 'es_future_robustness'):
+                data_files[obj] = os.path.join(workspace_dir, filename)
             else:
                 data_files[f'{obj}_anomaly'] = os.path.join(workspace_dir, filename)
         else:
             raise ValueError(f"Unknown objective: {obj}. Available: {list(all_objectives.keys())}")
-    
+
+    # Auto-load abiotic/biotic as data dependencies for computed objectives that require them,
+    # even when they are not standalone optimisation objectives.
+    _needs_abiotic_biotic = {'landscape_context', 'restoration_potential'}
+    _dependency_keys = set()  # keys loaded as data-only, not as objectives
+    if computed_objectives & _needs_abiotic_biotic:
+        for _dep, _dep_key in [('abiotic', 'abiotic_anomaly'), ('biotic', 'biotic_anomaly')]:
+            if _dep_key not in data_files and _dep not in objectives:
+                _dep_path = os.path.join(workspace_dir, all_objectives[_dep])
+                if os.path.exists(_dep_path):
+                    data_files[_dep_key] = _dep_path
+                    _dependency_keys.add(_dep_key)
+                    logger.info(f"Auto-loading {_dep_key} as dependency for computed objectives")
+
     initial_conditions = {}
     
     # Check if all required files exist first
@@ -474,8 +734,9 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 initial_conditions['region'] = region
                 first_raster = False
             else:
-                # Skip strict validation for landscape_anomaly since it has special resampling handling
-                if objective != 'landscape_anomaly':
+                # Objectives that may have a slightly different extent and are resampled below.
+                _resampled_objectives = {'landscape_anomaly', 'es_future_val', 'es_future_robustness'}
+                if objective not in _resampled_objectives:
                     if src.crs != ref['crs']:
                         raise ValueError(
                             f"CRS mismatch for {objective}. "
@@ -497,8 +758,11 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                             f"Expected {ref['bounds']}, got {src.bounds} ({file_path})"
                         )
                 else:
-                    # For landscape_anomaly, just log the difference - will be handled later with resampling
-                    logger.info("landscape_anomaly has different specs - will resample to match reference")
+                    if data.shape != ref['shape'] or src.transform != ref['transform']:
+                        logger.info(
+                            f"{objective} has different specs "
+                            f"(shape {data.shape} vs {ref['shape']}) — will resample to match reference"
+                        )
             # Track NaN locations BEFORE replacement
             nan_mask = np.isnan(data)
             nan_masks[objective] = nan_mask
@@ -511,7 +775,34 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 data = np.nan_to_num(data, nan=0.0)
             else:
                 logger.info(f"Loaded {objective}: {data.shape}")
-                
+
+            # Resample ES future rasters to the reference grid if their shape/transform differs.
+            if objective in ('es_future_val', 'es_future_robustness') and data.shape != ref['shape']:
+                try:
+                    from rasterio.warp import reproject, Resampling as _Resampling
+                    _resampled = np.empty(ref['shape'], dtype=np.float64)
+                    reproject(
+                        source=rio.band(src, 1),
+                        destination=_resampled,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=ref['transform'],
+                        dst_crs=ref['crs'],
+                        resampling=_Resampling.bilinear,
+                    )
+                    nan_masks[objective] = np.isnan(_resampled)
+                    data = np.nan_to_num(_resampled, nan=0.0)
+                    logger.info(
+                        f"Resampled {objective} to {data.shape} "
+                        f"({int(nan_masks[objective].sum())} NaN pixels masked from eligibility)"
+                    )
+                except Exception as _resamp_err:
+                    raise ValueError(
+                        f"Failed to resample {objective} to reference grid: {_resamp_err}\n"
+                        f"Source: shape={data.shape}, crs={src.crs}, transform={src.transform}\n"
+                        f"Reference: shape={ref['shape']}, crs={ref['crs']}, transform={ref['transform']}"
+                    )
+
             initial_conditions[objective] = data
     
     # Load LULC rasters - separate datasets for ecosystem masking and landscape calculations
@@ -898,12 +1189,144 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                         f"1d slice length={len(initial_conditions['connectivity_gain_1d'])}")
         else:
             logger.warning("'connectivity' objective requested but landscape_lulc_data not available; skipping.")
-    
+
+    # Compute landscape_context if requested.
+    # For each restoration-eligible pixel: equal-weight mean of the focal-mean abiotic anomaly
+    # and focal-mean biotic anomaly of eligible neighbours within a focal radius
+    # (default 500 m = 5 px at 100 m resolution), excluding the pixel itself.
+    # Lower value → neighbours in better combined condition → more supportive landscape context.
+    if 'landscape_context' in computed_objectives:
+        _has_abiotic = 'abiotic_anomaly' in initial_conditions
+        _has_biotic  = 'biotic_anomaly'  in initial_conditions
+        if _has_abiotic or _has_biotic:
+            from scipy.ndimage import uniform_filter
+            _radius_px   = 5  # 500 m at 100 m resolution
+            _kernel_size = 2 * _radius_px + 1  # 11 × 11 box approximation
+            _elig_2d     = initial_conditions['restoration_eligible_mask']
+            _count_elig  = _elig_2d.astype(np.float64)
+            _cnt_focal   = uniform_filter(_count_elig, size=_kernel_size, mode='constant') * (_kernel_size ** 2)
+            _cnt_neigh   = np.maximum(_cnt_focal - 1.0, 0.0)  # exclude self
+
+            def _focal_mean_neighbours(anom_2d):
+                """Focal mean over eligible neighbours, excluding the pixel itself."""
+                _anom_elig = np.where(_elig_2d, anom_2d, 0.0).astype(np.float64)
+                _sum_focal = (uniform_filter(_anom_elig, size=_kernel_size, mode='constant')
+                              * (_kernel_size ** 2))
+                _sum_focal = _sum_focal - anom_2d  # subtract self
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    return np.where(_cnt_neigh > 0, _sum_focal / _cnt_neigh, 0.0)
+
+            _component_maps = []
+            if _has_abiotic:
+                _component_maps.append(_focal_mean_neighbours(
+                    initial_conditions['abiotic_anomaly'].copy()))
+            if _has_biotic:
+                _component_maps.append(_focal_mean_neighbours(
+                    initial_conditions['biotic_anomaly'].copy()))
+
+            # Equal-weight mean across available components
+            _ctx_2d = np.mean(np.stack(_component_maps, axis=0), axis=0)
+
+            initial_conditions['landscape_context'] = _ctx_2d
+            flat_ctx = _ctx_2d.flatten()
+            initial_conditions['landscape_context_1d'] = flat_ctx[restoration_eligible_indices].astype(np.float64)
+            logger.info(
+                f"landscape_context computed (components={len(_component_maps)}): "
+                f"radius={_radius_px}px, "
+                f"1d length={len(initial_conditions['landscape_context_1d'])}, "
+                f"mean={initial_conditions['landscape_context_1d'].mean():.4f}"
+            )
+        else:
+            logger.warning("'landscape_context' objective requested but neither abiotic_anomaly nor biotic_anomaly is available; skipping.")
+
+    # Build 1D slice when landscape_context was loaded from a pre-computed file.
+    if 'landscape_context' in initial_conditions and 'landscape_context_1d' not in initial_conditions:
+        flat_ctx = initial_conditions['landscape_context'].flatten()
+        initial_conditions['landscape_context_1d'] = flat_ctx[restoration_eligible_indices].astype(np.float64)
+        logger.info(
+            f"landscape_context loaded from file: "
+            f"1d length={len(initial_conditions['landscape_context_1d'])}, "
+            f"mean={initial_conditions['landscape_context_1d'].mean():.4f}"
+        )
+
+    # Compute restoration_potential if requested.
+    # For each restoration-eligible pixel: equal-weight mean of abiotic and biotic baseline
+    # anomaly values at that pixel (static — no neighbourhood, no restoration effect).
+    # Lower value → pixel more degraded on both dimensions → higher restoration potential.
+    # Minimised directly: sum over selected pixels; more negative = selecting more degraded pixels.
+    if 'restoration_potential' in computed_objectives:
+        _rp_has_abiotic = 'abiotic_anomaly' in initial_conditions
+        _rp_has_biotic  = 'biotic_anomaly'  in initial_conditions
+        if _rp_has_abiotic and _rp_has_biotic:
+            _rp_2d = (initial_conditions['abiotic_anomaly'].astype(np.float64) +
+                      initial_conditions['biotic_anomaly'].astype(np.float64)) / 2.0
+            _components = 2
+        elif _rp_has_abiotic:
+            logger.warning("'restoration_potential' objective: biotic_anomaly not available; using abiotic only.")
+            _rp_2d = initial_conditions['abiotic_anomaly'].astype(np.float64)
+            _components = 1
+        elif _rp_has_biotic:
+            logger.warning("'restoration_potential' objective: abiotic_anomaly not available; using biotic only.")
+            _rp_2d = initial_conditions['biotic_anomaly'].astype(np.float64)
+            _components = 1
+        else:
+            logger.warning("'restoration_potential' objective requested but neither abiotic_anomaly nor biotic_anomaly is available; skipping.")
+            _rp_2d = None
+
+        if _rp_2d is not None:
+            initial_conditions['restoration_potential'] = _rp_2d
+            _flat_rp = _rp_2d.flatten()
+            initial_conditions['restoration_potential_1d'] = _flat_rp[restoration_eligible_indices].astype(np.float64)
+            logger.info(
+                f"restoration_potential computed (components={_components}): "
+                f"1d length={len(initial_conditions['restoration_potential_1d'])}, "
+                f"mean={initial_conditions['restoration_potential_1d'].mean():.4f}"
+            )
+
+    # Build 1D slice when restoration_potential was loaded from a pre-computed file.
+    if 'restoration_potential' in initial_conditions and 'restoration_potential_1d' not in initial_conditions:
+        _flat_rp = initial_conditions['restoration_potential'].flatten()
+        initial_conditions['restoration_potential_1d'] = _flat_rp[restoration_eligible_indices].astype(np.float64)
+        logger.info(
+            f"restoration_potential loaded from file: "
+            f"1d length={len(initial_conditions['restoration_potential_1d'])}, "
+            f"mean={initial_conditions['restoration_potential_1d'].mean():.4f}"
+        )
+
+    # Build 1D slices for ES future objectives loaded from robustness raster files.
+    # NaN pixels (outside BLCE study area) are excluded from restoration_eligible_indices
+    # via the nan_masks mechanism, so only valid-data pixels appear in the 1D slice.
+    if 'es_future_val' in initial_conditions and 'es_future_val_1d' not in initial_conditions:
+        _flat_esv = np.nan_to_num(initial_conditions['es_future_val'].flatten(), nan=0.0)
+        initial_conditions['es_future_val_1d'] = _flat_esv[restoration_eligible_indices].astype(np.float64)
+        _nan_in_elig = int(np.sum(initial_conditions['es_future_val_1d'] == 0.0))
+        logger.info(
+            f"es_future_val loaded from file: "
+            f"1d length={len(initial_conditions['es_future_val_1d'])}, "
+            f"mean={initial_conditions['es_future_val_1d'].mean():.4f}, "
+            f"zero/NaN-filled in eligible area={_nan_in_elig}"
+        )
+
+    if 'es_future_robustness' in initial_conditions and 'es_future_robustness_1d' not in initial_conditions:
+        _flat_esr = np.nan_to_num(initial_conditions['es_future_robustness'].flatten(), nan=0.0)
+        initial_conditions['es_future_robustness_1d'] = _flat_esr[restoration_eligible_indices].astype(np.float64)
+        _nan_in_elig_r = int(np.sum(initial_conditions['es_future_robustness_1d'] == 0.0))
+        logger.info(
+            f"es_future_robustness loaded from file: "
+            f"1d length={len(initial_conditions['es_future_robustness_1d'])}, "
+            f"mean={initial_conditions['es_future_robustness_1d'].mean():.4f}, "
+            f"zero/NaN-filled in eligible area={_nan_in_elig_r}"
+        )
+
     initial_conditions['sample_info'] = {
         'sample_fraction': sample_fraction,
         'sample_seed': sample_seed,
         'is_sampled': sample_fraction is not None and 0 < sample_fraction < 1
     }
+
+    # Record which keys were loaded as data-only dependencies (not optimisation objectives).
+    # RestorationProblem uses this to skip registering them as objectives.
+    initial_conditions['_dependency_keys'] = _dependency_keys
     
     total_pixels = shape[0] * shape[1]
     #print(f"✓ Eligibility masks created:")

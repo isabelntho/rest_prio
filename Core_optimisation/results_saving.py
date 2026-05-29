@@ -711,7 +711,7 @@ def save_results_with_reports(problem_or_results, res=None, initial_conditions=N
                                         pop_size=None, n_generations=None, total_time=None, hv_value=None,
                                         ecosystem='unknown', region='unknown', experiment_id=None, random_seed=None,
                                         output_dir=".", verbose=True, include_reports=True, include_debug=False,
-                                        run_label=""):
+                                        run_label="", r_export_parent=None):
     """
      Save optimization results with comprehensive reporting.
 
@@ -752,6 +752,7 @@ def save_results_with_reports(problem_or_results, res=None, initial_conditions=N
             include_reports=include_reports,
             include_debug=include_debug,
             run_label=run_label,
+            r_export_parent=r_export_parent,
         )
 
     problem = problem_or_results
@@ -905,7 +906,7 @@ def save_parameter_summary(output_dir=".", n_samples_per_param=3, random_seed=42
     
     return summary_filename
 
-def save_scenario_results(results, output_dir=".", verbose=True, include_reports=True, include_debug=False, run_label=""):
+def save_scenario_results(results, output_dir=".", verbose=True, include_reports=True, include_debug=False, run_label="", r_export_parent=None):
     """
     Save single scenario optimization results to files with optional comprehensive reporting.
     
@@ -1049,16 +1050,20 @@ def save_scenario_results(results, output_dir=".", verbose=True, include_reports
     _append_to_registry(registry_entry, output_dir=output_dir)
 
     # ── Auto-export to R-readable format ──────────────────────────────────────
-    # Writes r_inputs/<run_label>/ alongside the pickle so results are
-    # immediately available to the QMD analysis document.
+    # If r_export_parent is given (grid mode), write to r_export_parent/run_label/
+    # with no timestamp — the parent already carries the grid-level timestamp.
+    # Otherwise (single run) write to r_inputs/{timestamp}_{run_label}/.
     try:
         from export_to_r import export_results as _export_to_r
-        r_label   = run_label_slug if run_label_slug else registry_entry["run_id"]
-        r_out_dir = os.path.join(output_dir, "r_inputs", r_label)
+        _base = run_label_slug if run_label_slug else registry_entry["run_id"]
+        if r_export_parent is not None:
+            r_out_dir = os.path.join(r_export_parent, _base)
+        else:
+            r_out_dir = os.path.join(output_dir, "r_inputs", f"{run_timestamp}_{_base}")
         _export_to_r(results_filename, output_dir=r_out_dir, nondom_pixels_only=True)
         generated_files["r_export_dir"] = r_out_dir
         if verbose:
-            print(f"✓ R export written to: {r_out_dir}")
+            print(f"✓ R export → {os.path.relpath(r_out_dir, output_dir)}/")
     except Exception as e:
         if verbose:
             print(f"  Warning: R export failed: {e}")

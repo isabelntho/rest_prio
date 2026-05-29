@@ -114,12 +114,15 @@ def build_repair_scores(initial_conditions, scenario_params):
 def build_per_objective_repair_scores(initial_conditions, scenario_params):
     """Per-objective pixel scores for direction-aware patch repair.
 
-    Returns a dict with keys 'abiotic', 'biotic', 'cost'.  Each value is a
-    1-D float64 array over eligible pixels, normalized to [0, 1].  Higher
-    score always means "prefer this pixel for the corresponding objective":
-      - abiotic: degradation weight (same as composite abiotic term)
-      - biotic:  degradation weight (same as composite biotic term)
-      - cost:    inverted, normalised cost  (lower cost → higher score)
+    Returns a dict with keys 'abiotic', 'biotic', 'cost', and optionally
+    'landscape_context'.  Each value is a 1-D float64 array over eligible
+    pixels, normalized to [0, 1].  Higher score always means "prefer this
+    pixel for the corresponding objective":
+      - abiotic:           degradation weight (same as composite abiotic term)
+      - biotic:            degradation weight (same as composite biotic term)
+      - cost:              inverted, normalised cost  (lower cost → higher score)
+      - landscape_context: inverted context score (low neighbour anomaly → high
+                           score, i.e. neighbours already in good condition)
     """
     elig = initial_conditions["eligible_mask"]
     n_elig = int(elig.sum())
@@ -150,11 +153,33 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
     else:
         cost_score = np.full(len(wa), 0.5, dtype=np.float64)
 
-    return {
+    scores = {
         "abiotic": np.asarray(wa, dtype=np.float64),
         "biotic": np.asarray(wb, dtype=np.float64),
         "cost": cost_score,
     }
+
+    if "landscape_context_1d" in initial_conditions:
+        ctx = initial_conditions["landscape_context_1d"].astype(np.float64)
+        # Invert: lower context anomaly (better surroundings) → higher repair score
+        ctx_min, ctx_max = np.nanmin(ctx), np.nanmax(ctx)
+        span = ctx_max - ctx_min
+        if span > 1e-12:
+            scores["landscape_context"] = 1.0 - (ctx - ctx_min) / span
+        else:
+            scores["landscape_context"] = np.full(len(ctx), 0.5, dtype=np.float64)
+
+    if "restoration_potential_1d" in initial_conditions:
+        rp = initial_conditions["restoration_potential_1d"].astype(np.float64)
+        # Invert: lower restoration_potential (more degraded) → higher repair score
+        rp_min, rp_max = np.nanmin(rp), np.nanmax(rp)
+        span = rp_max - rp_min
+        if span > 1e-12:
+            scores["restoration_potential"] = 1.0 - (rp - rp_min) / span
+        else:
+            scores["restoration_potential"] = np.full(len(rp), 0.5, dtype=np.float64)
+
+    return scores
 
 
 # --- Patch Approach Initialization ---
@@ -467,16 +492,25 @@ class RestorationProblem(ElementwiseProblem):
         
         # Determine which objectives are available
         self.objective_names = []
-        if 'abiotic_anomaly' in initial_conditions:
+        _dep_only = set(initial_conditions.get('_dependency_keys', set()))
+        if 'abiotic_anomaly' in initial_conditions and 'abiotic_anomaly' not in _dep_only:
             self.objective_names.append('abiotic_anomaly')
-        if 'biotic_anomaly' in initial_conditions:
+        if 'biotic_anomaly' in initial_conditions and 'biotic_anomaly' not in _dep_only:
             self.objective_names.append('biotic_anomaly')
         if 'landscape_anomaly' in initial_conditions:
             self.objective_names.append('landscape_anomaly')
         if 'connectivity_gain_1d' in initial_conditions:
             self.objective_names.append('connectivity_gain')
+        if 'landscape_context_1d' in initial_conditions:
+            self.objective_names.append('landscape_context')
+        if 'restoration_potential_1d' in initial_conditions:
+            self.objective_names.append('restoration_potential')
         if 'implementation_cost' in initial_conditions:
             self.objective_names.append('implementation_cost')
+        if 'es_future_val_1d' in initial_conditions:
+            self.objective_names.append('es_future_val')
+        if 'es_future_robustness_1d' in initial_conditions:
+            self.objective_names.append('es_future_robustness')
         
         n_objectives = len(self.objective_names)
         if n_objectives == 0:
@@ -551,12 +585,25 @@ class RestorationProblem(ElementwiseProblem):
             elif obj_name == 'connectivity_gain':
                 cg = self.initial_conditions['connectivity_gain_1d']
                 scale = float(np.nansum(np.abs(cg)))
+            elif obj_name == 'landscape_context':
+                ctx = self.initial_conditions['landscape_context_1d']
+                # Scale = sum of absolute values over all restoration-eligible pixels
+                scale = float(np.nansum(np.abs(ctx)))
+            elif obj_name == 'restoration_potential':
+                rp = self.initial_conditions['restoration_potential_1d']
+                scale = float(np.nansum(np.abs(rp)))
             elif obj_name == 'implementation_cost':
                 c = self.initial_conditions['implementation_cost']
                 if rest_mask is not None and conv_mask is not None:
                     scale = float(np.nansum(np.abs(c[rest_mask])) + np.nansum(np.abs(c[conv_mask])))
                 else:
                     scale = float(np.nansum(np.abs(c)))
+            elif obj_name == 'es_future_val':
+                esv = self.initial_conditions['es_future_val_1d']
+                scale = float(np.nansum(np.abs(esv)))
+            elif obj_name == 'es_future_robustness':
+                esr = self.initial_conditions['es_future_robustness_1d']
+                scale = float(np.nansum(np.abs(esr)))
             else:
                 scale = 1.0
 
@@ -609,6 +656,29 @@ class RestorationProblem(ElementwiseProblem):
                 # Negated: minimisation problem → maximise gain ↔ minimise negative gain.
                 cg = self.initial_conditions['connectivity_gain_1d']
                 obj_value = -float(np.sum(cg[x_convert == 1]))
+            elif obj_name == 'landscape_context':
+                # Precomputed per-pixel focal-mean neighbour anomaly; sum over restored pixels.
+                # Lower value = neighbours in better condition = more supportive context.
+                # Minimised directly (no negation needed).
+                ctx = self.initial_conditions['landscape_context_1d']
+                obj_value = -float(np.sum(ctx[x_restore == 1]))
+            elif obj_name == 'restoration_potential':
+                # Precomputed per-pixel mean of abiotic and biotic baseline anomaly.
+                # Lower value = pixel more degraded on both dimensions = higher potential.
+                # Minimised directly: selecting more degraded pixels gives a more negative sum.
+                rp = self.initial_conditions['restoration_potential_1d']
+                obj_value = float(np.sum(rp[x_restore == 1]))
+            elif obj_name == 'es_future_val':
+                # Sum of per-pixel ES performance over selected restoration pixels.
+                # Higher = greater total future ES gain → maximise (negate for pymoo minimisation).
+                # Sum (not mean) is consistent with other objectives and avoids concentration artefacts.
+                esv = self.initial_conditions['es_future_val_1d']
+                obj_value = -float(np.sum(esv[x_restore == 1]))
+            elif obj_name == 'es_future_robustness':
+                # Sum of per-pixel ES instability over selected restoration pixels.
+                # Lower = less total undesirable deviation = more robust → minimise directly.
+                esr = self.initial_conditions['es_future_robustness_1d']
+                obj_value = float(np.sum(esr[x_restore == 1]))
             elif obj_name == 'implementation_cost':
                 obj_value = updated_conditions[obj_name]
             else:
@@ -1144,15 +1214,29 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         # vectors, so cost-axis individuals get repaired toward cheap patches,
         # abiotic-axis individuals toward high-abiotic patches, etc.
         per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
+        # Map internal objective names → score keys used by build_per_objective_repair_scores.
+        # This ensures per_obj_patch_scores matches the actual objectives in the run.
+        _obj_to_score_key = {
+            'abiotic_anomaly':     'abiotic',
+            'biotic_anomaly':      'biotic',
+            'implementation_cost': 'cost',
+            'landscape_context':   'landscape_context',
+            'restoration_potential': 'restoration_potential',
+        }
+        _score_keys = [
+            _obj_to_score_key[obj]
+            for obj in problem.objective_names
+            if obj in _obj_to_score_key and _obj_to_score_key[obj] in per_obj_pixel_scores
+        ]
         per_obj_patch_scores = np.stack([
             aggregate_patch_scores_from_pixel_scores(
                 patch_mappings=initial_conditions['patch_mappings'],
-                restoration_pixel_scores=per_obj_pixel_scores[obj],
+                restoration_pixel_scores=per_obj_pixel_scores[key],
                 conversion_pixel_scores=None,
                 mode='mean',
             )
-            for obj in ["abiotic", "biotic", "cost"]
-        ], axis=0)  # shape (3, n_patches)
+            for key in _score_keys
+        ], axis=0)  # shape (n_objectives, n_patches)
 
         repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=12)
 
@@ -1255,7 +1339,8 @@ def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8):
 def _package_results(result, problem, initial_conditions, scenario_params, callback,
                      use_patch_approach, pop_size, n_generations, hv_patience,
                      hv_min_improvement, save_results, output_dir, verbose,
-                     save_snapshots=False, run_label="", run_config=None):
+                     save_snapshots=False, run_label="", run_config=None,
+                     r_export_parent=None):
     """
     Assemble the optimization results dict and optionally save to disk.
 
@@ -1392,7 +1477,7 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
                     print(f"Warning: Could not assemble X_history: {e}")
 
     if save_results:
-        save_results_with_reports(optimization_results, output_dir=output_dir, verbose=verbose, run_label=run_label)
+        save_results_with_reports(optimization_results, output_dir=output_dir, verbose=verbose, run_label=run_label, r_export_parent=r_export_parent)
 
     return optimization_results
 
@@ -1460,7 +1545,8 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
                                      output_dir=".", save_snapshots=False,
                                      run_label="", run_config=None,
-                                     n_partitions=8, warm_seeding=True):
+                                     n_partitions=8, warm_seeding=True,
+                                     r_export_parent=None):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
@@ -1616,6 +1702,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                 hv_min_improvement, save_results, output_dir, verbose,
                 save_snapshots=save_snapshots,
                 run_label=run_label, run_config=run_config,
+                r_export_parent=r_export_parent,
             )
         else:
             if verbose:

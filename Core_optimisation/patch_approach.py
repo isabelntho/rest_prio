@@ -692,7 +692,7 @@ class PatchRepair(Repair):
         self.score_temperature = float(score_temperature)
         self.top_k = int(max(2, top_k))
         # per_objective_patch_scores: shape (n_obj, n_patches), one row per objective
-        # (order: abiotic, biotic, cost).  ref_dirs: shape (n_ref_dirs, n_obj).
+        # (order matches problem.objective_names).  ref_dirs: shape (n_ref_dirs, n_obj).
         # When both are provided, repair blends the objective rows using the
         # reference-direction weights assigned to each individual by NSGA-III.
         self.per_objective_patch_scores = (
