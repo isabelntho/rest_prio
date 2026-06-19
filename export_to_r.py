@@ -13,7 +13,7 @@ Outputs (written to <output_dir>/):
 
 Usage:
     python export_to_r.py results_files/res_fg_20260415_1840_cost_corrected.pkl
-    python export_to_r.py results_files/res_20260427_1100_3obj_rf10_bs.pkl --output-dir r_inputs/3obj_bs
+    python export_to_r.py results_files/res_20260514_0918_test_lscontext_restpo.pkl --output-dir r_inputs/test_lscontext_restpo
 """
 
 import argparse
@@ -115,7 +115,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading {pkl_path.name} ...")
+    #print(f"Loading {pkl_path.name} ...")
     with open(pkl_path, "rb") as f:
         r = pickle.load(f)
 
@@ -141,7 +141,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     obj_df["is_nondominated"] = is_nondominated.astype(int)
     obj_path = output_dir / "objectives.csv"
     obj_df.to_csv(obj_path, index=False)
-    print(f"  → {obj_path.name}  ({n_solutions} rows × {len(obj_names)} objectives)")
+    #print(f"  → {obj_path.name}  ({n_solutions} rows × {len(obj_names)} objectives)")
 
     # -------------------------------------------------------------------
     # 2. objectives_normalized.csv
@@ -152,7 +152,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         norm_df["is_nondominated"] = is_nondominated.astype(int)
         norm_path = output_dir / "objectives_normalized.csv"
         norm_df.to_csv(norm_path, index=False)
-        print(f"  → {norm_path.name}")
+        #print(f"  → {norm_path.name}")
 
     # -------------------------------------------------------------------
     # 3. Hypervolume evolution  (from algorithm_info or evolution JSON)
@@ -162,7 +162,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     evo_json_path = _find_evolution_json(pkl_path)
     evo_data = {}
     if evo_json_path:
-        print(f"  Found evolution JSON: {evo_json_path.name}")
+        #print(f"  Found evolution JSON: {evo_json_path.name}")
         with open(evo_json_path) as f:
             evo_data = json.load(f)
         if not hv_history:
@@ -172,7 +172,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         hv_df = pd.DataFrame({"generation": np.arange(len(hv_history)), "hypervolume": hv_history})
         hv_path = output_dir / "hypervolume_evolution.csv"
         hv_df.to_csv(hv_path, index=False)
-        print(f"  → {hv_path.name}  ({len(hv_history)} generations)")
+        #print(f"  → {hv_path.name}  ({len(hv_history)} generations)")
 
     # -------------------------------------------------------------------
     # 4. Per-generation population statistics
@@ -212,7 +212,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         pop_df = pd.DataFrame(rows)
         pop_path = output_dir / "population_stats.csv"
         pop_df.to_csv(pop_path, index=False)
-        print(f"  → {pop_path.name}  ({n_gen} generations × {len(obj_names)} objectives)")
+        #print(f"  → {pop_path.name}  ({n_gen} generations × {len(obj_names)} objectives)")
 
     # -------------------------------------------------------------------
     # 5. Pixel selection (long format, non-dominated solutions by default)
@@ -228,12 +228,35 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         n_conversion_pixels  = problem_info.get("n_conversion_pixels",
                                                 len(conversion_indices) if conversion_indices is not None else 0)
 
+        is_planning_unit_based = problem_info.get("is_planning_unit_based", False)
+        unit_mappings = ic.get("unit_mappings")
+
         # Expand patch decisions → pixel decisions if needed
         if is_patch_based and patch_mappings is not None:
-            print("  Expanding patch decisions to pixel level ...")
+            #print("  Expanding patch decisions to pixel level ...")
             n_restoration_patches = problem_info.get("n_restoration_patches", decisions.shape[1])
             per_sol_px_indices   = _expand_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
             per_sol_conv_indices = _expand_conversion_patches_to_pixels(decisions, patch_mappings, n_restoration_patches)
+        elif is_planning_unit_based and unit_mappings is not None:
+            # planning-unit-level: decisions are (n_solutions, n_units); expand each unit to its pixels
+            rest_map = unit_mappings['unit_to_restoration_pixels']
+            conv_map = unit_mappings.get('unit_to_conversion_pixels', {})
+            per_sol_px_indices = []
+            per_sol_conv_indices_pu = [] if n_conversion_pixels > 0 and conversion_indices is not None else None
+            for i in range(n_solutions):
+                selected_units = np.where(decisions[i] == 1)[0]
+                px_idx = np.concatenate([np.asarray(rest_map[int(u)], dtype=np.intp)
+                                         for u in selected_units
+                                         if rest_map.get(int(u)) is not None and len(rest_map[int(u)]) > 0],
+                                        axis=0) if selected_units.size > 0 else np.array([], dtype=np.intp)
+                per_sol_px_indices.append(px_idx)
+                if per_sol_conv_indices_pu is not None:
+                    cx_idx = np.concatenate([np.asarray(conv_map[int(u)], dtype=np.intp)
+                                             for u in selected_units
+                                             if conv_map.get(int(u)) is not None and len(conv_map[int(u)]) > 0],
+                                            axis=0) if selected_units.size > 0 else np.array([], dtype=np.intp)
+                    per_sol_conv_indices_pu.append(cx_idx)
+            per_sol_conv_indices = per_sol_conv_indices_pu
         elif not is_patch_based:
             # pixel-level: first n_restoration_pixels = restore, next n_conversion_pixels = convert
             per_sol_px_indices = [
@@ -332,7 +355,97 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
                       f"[{n_restore_rows:,} restore, {n_convert_rows:,} convert], {coord_mode})")
 
     # -------------------------------------------------------------------
-    # 6. metadata.json
+    # 6. Landscape context raster (if available in initial_conditions)
+    #    The stored landscape_context array can be corrupted (in-place modification
+    #    during optimisation), so we always recompute it fresh from the anomaly
+    #    arrays and eligible mask, which are reliably preserved in the pickle.
+    # -------------------------------------------------------------------
+    _has_ctx_inputs = (
+        ic.get("abiotic_anomaly") is not None or ic.get("biotic_anomaly") is not None
+    )
+    if _has_ctx_inputs and ic.get("restoration_eligible_mask") is not None \
+            and ic.get("transform") is not None and shape is not None:
+        try:
+            from scipy.ndimage import uniform_filter
+            import rasterio as rio
+            from affine import Affine
+
+            _elig_2d   = ic["restoration_eligible_mask"]
+            _radius_px = 5
+            _ksize     = 2 * _radius_px + 1  # 11
+
+            # Count eligible neighbours (excluding self)
+            _cnt_elig  = _elig_2d.astype(np.float64)
+            _cnt_focal = uniform_filter(_cnt_elig, size=_ksize, mode="constant") * (_ksize ** 2)
+            _cnt_neigh = np.maximum(_cnt_focal - 1.0, 0.0)
+
+            def _focal_mean_neighbours(anom_2d):
+                _ae = np.where(_elig_2d, anom_2d, 0.0).astype(np.float64)
+                _sf = uniform_filter(_ae, size=_ksize, mode="constant") * (_ksize ** 2)
+                _sf = _sf - anom_2d.astype(np.float64)  # subtract self
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    return np.where(_cnt_neigh > 0, _sf / _cnt_neigh, 0.0)
+
+            _components = []
+            if ic.get("abiotic_anomaly") is not None:
+                _components.append(_focal_mean_neighbours(ic["abiotic_anomaly"]))
+            if ic.get("biotic_anomaly") is not None:
+                _components.append(_focal_mean_neighbours(ic["biotic_anomaly"]))
+
+            ctx_2d = np.mean(np.stack(_components, axis=0), axis=0)
+
+            transform_raw = ic.get("transform")
+            affine_t = transform_raw if isinstance(transform_raw, Affine) \
+                else Affine(*list(transform_raw)[:6])
+            ctx_path = output_dir / "landscape_context.tif"
+            with rio.open(
+                ctx_path, "w",
+                driver="GTiff",
+                height=ctx_2d.shape[0],
+                width=ctx_2d.shape[1],
+                count=1,
+                dtype="float32",
+                crs=str(ic.get("crs", "EPSG:2056")),
+                transform=affine_t,
+                nodata=float("nan"),
+            ) as dst:
+                dst.write(ctx_2d.astype("float32"), 1)
+            print(f"  → {ctx_path.name}  (landscape context raster, recomputed from anomaly inputs)")
+        except Exception as _e:
+            print(f"  Warning: could not export landscape_context raster: {_e}")
+
+    # -------------------------------------------------------------------
+    # 6b. Restoration potential raster (if available in initial_conditions)
+    # -------------------------------------------------------------------
+    rp_2d = ic.get("restoration_potential")
+    if rp_2d is not None and ic.get("transform") is not None and shape is not None:
+        try:
+            import rasterio as rio
+            from affine import Affine
+            transform_raw = ic.get("transform")
+            if isinstance(transform_raw, Affine):
+                affine_t = transform_raw
+            else:
+                affine_t = Affine(*list(transform_raw)[:6])
+            rp_path = output_dir / "restoration_potential.tif"
+            with rio.open(
+                rp_path, "w",
+                driver="GTiff",
+                height=rp_2d.shape[0],
+                width=rp_2d.shape[1],
+                count=1,
+                dtype="float32",
+                crs=str(ic.get("crs", "EPSG:2056")),
+                transform=affine_t,
+                nodata=float("nan"),
+            ) as dst:
+                dst.write(rp_2d.astype("float32"), 1)
+            print(f"  → {rp_path.name}  (restoration potential raster)")
+        except Exception as _e:
+            print(f"  Warning: could not export restoration_potential raster: {_e}")
+
+    # -------------------------------------------------------------------
+    # 7. metadata.json
     # -------------------------------------------------------------------
     def _json_safe(v):
         if isinstance(v, (np.integer,)): return int(v)
@@ -376,7 +489,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     meta_path = output_dir / "metadata.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
-    print(f"  → {meta_path.name}")
+    #print(f"  → {meta_path.name}")
 
     print(f"\nAll outputs written to: {output_dir}/")
     return str(output_dir)

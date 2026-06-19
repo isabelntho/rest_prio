@@ -1204,8 +1204,8 @@ compute_spatial_classification <- function(
 #   "low substantive sensitivity"— no SNR is detectable
 #
 # Outputs:
-#   priority_status + dominant_sensitivity + seed_status  → classification  (3-part string)
-#   map_class                                             → simplified class for figures
+#   priority_status + dominant_sensitivity + seed_status  = classification  (3-part string)
+#   map_class                                             = simplified class for figures
 #
 # Arguments:
 #   runs_df                 : bind_rows() of load_run_rfop() outputs
@@ -1213,7 +1213,7 @@ compute_spatial_classification <- function(
 #   high_priority_threshold : percentile (0–100) of mean_RFOP among selected pixels
 #                             used as the "high priority" cutoff; default 80 = top 20%
 #   snr_threshold           : SNR threshold above which a dimension is "detectable" (default 1)
-#   seed_sd_threshold       : mean_seed_SD threshold; above this → "seed uncertain" (default 5)
+#   seed_sd_threshold       : mean_seed_SD threshold; above this = "seed uncertain" (default 5)
 #   mixed_tolerance         : fractional tolerance for calling "mixed sensitive" (default 0.2)
 #   snr_denominator_constant: added to mean_seed_SD before dividing (default 1)
 compute_rfop_sensitivity <- function(

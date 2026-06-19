@@ -458,10 +458,15 @@ class RestorationProblem(ElementwiseProblem):
         # Extract effect parameters from scenario_params
         abiotic_effect = scenario_params.get('abiotic_effect', 0.01)
         biotic_effect = scenario_params.get('biotic_effect', 0.01)
+        # Derive neighbor radius in pixels from a fixed 300 m physical radius so
+        # that the spatial extent of the restoration spillover effect is consistent
+        # regardless of the aggregation factor applied during data loading.
+        _pixel_size = abs(initial_conditions['transform'].a)
+        _neighbor_radius_px = max(1, round(300.0 / _pixel_size))
         self.effect_params = {
             'abiotic_effect': abiotic_effect,
             'biotic_effect': biotic_effect,
-            'neighbor_radius': 3,  # Fixed value
+            'neighbor_radius': _neighbor_radius_px,  # 300 m physical radius
             'neighbor_effect_decay': 0.2  # Fixed value
         }
         

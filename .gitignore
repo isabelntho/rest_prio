@@ -75,3 +75,10 @@ logs/profile_combined_baseline_speedcheck.txt
 ~$WP3_framework.pptx
 logs/profile_combined_grid_speedcheck_fullbern.txt
 WP3_framework.pptx
+
+*WBF_presentation_files/
+*wbf_style.scss
+*r_inputs/
+*sensitivity_cache/
+*.tif
+*.pdf

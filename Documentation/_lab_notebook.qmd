@@ -56,3 +56,19 @@ From (https://doi.org/10.1029/2021EF002322):
 "The authors of (Marchau et al., 2019) characterize different levels of uncertainty, and describe the condition of deep uncertainty. Problems are deeply uncertain when impacts analysts cannot agree on the conceptual models that could be used to represent probable futures, the probability distributions representing uncertainty of parameters in the future, and/or how to value the different outcomes.""
 
 :::
+
+# Meeting 12.05.2026
+
+* Adrienne's perspective: maybe as the RFOP values are in general low, it's of course going to be impossible to identify robust areas? Many solutions, not super discriminating
+Proposed several possible approaches to address this:
+- Combine the abiotic & biotic anomalies into a single objective (requires identifying a reasonable other 3rd objective)
+
+# Meeting 22/05/2026
+
+* Looked at results of changing the objectives, new definition of 'robust' areas, but still needs some work to derive clear insights.
+* Next steps: look again at the specific sensitivity dimensions - what does the spatial layout of areas that are robust to indicator construction look like? What about the areas that are sensitive to policy levers? etc. Try and draw out this difference.
+* Then discussed the development of the WP3 framework - Adrienne said she understood eveything
+* Ideas for framing of work (and thesis in general) - focus on the uncertainty/robustness and how this should make us question the use of models in decision making
++ Adrienne mentioned upcoming talk where she would conceptualise how science should be more reflective with policymakers - encouraging more discussion about the selected areas and the uncertainty around them, rather than just presenting a single solution.
+* Go forward with DMDU summer school - Adrienne ok to support financially.
+* To work on presentation for next two weeks - meet with Adrienne during writing week to discuss framing and content?
