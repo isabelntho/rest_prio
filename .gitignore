@@ -75,3 +75,12 @@ logs/profile_combined_baseline_speedcheck.txt
 ~$WP3_framework.pptx
 logs/profile_combined_grid_speedcheck_fullbern.txt
 WP3_framework.pptx
+Documentation/archive/WBF_presentation_files/*
+*html
+*.tif
+*.pdf
+*.scss
+*.ttf
+Debugs_tests/_smoke_axis2.py
+Documentation/BE_bern.rds
+Documentation/map_bern_landuse.R

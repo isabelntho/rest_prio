@@ -1071,6 +1071,86 @@ plot_jaccard_comparison <- function(run_a, run_b, obj_names) {
 # rfop_pct is computed relative to that run's own Pareto front size, so runs with
 # different numbers of non-dominated solutions are directly comparable.
 #
+# ── Canonical run loaders (consolidated here so any driver can `source()` this
+#    file and load exports without redefining loaders inline) ──────────────────
+
+# Read a CSV only if it exists, else return NULL.
+read_csv_if_exists <- function(path) {
+  if (file.exists(path)) utils::read.csv(path) else NULL
+}
+
+# Fast reader for the (x, y) columns of large pixel_selection.csv files.
+# Falls back gracefully: data.table::fread -> readr -> base read.csv.
+.read_xy_fast <- function(path) {
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    as.data.frame(data.table::fread(path, select = c("x", "y"), showProgress = FALSE))
+  } else if (requireNamespace("readr", quietly = TRUE)) {
+    as.data.frame(readr::read_csv(path, col_select = c("x", "y"),
+                                  progress = FALSE, show_col_types = FALSE))
+  } else {
+    utils::read.csv(path)[, c("x", "y")]
+  }
+}
+
+# Non-dominated solution ids from an objectives data frame.
+get_nd_ids <- function(objectives) {
+  if ("is_nondominated" %in% names(objectives))
+    objectives$solution_id[objectives$is_nondominated == 1L]
+  else
+    objectives$solution_id
+}
+
+# Full run loader: objectives, normalized objectives, HV evolution, population
+# stats, pixel selection and eligible pixels, plus metadata. Maximised objectives
+# (anomaly / connectivity_gain / restoration_potential / landscape_context) are
+# sign-flipped so larger = better for plotting.
+load_run_data <- function(dir_path, label) {
+  dir_path <- normalizePath(dir_path, mustWork = TRUE)
+  meta     <- jsonlite::read_json(file.path(dir_path, "metadata.json"))
+  df_obj   <- utils::read.csv(file.path(dir_path, "objectives.csv"))
+  df_norm  <- read_csv_if_exists(file.path(dir_path, "objectives_normalized.csv"))
+  df_hv    <- read_csv_if_exists(file.path(dir_path, "hypervolume_evolution.csv"))
+  df_pop   <- read_csv_if_exists(file.path(dir_path, "population_stats.csv"))
+  df_psel  <- read_csv_if_exists(file.path(dir_path, "pixel_selection.csv"))
+  df_elig  <- read_csv_if_exists(file.path(dir_path, "eligible_pixels.csv"))
+  obj_names    <- unlist(meta$objective_names)
+  raster_shape <- unlist(meta$raster_info$shape)
+  norm_scales  <- tryCatch(unlist(meta$algorithm$objective_normalization$scales),
+                           error = function(e) NULL)
+  invert_cols <- grep(
+    "anomaly|connectivity_gain|restoration_potential|landscape_context",
+    obj_names, value = TRUE)
+  if (length(invert_cols) > 0L) {
+    df_obj[, invert_cols] <- -df_obj[, invert_cols]
+    if (!is.null(df_norm))
+      df_norm[, intersect(invert_cols, names(df_norm))] <-
+        -df_norm[, intersect(invert_cols, names(df_norm))]
+  }
+  list(label = label, dir = dir_path, meta = meta, obj_names = obj_names,
+       n_obj = length(obj_names), n_solutions = meta$n_solutions,
+       n_nondom = meta$n_nondominated_solutions, raster_shape = raster_shape,
+       norm_scales = norm_scales, df_obj = df_obj, df_norm = df_norm,
+       df_hv = df_hv, df_pop = df_pop, df_psel = df_psel, df_elig = df_elig)
+}
+
+# Lightweight run loader (objectives + selection only).
+load_run <- function(dir_path, label = basename(dir_path)) {
+  dir_path <- normalizePath(dir_path, mustWork = TRUE)
+  if (!file.exists(file.path(dir_path, "metadata.json")))
+    stop("Missing metadata.json in ", dir_path)
+  meta            <- jsonlite::read_json(file.path(dir_path, "metadata.json"))
+  objectives      <- read_csv_if_exists(file.path(dir_path, "objectives.csv"))
+  objectives_norm <- read_csv_if_exists(file.path(dir_path, "objectives_normalized.csv"))
+  pixel_selection <- read_csv_if_exists(file.path(dir_path, "pixel_selection.csv"))
+  eligible_pixels <- read_csv_if_exists(file.path(dir_path, "eligible_pixels.csv"))
+  obj_names       <- unlist(meta$objective_names)
+  if (is.null(objectives))      stop("Missing objectives.csv in ",     dir_path)
+  if (is.null(pixel_selection)) stop("Missing pixel_selection.csv in ", dir_path)
+  list(label = label, dir = dir_path, meta = meta, obj_names = obj_names,
+       objectives = objectives, objectives_norm = objectives_norm,
+       pixel_selection = pixel_selection, eligible_pixels = eligible_pixels)
+}
+
 # dir_path    : path to an r_inputs/<label>/ export folder
 # label       : human-readable label for this specific run
 # dim_type    : sensitivity dimension this run belongs to ("indicator", "policy",
@@ -1095,7 +1175,10 @@ load_run_rfop <- function(dir_path, label, dim_type, group_label) {
     NA_integer_
   }
 
-  df <- read.csv(psel_path)
+  # pixel_selection.csv can be tens of MB; only x,y are needed (one row per
+  # selected pixel per solution). Read just those columns with the fastest
+  # available reader — base read.csv on full files is the bottleneck.
+  df <- .read_xy_fast(psel_path)
 
   # Aggregate over solutions: count how many non-dominated solutions selected each pixel
   freq_df <- df |>
@@ -1462,9 +1545,16 @@ compute_rfop_sensitivity <- function(
     mixed_tolerance          = 0.2,
     snr_denominator_constant = 1,
     use_rank_stability       = TRUE,
-    rank_stability_threshold = 15
+    rank_stability_threshold = 15,
+    noise_floor              = c("se", "sd")
 ) {
   stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+  noise_floor <- match.arg(noise_floor)
+  # noise_floor = "se": the seed noise floor is the standard ERROR of the
+  #   scenario mean (within-scenario seed SD / sqrt(n_seeds)) — the correct floor
+  #   when scenario means are averaged over many seeds, so it is comparable to the
+  #   seed-averaged signal dimensions. "sd" uses the raw single-seed SD (the old,
+  #   over-conservative behaviour).
 
   # ── Step 1: per-dimension SD of scenario-means ──────────────────────────────
   # For each dimension, average across seeds within each scenario (group_label),
@@ -1545,12 +1635,14 @@ compute_rfop_sensitivity <- function(
       n_seeds   = dplyr::n(),
       .groups   = "drop"
     ) |>
-    dplyr::filter(n_seeds > 1)    # exclude single-seed scenarios (SD would be NA)
+    dplyr::filter(n_seeds > 1) |>   # exclude single-seed scenarios (SD would be NA)
+    # Standard error of the scenario mean when noise_floor = "se".
+    dplyr::mutate(noise = if (noise_floor == "se") within_sd / sqrt(n_seeds) else within_sd)
 
   if (nrow(within_sd) > 0) {
     mean_seed_sd_df <- within_sd |>
       dplyr::group_by(x, y) |>
-      dplyr::summarise(mean_seed_SD = mean(within_sd, na.rm = TRUE), .groups = "drop")
+      dplyr::summarise(mean_seed_SD = mean(noise, na.rm = TRUE), .groups = "drop")
   } else {
     mean_seed_sd_df <- dplyr::distinct(runs_df, x, y) |>
       dplyr::mutate(mean_seed_SD = NA_real_)
@@ -2223,13 +2315,11 @@ make_stability_scatter <- function(
 
   p +
     annotate("text", x = 0, y = seed_sd_threshold + 0.3,
-             label = paste0("seed-stable threshold (", seed_sd_threshold, " pp)"),
+             label = paste0("seed-noise reference (", seed_sd_threshold, " %)"),
              hjust = 0, vjust = 0, size = 3, colour = "grey30") +
     labs(
-      title    = "Priority vs seed stability",
-      subtitle = "Colour = dominant sensitivity dimension",
       x        = "Mean RFOP (%)",
-      y        = "Mean seed SD (pp)"
+      y        = "Mean seed noise — SE of scenario mean (%)"
     ) +
     theme_minimal() +
     theme(
@@ -2717,6 +2807,123 @@ collect_pareto_stats <- function(runs_meta, obj_names) {
 }
 
 
+# ── Cross-run-comparable hypervolume (shared reference point) ────────────────
+# The per-run HV exported from the optimiser uses a per-run reference point and
+# per-run objective normalisation, so HV is NOT comparable across scenarios.
+# This recomputes HV on the RAW objectives of each run's non-dominated front
+# against a SINGLE shared reference box (the pooled worst corner), making HV
+# directly comparable. Dimension-agnostic Monte-Carlo estimate (no HV package
+# required). Only pass runs whose objectives share the same definition/units
+# (e.g. exclude the threshold-formulation runs).
+#
+#   runs_meta : named list; each element has $run = load_run_data() output
+#   obj_names : objective columns to use (raw, as in df_obj)
+# Returns a tibble: run_label, hv (shared-ref HV), n_nondom.
+compute_shared_hv <- function(runs_meta, obj_names, n_mc = 2e4, margin = 0.05, seed = 42) {
+  # Orient all objectives to a 'benefit' (larger = better) frame. load_run_data()
+  # already flips rp/lc/anomaly/connectivity to benefit; negate raw minimise
+  # objectives (cost, robustness) so every column is benefit-oriented.
+  neg <- grepl("cost|robustness", obj_names)
+  .benefit <- function(df) {
+    M <- as.matrix(df[, obj_names, drop = FALSE])
+    if (any(neg)) M[, neg] <- -M[, neg]
+    M
+  }
+  mats <- lapply(runs_meta, function(m) {
+    run <- m$run
+    if (is.null(run) || is.null(run$df_obj)) return(NULL)
+    df <- run$df_obj
+    if ("is_nondominated" %in% names(df))
+      df <- df[df$is_nondominated == 1, , drop = FALSE]
+    if (nrow(df) == 0L || !all(obj_names %in% names(df))) return(NULL)
+    .benefit(df)
+  })
+  mats <- mats[!vapply(mats, is.null, logical(1))]
+  if (length(mats) == 0L) return(tibble::tibble())
+
+  pooled <- do.call(rbind, mats)
+  U   <- apply(pooled, 2, max)                 # ideal (best) corner
+  L   <- apply(pooled, 2, min)
+  rng <- pmax(U - L, 1e-12)
+  R   <- L - margin * rng                       # shared reference (worst corner)
+  box_vol <- prod(U - R)
+
+  set.seed(seed)
+  k <- length(obj_names)
+  S <- matrix(runif(n_mc * k), ncol = k)
+  S <- sweep(sweep(S, 2, (U - R), `*`), 2, R, `+`)   # uniform in [R, U]
+
+  hv_of <- function(M) {
+    dom <- logical(nrow(S))
+    for (i in seq_len(nrow(M))) {
+      inside <- rep(TRUE, nrow(S))
+      for (j in seq_len(k)) inside <- inside & (S[, j] <= M[i, j])
+      dom <- dom | inside
+    }
+    mean(dom) * box_vol
+  }
+
+  tibble::tibble(
+    run_label = names(mats),
+    hv        = vapply(mats, hv_of, numeric(1)),
+    n_nondom  = vapply(mats, nrow, integer(1))
+  )
+}
+
+
+# ── Cross-scenario agreement of top-X% priority areas ────────────────────────
+# Tests directly whether a robust priority core exists: for each scenario, take
+# its top `top_pct`% RFOP pixels as its "priority set", then measure how much
+# those sets agree across scenarios.
+#
+#   runs_df : load_run_rfop() rows (seed-averaged per scenario internally)
+#   top_pct : percentage of pixels kept as each scenario's priority set
+#   dims    : dim_types treated as scenarios to compare (default condition axes)
+# Returns a list:
+#   jaccard      : tibble(a, b, jaccard) of pairwise top-set overlap
+#   consensus    : tibble(x, y, n_top, n_scen, frac) — how many scenarios rank a
+#                  pixel in their top set (frac = n_top / n_scen)
+#   mean_jaccard : mean pairwise Jaccard; n_scenarios; top_pct
+compute_topx_overlap <- function(runs_df, top_pct = 15,
+                                 dims = c("indicator", "benchmark")) {
+  sm <- runs_df |>
+    dplyr::filter(dim_type %in% dims) |>
+    dplyr::group_by(group_label, x, y) |>
+    dplyr::summarise(rfop = mean(rfop_pct, na.rm = TRUE), .groups = "drop")
+
+  scen   <- sort(unique(sm$group_label))
+  n_scen <- length(scen)
+
+  top_df <- sm |>
+    dplyr::group_by(group_label) |>
+    dplyr::mutate(thr = stats::quantile(rfop, 1 - top_pct / 100, na.rm = TRUE)) |>
+    dplyr::filter(rfop >= thr) |>
+    dplyr::ungroup() |>
+    dplyr::select(group_label, x, y)
+
+  consensus <- top_df |>
+    dplyr::count(x, y, name = "n_top") |>
+    dplyr::mutate(n_scen = n_scen, frac = n_top / n_scen)
+
+  sets    <- split(paste(top_df$x, top_df$y), top_df$group_label)
+  jaccard <- if (n_scen >= 2) {
+    pairs <- utils::combn(scen, 2, simplify = FALSE)
+    do.call(rbind, lapply(pairs, function(p) {
+      a <- sets[[p[1]]]; b <- sets[[p[2]]]
+      uni <- length(union(a, b))
+      data.frame(a = p[1], b = p[2],
+                 jaccard = if (uni > 0) length(intersect(a, b)) / uni else NA_real_)
+    }))
+  } else data.frame(a = character(0), b = character(0), jaccard = numeric(0))
+
+  list(jaccard      = tibble::as_tibble(jaccard),
+       consensus    = tibble::as_tibble(consensus),
+       mean_jaccard = mean(jaccard$jaccard, na.rm = TRUE),
+       n_scenarios  = n_scen,
+       top_pct      = top_pct)
+}
+
+
 # Dot plot of hypervolume across runs, faceted by sensitivity dimension.
 # The reference run (e.g. global_all) is highlighted as a dashed line.
 #
@@ -3161,8 +3368,13 @@ make_redundancy_boxplot <- function(redundancy_df) {
 # Returns a data frame with one row per eligible pixel:
 #   x, y, rfop_sd_<dim>, rfop_mean_<dim>, n_groups_<dim>, dominant_dim
 compute_rfop_anova <- function(runs_df,
-                               dims = c("indicator", "policy", "seed")) {
+                               dims = c("indicator", "policy", "seed"),
+                               se_dims = character(0)) {
   stopifnot(all(c("x", "y", "rfop_pct", "dim_type", "group_label") %in% names(runs_df)))
+  # se_dims: dimensions to express as the standard ERROR of their group-mean RFOP
+  #   (rfop_sd / sqrt(n_groups)) rather than the raw SD across groups. Use this for
+  #   a pure-noise dimension (e.g. "seed") so it is on the same footing as the
+  #   seed-averaged signal dimensions; otherwise the seed bar is inflated by ~sqrt(n).
 
   dims_present <- intersect(dims, unique(runs_df$dim_type))
 
@@ -3185,6 +3397,16 @@ compute_rfop_anova <- function(runs_df,
 
   result <- Reduce(function(a, b) dplyr::full_join(a, b, by = c("x", "y")),
                    result_list)
+
+  # Express requested dimensions as the standard error of their group-mean RFOP
+  # (SD / sqrt(n_groups)) before computing dominance, so a noise dimension is
+  # compared fairly against seed-averaged signal dimensions.
+  for (d in intersect(se_dims, dims_present)) {
+    sd_col <- paste0("rfop_sd_", d)
+    n_col  <- paste0("n_groups_", d)
+    if (all(c(sd_col, n_col) %in% names(result)))
+      result[[sd_col]] <- result[[sd_col]] / sqrt(pmax(result[[n_col]], 1))
+  }
 
   # Dominant dimension: the one with the largest SD of group-mean RFOP
   sd_cols <- paste0("rfop_sd_", dims_present)
@@ -3281,12 +3503,10 @@ make_anova_eta2_ridges <- function(anova_df,
       colour = "grey30"
     ) +
     scale_fill_manual(values = .anova_palette[dims_present], guide = "none") +
-    scale_x_continuous(labels = scales::label_number(suffix = " pp"),
+    scale_x_continuous(labels = scales::label_number(suffix = " %"),
                        expand = c(0.01, 0)) +
     labs(
-      title    = "Distribution of RFOP variation across pixels",
-      subtitle = "SD of group-mean RFOP per dimension. Vertical line = median. Units: percentage points.",
-      x        = "SD of group-mean RFOP (percentage points)",
+      x        = "SD of group-mean RFOP (%)",
       y        = NULL
     ) +
     theme_minimal() +
@@ -3331,14 +3551,260 @@ make_anova_summary_bar <- function(anova_df,
       width = 0.25, colour = "grey30"
     ) +
     scale_fill_manual(values = .anova_palette[dims_present], guide = "none") +
-    scale_x_continuous(labels = scales::label_number(suffix = " pp"),
+    scale_x_continuous(labels = scales::label_number(suffix = " %"),
                        expand = c(0.01, 0)) +
     labs(
-      title    = "Mean RFOP variation per sensitivity dimension",
-      subtitle = "Mean (\u00b1 SE) SD of group-mean RFOP across all eligible pixels.\nAll dimensions use the same scale (percentage points) \u2014 directly comparable.",
-      x        = "Mean SD of group-mean RFOP (pp)",
+      x        = "Mean SD of group-mean RFOP (%)",
       y        = NULL
     ) +
     theme_minimal() +
     theme(panel.grid.major.y = element_blank())
+}
+
+
+# =============================================================================
+# FACTORIAL ATTRIBUTION — crossed design, variance partitioning (iEMSs Block 4)
+# -----------------------------------------------------------------------------
+# Replaces the one-at-a-time decomposition (compute_rfop_anova, above) with a
+# proper crossed-factorial variance partition. For a fully-crossed run matrix
+#   form × scaling × construction × policy  (seed-replicated)
+# this estimates, per spatial cell, how much of the variation in per-cell
+# selection frequency (RFOP) is attributable to each formulation factor's MAIN
+# effect, to their INTERACTIONS, and to the RESIDUAL (seed) noise floor.
+#
+# Pipeline:
+#   1. load_run_factorial()            — load one run + its factor levels from metadata
+#   2. compute_rfop_variance_partition() — per-cell aov(); SS → eta^2 per term
+#   3. make_variance_partition_bar()   — global variance-share bar (main/interaction/residual)
+#   4. make_dominant_factor_map()      — per-cell dominant source map
+# =============================================================================
+
+# Colour palette / labels for factorial sources. Order here also sets bar/legend order.
+.factor_palette <- c(
+  form         = "#1B9E77",   # teal   — objective target form (sum vs threshold)
+  scaling      = "#D95F02",   # orange — condition scaling / reference (anomaly vs q75)
+  construction = "#7570B3",   # violet — condition-indicator construction
+  policy       = "#E7298A",   # magenta— policy / governance lever
+  interaction  = "#A6761D",   # brown  — pooled interactions
+  residual     = "grey70"     # grey   — residual (seed) noise floor
+)
+.factor_labels <- c(
+  form         = "Objective form",
+  scaling      = "Condition scaling",
+  construction = "Indicator construction",
+  policy       = "Policy",
+  interaction  = "Interactions",
+  residual     = "Residual (seed)"
+)
+
+# Load one factorial run's per-cell RFOP plus its factor levels (read from
+# metadata.json, written by run_custom.py's factorial mode as flat factor_* keys
+# in run_config). Returns a data frame:
+#   x, y, rfop_pct, run_label, form, scaling, construction, policy, seed
+# Factor levels are recovered from metadata, NOT parsed from the directory name,
+# so the loader is robust to label-format changes.
+load_run_factorial <- function(dir_path, label = basename(dir_path)) {
+  dir_path  <- normalizePath(dir_path, mustWork = TRUE)
+  psel_path <- file.path(dir_path, "pixel_selection.csv")
+  meta_path <- file.path(dir_path, "metadata.json")
+  if (!file.exists(psel_path)) {
+    warning(sprintf("pixel_selection.csv not found in %s — skipping.", dir_path))
+    return(NULL)
+  }
+  if (!file.exists(meta_path)) {
+    warning(sprintf("metadata.json not found in %s — cannot recover factor levels; skipping.", dir_path))
+    return(NULL)
+  }
+  meta <- jsonlite::read_json(meta_path)
+  rc   <- meta$run_config %||% list()
+  sp   <- meta$scenario_params %||% list()
+
+  n_nondom <- as.integer(meta$n_nondominated_solutions %||% meta$n_solutions %||% 1L)
+
+  # Factor levels: prefer the explicit flat factor_* keys; fall back to the
+  # underlying scenario fields / the run label so older exports still load.
+  .seed_from_label <- function(lbl) {
+    s <- stringr::str_extract(lbl, "seed[0-9]+$")
+    if (is.na(s)) NA_integer_ else as.integer(sub("seed", "", s))
+  }
+  form         <- rc$factor_form         %||% sp$rp_formulation %||% NA_character_
+  scaling      <- rc$factor_scaling      %||% NA_character_
+  construction <- rc$factor_construction %||% NA_character_
+  policy       <- rc$factor_policy       %||% NA_character_
+  seed         <- rc$random_seed         %||% .seed_from_label(label)
+
+  # If scaling/construction were not written explicitly, split the condition tag
+  # ("{scaling}_{construction}", e.g. "upper_q75_drop_smd") on its known prefix.
+  cond_tag <- rc$condition_scenario %||% NA_character_
+  if ((is.na(scaling) || is.na(construction)) && !is.na(cond_tag)) {
+    for (pre in c("upper_q75", "global", "zones")) {
+      if (startsWith(cond_tag, paste0(pre, "_"))) {
+        if (is.na(scaling))      scaling      <- pre
+        if (is.na(construction)) construction <- sub(paste0("^", pre, "_"), "", cond_tag)
+        break
+      }
+    }
+  }
+
+  df <- .read_xy_fast(psel_path)
+  df |>
+    dplyr::count(x, y, name = "n_selected") |>
+    dplyr::mutate(
+      rfop_pct     = n_selected / n_nondom * 100,
+      run_label    = label,
+      form         = as.character(form),
+      scaling      = as.character(scaling),
+      construction = as.character(construction),
+      policy       = as.character(policy),
+      seed         = seed
+    ) |>
+    dplyr::select(x, y, rfop_pct, run_label, form, scaling, construction, policy, seed)
+}
+
+
+# Per-cell crossed-factorial variance partition of RFOP.
+#
+# For each spatial cell (x, y) it fits a fixed-effects factorial model
+#   rfop_pct ~ f1 * f2 * ... (all factors that vary within the cell)
+# and converts the ANOVA sums of squares to eta^2 (SS_term / SS_total) for every
+# main effect and interaction. The model Residual captures seed replication (and
+# any unmodelled variation) — i.e. the noise floor against which factor effects
+# are read. eta^2 across all returned terms of a cell sums to 1.
+#
+# runs_df : bind_rows() of load_run_factorial() — cols x, y, rfop_pct + factors
+# factors : factor columns to cross (those with a single level overall are dropped)
+# min_obs : minimum observations in a cell to attempt a fit (guards rank-deficiency)
+#
+# Returns a long data frame: x, y, term, ss, eta2, component
+#   component ∈ {<factor name>, "interaction", "residual"}
+compute_rfop_variance_partition <- function(runs_df,
+                                            factors = c("form", "scaling", "construction", "policy"),
+                                            min_obs = 8) {
+  stopifnot(all(c("x", "y", "rfop_pct") %in% names(runs_df)))
+  factors <- intersect(factors, names(runs_df))
+  # Keep only factors that actually vary across the matrix.
+  factors <- factors[vapply(factors, function(f) dplyr::n_distinct(runs_df[[f]]) > 1L, logical(1))]
+  if (length(factors) == 0L)
+    stop("compute_rfop_variance_partition(): no supplied factor varies across runs_df.")
+
+  classify_term <- function(term) {
+    if (term == "Residuals") return("residual")
+    if (grepl(":", term, fixed = TRUE)) return("interaction")
+    term
+  }
+
+  runs_df |>
+    dplyr::mutate(dplyr::across(dplyr::all_of(factors), as.factor)) |>
+    dplyr::group_by(x, y) |>
+    dplyr::group_modify(function(.d, .key) {
+      if (nrow(.d) < min_obs) return(tibble::tibble())
+      # Factors that vary *within this cell's rows* (others are not estimable here).
+      f_local <- factors[vapply(factors,
+                                function(f) nlevels(droplevels(.d[[f]])) > 1L, logical(1))]
+      if (length(f_local) == 0L) return(tibble::tibble())
+      fml <- stats::as.formula(paste("rfop_pct ~", paste(f_local, collapse = " * ")))
+      fit <- tryCatch(stats::aov(fml, data = .d), error = function(e) NULL)
+      if (is.null(fit)) return(tibble::tibble())
+      a <- tryCatch(stats::anova(fit), error = function(e) NULL)
+      if (is.null(a) || !("Sum Sq" %in% names(a))) return(tibble::tibble())
+      ss    <- a[["Sum Sq"]]
+      terms <- rownames(a)
+      tot   <- sum(ss, na.rm = TRUE)
+      if (!is.finite(tot) || tot <= 0) return(tibble::tibble())
+      tibble::tibble(
+        term      = terms,
+        ss        = ss,
+        eta2      = ss / tot,
+        component = vapply(terms, classify_term, character(1))
+      )
+    }) |>
+    dplyr::ungroup()
+}
+
+
+# Pool a variance-partition long df to one eta^2 per (cell, component): every
+# interaction term collapses into a single "interaction" share per cell.
+.pool_vp_components <- function(vp_df) {
+  vp_df |>
+    dplyr::group_by(x, y, component) |>
+    dplyr::summarise(eta2 = sum(eta2, na.rm = TRUE), .groups = "drop")
+}
+
+# Global variance-share bar: mean eta^2 per source across cells (± SE).
+# Bars are ordered main effects → interactions → residual via .factor_palette.
+#
+# vp_df : output of compute_rfop_variance_partition()
+make_variance_partition_bar <- function(vp_df,
+                                        title = "Variance attribution of restoration priorities") {
+  if (is.null(vp_df) || nrow(vp_df) == 0L) return(NULL)
+  summ <- .pool_vp_components(vp_df) |>
+    dplyr::group_by(component) |>
+    dplyr::summarise(
+      mean_eta2 = mean(eta2, na.rm = TRUE),
+      se_eta2   = stats::sd(eta2, na.rm = TRUE) / sqrt(dplyr::n()),
+      .groups   = "drop"
+    ) |>
+    dplyr::filter(component %in% names(.factor_palette)) |>
+    dplyr::mutate(
+      comp_f = factor(component, levels = rev(names(.factor_palette))),
+      label  = .factor_labels[as.character(component)]
+    )
+
+  ggplot(summ, aes(x = mean_eta2, y = comp_f, fill = component)) +
+    geom_col(width = 0.65, colour = "grey30") +
+    geom_errorbar(aes(xmin = pmax(0, mean_eta2 - se_eta2), xmax = mean_eta2 + se_eta2),
+                  width = 0.25, colour = "grey30") +
+    scale_fill_manual(values = .factor_palette, guide = "none") +
+    scale_y_discrete(labels = function(b) .factor_labels[b]) +
+    scale_x_continuous(labels = scales::label_percent(accuracy = 1), expand = c(0.01, 0)) +
+    labs(title = title,
+         subtitle = "Mean share of per-cell RFOP variance (eta^2). Residual = seed noise floor.",
+         x = "Variance share", y = NULL) +
+    theme_minimal() +
+    theme(panel.grid.major.y = element_blank())
+}
+
+# Per-cell dominant-source map: colour each cell by the source with the largest
+# eta^2 (which formulation choice — or interaction / seed — drives that cell).
+#
+# vp_df   : output of compute_rfop_variance_partition()
+# elig_df : eligible_pixels.csv data frame for a grey underlay (optional)
+# include : which components are eligible to "win" a cell
+make_dominant_factor_map <- function(vp_df, elig_df = NULL,
+                                     include = names(.factor_palette),
+                                     title   = "Dominant source of priority variation") {
+  if (is.null(vp_df) || nrow(vp_df) == 0L) return(NULL)
+  dom <- .pool_vp_components(vp_df) |>
+    dplyr::filter(component %in% include) |>
+    dplyr::group_by(x, y) |>
+    dplyr::slice_max(eta2, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      component = factor(component, levels = names(.factor_palette)),
+      label     = factor(.factor_labels[as.character(component)],
+                         levels = unname(.factor_labels[names(.factor_palette)]))
+    )
+
+  p <- ggplot()
+  if (!is.null(elig_df) && nrow(elig_df) > 0)
+    p <- p + geom_raster(data = elig_df, aes(x = x, y = y), fill = "#e6e6e6")
+  p <- p +
+    geom_raster(data = dom, aes(x = x, y = y, fill = label)) +
+    scale_fill_manual(
+      values   = setNames(unname(.factor_palette), unname(.factor_labels[names(.factor_palette)])),
+      name     = "Dominant source",
+      na.value = "grey85", drop = FALSE
+    ) +
+    labs(title = title,
+         subtitle = "Cells coloured by the formulation source with the largest RFOP variance share") +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 12))
+  # geom_sf forces coord_sf, so only set coord_equal when no sf overlay is added
+  # (coord_equal + geom_sf together error in ggplot).
+  if (exists("BE")) {
+    p <- p + geom_sf(data = BE, fill = NA, colour = "black", linewidth = 0.4, inherit.aes = FALSE)
+  } else {
+    p <- p + coord_equal()
+  }
+  p
 }

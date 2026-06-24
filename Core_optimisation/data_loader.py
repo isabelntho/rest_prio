@@ -621,22 +621,20 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         'biotic':  f'inputs/anomaly_scenarios/biotic_{condition_scenario}.tif',
         'landscape': 'inputs/sn_dens.tif',
         'connectivity': None,  # Computed in-memory from landscape LULC; no file required
-        # landscape_context / restoration_potential: load from pre-computed file only for the
-        # baseline scenario ('global_all'), because the pre-computed files are derived from
-        # the global_all abiotic/biotic rasters.  Any other condition_scenario must force
-        # in-memory computation from the scenario-specific abiotic/biotic rasters (None → computed).
-        'landscape_context': (
-            'inputs/landscape_context.tif'
-            if (condition_scenario == 'global_all'
-                and os.path.exists(os.path.join(workspace_dir, 'inputs/landscape_context.tif')))
-            else None
-        ),
-        'restoration_potential': (
-            'inputs/restoration_potential.tif'
-            if (condition_scenario == 'global_all'
-                and os.path.exists(os.path.join(workspace_dir, 'inputs/restoration_potential.tif')))
-            else None
-        ),
+        # landscape_context / restoration_potential are ALWAYS computed in-memory from the
+        # scenario's abiotic/biotic rasters (None → computed below), never loaded from a
+        # pre-computed .tif.
+        #
+        # Previously 'global_all' loaded inputs/{landscape_context,restoration_potential}.tif
+        # while every other condition_scenario recomputed in-memory. That put the baseline
+        # cell on a different construction route than the LOO / q75 cells: if the saved
+        # rasters were not byte-identical to the in-memory computation, a file-vs-recompute
+        # discrepancy would be misattributed to the construction / scaling factors in the
+        # Block 3 factorial (the 'all' vs 'drop_*' and global vs q75 contrasts). Forcing
+        # in-memory for ALL scenarios guarantees the only thing differing between cells is
+        # the formulation under test.
+        'landscape_context': None,
+        'restoration_potential': None,
         'cost': 'inputs/implementation_cost_corrected.tif',
         'population_proximity': 'inputs/population_proximity.tif',
         'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',

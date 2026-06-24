@@ -4,11 +4,13 @@
 # Calculates abiotic and biotic anomalies across 13 condition scenarios and
 # writes all outputs to inputs/anomaly_scenarios/.
 #
-# Scenario dimensions (separate axes, 14 scenarios total):
-#   Benchmark (3):      global | upper_q75 | zones
-#   Indicator LOO (12): all | drop one abiotic (3) | drop one biotic (8)
-#   upper_q75 and zones always use all indicators.
-#   LOO variants always use the global benchmark.
+# Scenario dimensions:
+#   Benchmark:          global | upper_q75 | zones
+#   Indicator LOO:      all | drop one abiotic (3) | drop one biotic (8)
+#   The global benchmark is crossed with every LOO construction; the upper_q75
+#   benchmark is crossed with the agricultural-relevant LOO constructions
+#   (smd/sbd/soc/uzl/cdi/swf_h/swf_t/ndvi) for the Block 3 factorial. zones uses
+#   all indicators only.
 
 source("setup.R")
 
@@ -69,7 +71,21 @@ CONDITION_SCENARIOS <- list(
     list(tag = "global_drop_lai",   benchmark = "global",    exclude_vars = "lai"),
     list(tag = "global_drop_ndvi",  benchmark = "global",    exclude_vars = "ndvi"),
     list(tag = "upper_q75_all",     benchmark = "upper_q75", exclude_vars = character(0)),
-    list(tag = "zones_all",         benchmark = "zones",     exclude_vars = character(0))
+    list(tag = "zones_all",         benchmark = "zones",     exclude_vars = character(0)),
+
+    # ── q75 × indicator-LOO (agricultural-relevant) — for the Block 3 factorial ──
+    # The scaling × construction factorial needs each LOO construction at BOTH the
+    # global (anomaly) and upper_q75 references. The global LOO rasters already
+    # exist above; these add the matching upper_q75 versions. LOO is restricted to
+    # the agricultural EC indicators (setup.r): smd/sbd/soc + uzl/cdi/swf_h/swf_t/ndvi.
+    list(tag = "upper_q75_drop_smd",   benchmark = "upper_q75", exclude_vars = "smd"),
+    list(tag = "upper_q75_drop_sbd",   benchmark = "upper_q75", exclude_vars = "sbd"),
+    list(tag = "upper_q75_drop_soc",   benchmark = "upper_q75", exclude_vars = "soc"),
+    list(tag = "upper_q75_drop_uzl",   benchmark = "upper_q75", exclude_vars = "uzl"),
+    list(tag = "upper_q75_drop_cdi",   benchmark = "upper_q75", exclude_vars = "cdi"),
+    list(tag = "upper_q75_drop_swf_h", benchmark = "upper_q75", exclude_vars = "swf_h"),
+    list(tag = "upper_q75_drop_swf_t", benchmark = "upper_q75", exclude_vars = "swf_t"),
+    list(tag = "upper_q75_drop_ndvi",  benchmark = "upper_q75", exclude_vars = "ndvi")
 )
 
 # Load data
@@ -342,7 +358,8 @@ for (scenario in CONDITION_SCENARIOS) {
 cat("\n=== SCENARIO PROCESSING COMPLETE ===\n")
 written_files <- list.files(OUTPUT_DIR, pattern = "\\.tif$", full.names = FALSE)
 cat(sprintf("Files written to %s: %d\n", OUTPUT_DIR, length(written_files)))
-cat(sprintf("Expected: %d (14 scenarios x 2 rasters)\n", 14 * 2))
+cat(sprintf("Expected: %d (%d scenarios x 2 rasters)\n",
+            length(CONDITION_SCENARIOS) * 2, length(CONDITION_SCENARIOS)))
 for (f in written_files) cat(sprintf("  %s\n", f))
 cat("\n✓ Ecosystem condition anomaly scenarios completed!\n")
 

@@ -357,9 +357,15 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     # Initialize updated conditions
     updated_conditions = {}
     
-    # Process only objectives that are available in initial_conditions
-    available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly'] 
-                                   if obj in initial_conditions]
+    # Process only objectives that are available in initial_conditions AND are
+    # actual optimisation objectives. Keys loaded purely as data dependencies for
+    # computed objectives (e.g. abiotic/biotic anomaly used to build the precomputed
+    # restoration_potential_1d / landscape_context_1d arrays) are listed in
+    # _dependency_keys; their updated anomalies are never read by evaluate_raw_objectives,
+    # so skipping them here avoids full-raster copies + dilation every evaluation.
+    _dep_only = initial_conditions.get('_dependency_keys', set())
+    available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']
+                                   if obj in initial_conditions and obj not in _dep_only]
     
     for objective in available_anomaly_objectives:
         original_values = initial_conditions[objective].copy()
@@ -489,7 +495,23 @@ class RestorationProblem(ElementwiseProblem):
             'neighbor_radius': 3,  # Fixed value
             'neighbor_effect_decay': 0.2  # Fixed value
         }
-        
+
+        # restoration_potential objective formulation (Axis 2 — uncertainty in how
+        # the restoration target is operationalised):
+        #   'sum'       – total improvement: minimise summed baseline restoration_potential
+        #                 over selected pixels (selects the most degraded pixels).
+        #   'threshold' – area exceeding a target: maximise the count of selected pixels
+        #                 whose post-restoration condition crosses into 'good' state
+        #                 (restoration_potential + improvement > rp_threshold).
+        # The two formulations represent alternative restoration targets over the same
+        # ecological objective; switching between them isolates the effect of objective
+        # construction on spatial priorities.
+        self.rp_formulation = str(scenario_params.get('rp_formulation', 'sum')).lower()
+        self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
+        # First-order per-pixel condition gain from restoration, applied to the combined
+        # (abiotic + biotic) restoration_potential score used by the threshold formulation.
+        self.rp_improvement = 0.5 * (abiotic_effect + biotic_effect)
+
         # Determine which objectives are available
         self.objective_names = []
         _dep_only = set(initial_conditions.get('_dependency_keys', set()))
@@ -591,7 +613,12 @@ class RestorationProblem(ElementwiseProblem):
                 scale = float(np.nansum(np.abs(ctx)))
             elif obj_name == 'restoration_potential':
                 rp = self.initial_conditions['restoration_potential_1d']
-                scale = float(np.nansum(np.abs(rp)))
+                if getattr(self, 'rp_formulation', 'sum') == 'threshold':
+                    # Count-based objective: scale by the number of eligible pixels
+                    # so the normalised value falls in [-1, 0].
+                    scale = float(len(rp))
+                else:
+                    scale = float(np.nansum(np.abs(rp)))
             elif obj_name == 'implementation_cost':
                 c = self.initial_conditions['implementation_cost']
                 if rest_mask is not None and conv_mask is not None:
@@ -665,9 +692,18 @@ class RestorationProblem(ElementwiseProblem):
             elif obj_name == 'restoration_potential':
                 # Precomputed per-pixel mean of abiotic and biotic baseline anomaly.
                 # Lower value = pixel more degraded on both dimensions = higher potential.
-                # Minimised directly: selecting more degraded pixels gives a more negative sum.
                 rp = self.initial_conditions['restoration_potential_1d']
-                obj_value = float(np.sum(rp[x_restore == 1]))
+                sel = (x_restore == 1)
+                if self.rp_formulation == 'threshold':
+                    # Area-exceeding-threshold formulation: count selected pixels whose
+                    # post-restoration condition crosses into 'good' state. Negated so the
+                    # minimiser maximises the restored area reaching the target.
+                    post_rp = rp[sel] + self.rp_improvement
+                    obj_value = -float(np.count_nonzero(post_rp > self.rp_threshold))
+                else:
+                    # Total-improvement formulation: minimise summed baseline potential
+                    # (selecting more degraded pixels gives a more negative sum).
+                    obj_value = float(np.sum(rp[sel]))
             elif obj_name == 'es_future_val':
                 # Sum of per-pixel ES performance over selected restoration pixels.
                 # Higher = greater total future ES gain → maximise (negate for pymoo minimisation).
