@@ -419,8 +419,10 @@ class PatchAwareSampling(Sampling):
         # Set by _build_operators only when burden_sharing='yes' and admin data
         # is available; no effect on runs without burden sharing.
         self.patch_region_assignments = patch_region_assignments  # dict or None
-        # per_objective_patch_scores: shape (n_obj, n_patches) — seeds one extreme
-        # solution per objective into the initial population (warm start).
+        # per_objective_patch_scores: shape (n_scored_obj, n_patches) — seeds one
+        # extreme solution per SCORED objective into the initial population (warm
+        # start). Objectives without a per-patch score (e.g. spatial_clustering) are
+        # absent and get no warm-seed, avoiding a scan-order placeholder seed.
         self.per_objective_patch_scores = (
             np.asarray(per_objective_patch_scores, dtype=np.float64)
             if per_objective_patch_scores is not None else None
@@ -475,7 +477,12 @@ class PatchAwareSampling(Sampling):
         pixel-count tolerance as normal repair.
         """
         target_max = int(self.target_pixels * (1 + self.pixel_tolerance))
-        order = np.argsort(-score_vec)
+        # Break ties randomly: argsort over equal scores otherwise returns patches in
+        # index (raster scan) order, which seeds a solid block along the raster's top
+        # edge. Tiny jitter (≪ score spacing) randomises ties without changing the
+        # ranking of genuinely different scores. Deterministic under the run seed.
+        jitter = 1e-9 * np.random.random(score_vec.shape[0])
+        order = np.argsort(-(score_vec + jitter))
         active = np.zeros(n_patches, dtype=int)
         current = 0
         for idx in order:
@@ -682,6 +689,7 @@ class PatchRepair(Repair):
                  patch_mappings=None, pixel_tolerance=0.05,
                  patch_scores=None, score_temperature=0.5, top_k=12,
                  per_objective_patch_scores=None, ref_dirs=None,
+                 score_obj_indices=None,
                  patch_region_assignments=None):
         super().__init__()
         self.constraint_type = constraint_type
@@ -691,13 +699,18 @@ class PatchRepair(Repair):
         self.patch_scores = patch_scores
         self.score_temperature = float(score_temperature)
         self.top_k = int(max(2, top_k))
-        # per_objective_patch_scores: shape (n_obj, n_patches), one row per objective
-        # (order matches problem.objective_names).  ref_dirs: shape (n_ref_dirs, n_obj).
-        # When both are provided, repair blends the objective rows using the
-        # reference-direction weights assigned to each individual by NSGA-III.
+        # per_objective_patch_scores: shape (n_scored_obj, n_patches), one row per
+        # objective that HAS a per-patch score.  ref_dirs: shape (n_ref_dirs, n_obj).
+        # score_obj_indices maps each score row to its column in the n_obj weight
+        # vector, so objectives without a score (e.g. spatial_clustering) are simply
+        # excluded from the blend rather than given a degenerate placeholder row.
         self.per_objective_patch_scores = (
             np.asarray(per_objective_patch_scores, dtype=np.float64)
             if per_objective_patch_scores is not None else None
+        )
+        self.score_obj_indices = (
+            np.asarray(score_obj_indices, dtype=int)
+            if score_obj_indices is not None else None
         )
         self.ref_dirs = (
             np.asarray(ref_dirs, dtype=np.float64)
@@ -755,6 +768,10 @@ class PatchRepair(Repair):
                 try:
                     niche_idx = int(niches[i % len(niches)])
                     weights = self.ref_dirs[niche_idx]          # shape (n_obj,)
+                    # Subset weights to the objectives that actually have score rows,
+                    # keeping weights row-aligned with per_objective_patch_scores.
+                    if self.score_obj_indices is not None:
+                        weights = weights[self.score_obj_indices]
                     blended = np.einsum('o,op->p', weights, self.per_objective_patch_scores)
                     # Normalise to [0, 1] so temperature is comparable across directions.
                     b_min, b_max = blended.min(), blended.max()

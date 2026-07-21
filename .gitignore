@@ -84,3 +84,5 @@ Documentation/archive/WBF_presentation_files/*
 Debugs_tests/_smoke_axis2.py
 Documentation/BE_bern.rds
 Documentation/map_bern_landuse.R
+.quarto/vdoc/.vdoc.2702a178-a164-47d3-af39-931d7435ced0.r
+Documentation/CH_switzerland.rds

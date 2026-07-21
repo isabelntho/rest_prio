@@ -161,11 +161,12 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
 
     if "landscape_context_1d" in initial_conditions:
         ctx = initial_conditions["landscape_context_1d"].astype(np.float64)
-        # Invert: lower context anomaly (better surroundings) → higher repair score
+        # Anomaly convention: HIGHER context anomaly = neighbours in better condition.
+        # Favour good-condition surroundings → higher ctx gets the higher repair score.
         ctx_min, ctx_max = np.nanmin(ctx), np.nanmax(ctx)
         span = ctx_max - ctx_min
         if span > 1e-12:
-            scores["landscape_context"] = 1.0 - (ctx - ctx_min) / span
+            scores["landscape_context"] = (ctx - ctx_min) / span
         else:
             scores["landscape_context"] = np.full(len(ctx), 0.5, dtype=np.float64)
 
@@ -178,6 +179,14 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
             scores["restoration_potential"] = 1.0 - (rp - rp_min) / span
         else:
             scores["restoration_potential"] = np.full(len(rp), 0.5, dtype=np.float64)
+
+    # NOTE: spatial_clustering deliberately has NO per-pixel score. Clustering is a
+    # property of the whole selection, not of any single pixel, so there is no valid
+    # per-patch preference to seed or repair toward. A uniform placeholder is worse
+    # than nothing: argsort over a constant collapses to patch-index (raster scan)
+    # order, which warm-seeds a solid band along the north edge of the raster. The
+    # objective is left to emerge from evaluation + selection; the score machinery
+    # below subsets reference-direction weights to the objectives that DO have scores.
 
     return scores
 
@@ -508,6 +517,14 @@ class RestorationProblem(ElementwiseProblem):
         # construction on spatial priorities.
         self.rp_formulation = str(scenario_params.get('rp_formulation', 'sum')).lower()
         self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
+
+        # spatial_clustering objective metric:
+        #   'adjacency'  – count orthogonal shared edges between selected pixels
+        #                  (compactness; correlates strongly with cost in tests).
+        #   'components' – count disconnected clusters (4-connectivity); minimised.
+        #                  Insensitive to cluster size/shape, so it measures pure
+        #                  fragmentation and may decouple from cost.
+        self.clustering_metric = str(scenario_params.get('clustering_metric', 'adjacency')).lower()
         # First-order per-pixel condition gain from restoration, applied to the combined
         # (abiotic + biotic) restoration_potential score used by the threshold formulation.
         self.rp_improvement = 0.5 * (abiotic_effect + biotic_effect)
@@ -527,6 +544,8 @@ class RestorationProblem(ElementwiseProblem):
             self.objective_names.append('landscape_context')
         if 'restoration_potential_1d' in initial_conditions:
             self.objective_names.append('restoration_potential')
+        if initial_conditions.get('spatial_clustering_enabled', False):
+            self.objective_names.append('spatial_clustering')
         if 'implementation_cost' in initial_conditions:
             self.objective_names.append('implementation_cost')
         if 'es_future_val_1d' in initial_conditions:
@@ -625,6 +644,19 @@ class RestorationProblem(ElementwiseProblem):
                     scale = float(np.nansum(np.abs(c[rest_mask])) + np.nansum(np.abs(c[conv_mask])))
                 else:
                     scale = float(np.nansum(np.abs(c)))
+            elif obj_name == 'spatial_clustering':
+                # max_action_pixels is not yet set when this runs, so derive it here.
+                _max_frac = float(self.scenario_params['max_restoration_fraction'])
+                _n_rest = int(self.initial_conditions['n_restoration_pixels'])
+                _max_pix = max(int(_max_frac * _n_rest), 1)
+                if getattr(self, 'clustering_metric', 'adjacency') == 'components':
+                    # Worst case: every selected pixel its own component → ~max_pix
+                    # clusters. Scale by the pixel budget so normalised ∈ ~[0, 1].
+                    scale = float(_max_pix)
+                else:
+                    # A perfectly compact block of N pixels has at most ~2N shared
+                    # edges, so scale by 2 × the pixel budget → normalised ∈ ~[-1, 0].
+                    scale = float(2 * _max_pix)
             elif obj_name == 'es_future_val':
                 esv = self.initial_conditions['es_future_val_1d']
                 scale = float(np.nansum(np.abs(esv)))
@@ -685,8 +717,11 @@ class RestorationProblem(ElementwiseProblem):
                 obj_value = -float(np.sum(cg[x_convert == 1]))
             elif obj_name == 'landscape_context':
                 # Precomputed per-pixel focal-mean neighbour anomaly; sum over restored pixels.
-                # Lower value = neighbours in better condition = more supportive context.
-                # Minimised directly (no negation needed).
+                # Anomaly convention (see restoration_effect / anomaly_improvement_weight):
+                # HIGHER anomaly = better condition, lower/negative = more degraded.
+                # Good-condition surroundings => HIGH ctx. Negated so the minimiser maximises
+                # summed neighbour condition, i.e. favours restoring pixels embedded in
+                # good-condition surroundings.
                 ctx = self.initial_conditions['landscape_context_1d']
                 obj_value = -float(np.sum(ctx[x_restore == 1]))
             elif obj_name == 'restoration_potential':
@@ -704,6 +739,30 @@ class RestorationProblem(ElementwiseProblem):
                     # Total-improvement formulation: minimise summed baseline potential
                     # (selecting more degraded pixels gives a more negative sum).
                     obj_value = float(np.sum(rp[sel]))
+            elif obj_name == 'spatial_clustering':
+                # Spatial clustering of the selected restoration pixels. Map the
+                # selected eligible pixels back to the 2D raster, then score one of
+                # two metrics (self.clustering_metric):
+                shape = self.initial_conditions['shape']
+                sel_idx = self.initial_conditions['restoration_eligible_indices'][x_restore == 1]
+                sel_mask = np.zeros(shape, dtype=bool)
+                rows, cols = np.divmod(sel_idx, shape[1])
+                sel_mask[rows, cols] = True
+                if self.clustering_metric == 'components':
+                    # Number of disconnected clusters (4-connectivity). Fewer = more
+                    # clumped. Minimised directly. Insensitive to cluster size/shape
+                    # — measures pure fragmentation — so it need not track cost the
+                    # way edge count (∝ amount of contiguous land bought) does.
+                    _, n_comp = ndimage.label(sel_mask)
+                    obj_value = float(n_comp)
+                else:
+                    # 'adjacency' (default): orthogonal like-adjacencies — pairs of
+                    # selected pixels sharing an edge. More shared edges = more
+                    # compact. Negated so the pymoo minimiser maximises it. Cheap:
+                    # two boolean shift-AND reductions, no neighbourhood convolution.
+                    horiz = np.count_nonzero(sel_mask[:, :-1] & sel_mask[:, 1:])
+                    vert = np.count_nonzero(sel_mask[:-1, :] & sel_mask[1:, :])
+                    obj_value = -float(horiz + vert)
             elif obj_name == 'es_future_val':
                 # Sum of per-pixel ES performance over selected restoration pixels.
                 # Higher = greater total future ES gain → maximise (negate for pymoo minimisation).
@@ -1252,6 +1311,11 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
         # Map internal objective names → score keys used by build_per_objective_repair_scores.
         # This ensures per_obj_patch_scores matches the actual objectives in the run.
+        # Objectives WITHOUT a meaningful per-patch score (e.g. spatial_clustering,
+        # which is configuration-level) are intentionally absent here. They get no
+        # warm-seed and are excluded from direction-aware repair blending via
+        # _score_obj_indices below — never given a placeholder score, which would
+        # otherwise collapse argsort-based seeding to raster scan order.
         _obj_to_score_key = {
             'abiotic_anomaly':     'abiotic',
             'biotic_anomaly':      'biotic',
@@ -1259,11 +1323,16 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             'landscape_context':   'landscape_context',
             'restoration_potential': 'restoration_potential',
         }
-        _score_keys = [
-            _obj_to_score_key[obj]
-            for obj in problem.objective_names
-            if obj in _obj_to_score_key and _obj_to_score_key[obj] in per_obj_pixel_scores
-        ]
+        # Walk objective_names once so _score_keys (which scores) and
+        # _score_obj_indices (their column in the n_obj ref-direction weight vector)
+        # stay row-aligned with per_obj_patch_scores.
+        _score_keys = []
+        _score_obj_indices = []
+        for _oi, obj in enumerate(problem.objective_names):
+            key = _obj_to_score_key.get(obj)
+            if key is not None and key in per_obj_pixel_scores:
+                _score_keys.append(key)
+                _score_obj_indices.append(_oi)
         per_obj_patch_scores = np.stack([
             aggregate_patch_scores_from_pixel_scores(
                 patch_mappings=initial_conditions['patch_mappings'],
@@ -1272,7 +1341,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
                 mode='mean',
             )
             for key in _score_keys
-        ], axis=0)  # shape (n_objectives, n_patches)
+        ], axis=0)  # shape (n_scored_objectives, n_patches)
 
         repair_ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=12)
 
@@ -1311,6 +1380,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             top_k=patch_repair_top_k,
             per_objective_patch_scores=per_obj_patch_scores if warm_seeding else None,
             ref_dirs=repair_ref_dirs,
+            score_obj_indices=_score_obj_indices,
             patch_region_assignments=patch_region_assignments,
         ) if use_repair else None
 
@@ -1615,8 +1685,8 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     """
     # --- 1. Initialize patch approach if not already done ---
     if use_patch_approach and not initial_conditions.get('patch_approach_enabled', False):
-        if verbose:
-            print(f"Initializing patch approach with patch_size={patch_size}...")
+        #if verbose:
+            #print(f"Initializing patch approach with patch_size={patch_size}...")
         initial_conditions = initialize_patch_approach(initial_conditions, patch_size=patch_size)
 
     # --- 2. Print run header ---

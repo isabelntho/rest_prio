@@ -22,7 +22,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "iEMSs_factorial"
+RUN_LABEL = "notol_test"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -34,7 +34,7 @@ REGION = "Bern"
 #   "policy_grid"    runs each entry in POLICY_VARIANTS once against CONDITION_SCENARIO
 #   "factorial"      fully-crossed design over FACTORIAL_FORMS x FACTORIAL_SCALINGS x
 #                    FACTORIAL_CONSTRUCTIONS x FACTORIAL_POLICIES x SEEDS (iEMSs Block 4)
-SCENARIO_MODE = "factorial"
+SCENARIO_MODE = "custom"
 
 # Condition scenario tag — selects pre-computed anomaly rasters from inputs/anomaly_scenarios/
 # Available tags:
@@ -47,8 +47,8 @@ CONDITION_SCENARIO = "global_all"
 # Seeds used by both condition_grid and policy_grid modes.
 #   List[int] — runs each scenario/variant once per seed; labels: <name>_seed<n>
 #   None       — runs each scenario/variant once using RANDOM_SEED; labels: <name>
-SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
-
+#SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
+SEEDS = 101
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
 
@@ -56,7 +56,7 @@ log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.l
 if log_path:
     print(f"Verbose output → {log_path}")
 
-OBJECTIVES = ["restoration_potential", "landscape_context", "cost"]  # iEMSs headline objectives
+OBJECTIVES = ["restoration_potential", "spatial_clustering", "cost"]  # iEMSs headline objectives
 #OBJECTIVES = ["abiotic", "biotic", "cost"]
 #["restoration_potential", "cost", "es_future_val", "es_future_robustness"] # test ES future value as an objective
 # Available objective names:
@@ -70,6 +70,11 @@ OBJECTIVES = ["restoration_potential", "landscape_context", "cost"]  # iEMSs hea
 #                             rewards selecting pixels whose surroundings are already in good condition
 #   "restoration_potential" – minimise mean of per-pixel abiotic + biotic baseline anomaly;
 #                             single combined ecological condition score (lower = more degraded = higher potential)
+#   "spatial_clustering"    – maximise spatial compactness of the selected pixels
+#                             (number of orthogonal shared edges between selected pixels;
+#                             configuration-dependent, computed each evaluation). Rewards
+#                             clumped solutions. NB: distinct from the custom_scenario_params
+#                             'spatial_clustering' knob, which only soft-biases sampling.
 #   "es_future_val"         – maximise total ES performance of selected pixels under future scenarios
 #                             (source: Mean_sum_of_change_ES.tif; higher sum = greater future ES gain)
 #   "es_future_robustness"  – minimise total ES instability of selected pixels under future scenarios
@@ -79,7 +84,7 @@ SAMPLE_SEED = 42
 POP_SIZE = 92 #previously 50?
 N_GENERATIONS = 100
 N_JOBS = 12
-RANDOM_SEED = 100 #42
+RANDOM_SEED = 101 #42
 N_SAMPLES_PER_PARAM = 3
 N_PARTITIONS = 12 #6 # for 4 objectives 6
 WARM_SEEDING = True
@@ -100,6 +105,10 @@ custom_scenario_params = {
     #   "threshold" = area of restored pixels reaching 'good' condition (> rp_threshold)
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
+    # Metric for the "spatial_clustering" objective (only used when it is in OBJECTIVES):
+    #   "adjacency"  = shared-edge count (compactness); strongly correlated with cost
+    #   "components" = number of disconnected clusters (fragmentation); test for decoupling
+    "clustering_metric": "adjacency",
 }
 
 # Named policy scenarios for SCENARIO_MODE == "policy_grid".
@@ -169,7 +178,7 @@ FACTORIAL_POLICIES = {
 USE_PATCH_APPROACH = True
 PATCH_SIZE = 2
 PATCH_CONSTRAINT_TYPE = 'pixel_count'
-PIXEL_TOLERANCE = 0.15
+PIXEL_TOLERANCE = 0.05#.15
 
 # Spatial aggregation: block-coarsen all input rasters by this integer factor before optimisation.
 # 2 = halve resolution in each dimension (~4x fewer pixels). Set to None or 1 to disable.

@@ -19,7 +19,7 @@ import numpy as np
 import tempfile
 import rasterio as rio
 import geopandas as gpd
-from .spatial_operations import compute_sn_dens, compute_connectivity_gain_array
+from .spatial_operations import compute_sn_dens, compute_sn_dens_array, compute_connectivity_gain_array
 
 logger = logging.getLogger("resto_prio")
 
@@ -635,6 +635,11 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         # the formulation under test.
         'landscape_context': None,
         'restoration_potential': None,
+        # spatial_clustering has no underlying raster: it is a configuration-dependent
+        # compactness metric computed from the selected-pixel geometry at evaluation time
+        # (see RestorationProblem.evaluate_raw_objectives). None → treated as a computed
+        # objective; only an enable flag is set in initial_conditions.
+        'spatial_clustering': None,
         'cost': 'inputs/implementation_cost_corrected.tif',
         'population_proximity': 'inputs/population_proximity.tif',
         'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',
@@ -1189,53 +1194,90 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             logger.warning("'connectivity' objective requested but landscape_lulc_data not available; skipping.")
 
     # Compute landscape_context if requested.
-    # For each restoration-eligible pixel: equal-weight mean of the focal-mean abiotic anomaly
-    # and focal-mean biotic anomaly of eligible neighbours within a focal radius
-    # (default 500 m = 5 px at 100 m resolution), excluding the pixel itself.
-    # Lower value → neighbours in better combined condition → more supportive landscape context.
+    # HYBRID structural/condition context (range ~[0, 1]; HIGHER = more supportive):
+    #     ctx = (1 - w) * sn_dens  +  w * good_neighbour_fraction
+    #   sn_dens                = focal proportion of semi-natural habitat within 300 m
+    #                            (structural connectivity, from the landscape LULC; this is
+    #                            INDEPENDENT of the abiotic/biotic condition field).
+    #   good_neighbour_fraction = proportion of eligible neighbours within 500 m that are in
+    #                            good condition (abiotic > 0 AND biotic > 0); excludes self.
+    #   w = LC_CONDITION_WEIGHT = how much surrounding CONDITION modulates the otherwise
+    #                            structural context.
+    #
+    # Rationale: a pure condition context is near-collinear with restoration_potential (both
+    # derive from the abiotic/biotic anomaly), which collapses the trade-off front. Anchoring
+    # on the structural sn_dens layer keeps landscape_context an independent objective
+    # (prototype pixel-level r with restoration_potential ≈ 0.28 for sn_dens vs ≈ 0.52 for
+    # condition-only; w=0.25 ≈ 0.37), while still letting surrounding condition contribute.
+    # See DEVELOPMENT_TRACKER 2026-06-24.  Anomaly convention (restoration_effect): positive
+    # = good, negative = degraded.  To change the structural/condition balance, edit
+    # LC_CONDITION_WEIGHT below.
+    LC_CONDITION_WEIGHT = 0.25
     if 'landscape_context' in computed_objectives:
         _has_abiotic = 'abiotic_anomaly' in initial_conditions
         _has_biotic  = 'biotic_anomaly'  in initial_conditions
-        if _has_abiotic or _has_biotic:
+        _has_lulc    = 'landscape_lulc_data' in initial_conditions
+        if _has_lulc or _has_abiotic or _has_biotic:
             from scipy.ndimage import uniform_filter
-            _radius_px   = 5  # 500 m at 100 m resolution
+            _w = min(max(float(LC_CONDITION_WEIGHT), 0.0), 1.0)
+            _radius_px   = 5  # 500 m at 100 m resolution (condition focal window)
             _kernel_size = 2 * _radius_px + 1  # 11 × 11 box approximation
             _elig_2d     = initial_conditions['restoration_eligible_mask']
-            _count_elig  = _elig_2d.astype(np.float64)
-            _cnt_focal   = uniform_filter(_count_elig, size=_kernel_size, mode='constant') * (_kernel_size ** 2)
-            _cnt_neigh   = np.maximum(_cnt_focal - 1.0, 0.0)  # exclude self
+            _elig_float  = _elig_2d.astype(np.float64)
 
-            def _focal_mean_neighbours(anom_2d):
-                """Focal mean over eligible neighbours, excluding the pixel itself."""
-                _anom_elig = np.where(_elig_2d, anom_2d, 0.0).astype(np.float64)
-                _sum_focal = (uniform_filter(_anom_elig, size=_kernel_size, mode='constant')
-                              * (_kernel_size ** 2))
-                _sum_focal = _sum_focal - anom_2d  # subtract self
+            # --- structural component: sn_dens = proportion of semi-natural habitat (300 m) ---
+            _sn_dens = None
+            if _has_lulc:
+                _lu   = initial_conditions['landscape_lulc_data']
+                _meta = initial_conditions.get('landscape_lulc_meta', {}) or {}
+                try:
+                    _res = abs(float(_meta['transform'][0]))
+                except Exception:
+                    _res = 100.0
+                _nodata = _meta.get('nodata') if isinstance(_meta, dict) else None
+                # Forest + grassland classes in the landscape LULC encoding (matches the
+                # existing landscape_anomaly / sn_dens machinery).
+                _focal_classes = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+                                  56, 57, 58, 59, 60, 64, 65, 66, 67]
+                _sn_dens = compute_sn_dens_array(_lu, _nodata, _res, _focal_classes, radius_m=300)
+
+            # --- condition component: fraction of eligible neighbours in good condition ---
+            _cond = None
+            if _has_abiotic or _has_biotic:
+                _cnt_focal = uniform_filter(_elig_float, size=_kernel_size, mode='constant') * (_kernel_size ** 2)
+                _cnt_neigh = np.maximum(_cnt_focal - _elig_float, 0.0)  # exclude self
+                _good_condition = _elig_2d.copy()
+                if _has_abiotic:
+                    _good_condition = _good_condition & (initial_conditions['abiotic_anomaly'] > 0)
+                if _has_biotic:
+                    _good_condition = _good_condition & (initial_conditions['biotic_anomaly'] > 0)
+                _good_float = _good_condition.astype(np.float64)
+                _good_focal = uniform_filter(_good_float, size=_kernel_size, mode='constant') * (_kernel_size ** 2)
+                _good_neigh = np.maximum(_good_focal - _good_float, 0.0)  # exclude self
                 with np.errstate(invalid='ignore', divide='ignore'):
-                    return np.where(_cnt_neigh > 0, _sum_focal / _cnt_neigh, 0.0)
+                    _cond = np.where(_cnt_neigh > 0, _good_neigh / _cnt_neigh, 0.0)
 
-            _component_maps = []
-            if _has_abiotic:
-                _component_maps.append(_focal_mean_neighbours(
-                    initial_conditions['abiotic_anomaly'].copy()))
-            if _has_biotic:
-                _component_maps.append(_focal_mean_neighbours(
-                    initial_conditions['biotic_anomaly'].copy()))
-
-            # Equal-weight mean across available components
-            _ctx_2d = np.mean(np.stack(_component_maps, axis=0), axis=0)
+            # --- blend (degrade gracefully if a component is unavailable) ---
+            if _sn_dens is not None and _cond is not None:
+                _ctx_2d = (1.0 - _w) * np.nan_to_num(_sn_dens, nan=0.0) + _w * _cond
+                _label = f"hybrid: (1-{_w:.2f})*sn_dens[300m] + {_w:.2f}*good_neighbour_fraction"
+            elif _sn_dens is not None:
+                _ctx_2d = np.nan_to_num(_sn_dens, nan=0.0)
+                _label = "structural sn_dens[300m] only (no abiotic/biotic available)"
+            else:
+                _ctx_2d = _cond
+                _label = "condition good_neighbour_fraction only (no landscape LULC available)"
 
             initial_conditions['landscape_context'] = _ctx_2d
             flat_ctx = _ctx_2d.flatten()
             initial_conditions['landscape_context_1d'] = flat_ctx[restoration_eligible_indices].astype(np.float64)
             logger.info(
-                f"landscape_context computed (components={len(_component_maps)}): "
-                f"radius={_radius_px}px, "
+                f"landscape_context computed ({_label}): "
                 f"1d length={len(initial_conditions['landscape_context_1d'])}, "
                 f"mean={initial_conditions['landscape_context_1d'].mean():.4f}"
             )
         else:
-            logger.warning("'landscape_context' objective requested but neither abiotic_anomaly nor biotic_anomaly is available; skipping.")
+            logger.warning("'landscape_context' objective requested but neither landscape LULC nor abiotic/biotic is available; skipping.")
 
     # Build 1D slice when landscape_context was loaded from a pre-computed file.
     if 'landscape_context' in initial_conditions and 'landscape_context_1d' not in initial_conditions:
@@ -1315,6 +1357,13 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             f"mean={initial_conditions['es_future_robustness_1d'].mean():.4f}, "
             f"zero/NaN-filled in eligible area={_nan_in_elig_r}"
         )
+
+    # spatial_clustering is computed from the selected-pixel geometry at evaluation
+    # time, so there is no per-pixel array to build here — only a flag telling
+    # RestorationProblem to register it as an objective.
+    if 'spatial_clustering' in computed_objectives:
+        initial_conditions['spatial_clustering_enabled'] = True
+        logger.info("spatial_clustering objective enabled (configuration-dependent compactness)")
 
     initial_conditions['sample_info'] = {
         'sample_fraction': sample_fraction,
