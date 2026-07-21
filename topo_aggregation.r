@@ -4,7 +4,7 @@ library(ggplot2)
 library(sf)
 library(patchwork)
 
-raster_path <- "inputs/implementation_cost.tif"
+raster_path <- "data/implementation_cost.tif"
 plot_dir <- "topo_aggregation_plots"
 n_variogram_samples <- 5000
 n_seeds <- 100

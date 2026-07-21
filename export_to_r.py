@@ -422,12 +422,12 @@ if __name__ == "__main__":
 
 #eligible = ic["eligible_mask"].astype(np.uint8)  # 1=eligible, 0=not eligible
 
-#with rio.open("inputs/abiotic_condition_anomaly.tif") as src:
+#with rio.open("data/abiotic_condition_anomaly.tif") as src:
 #    profile = src.profile.copy()
 
 #profile.update(dtype=rio.uint8, count=1, nodata=None)
 
-#out_path = "inputs/eligible_pixels_fg.tif"
+#out_path = "data/eligible_pixels_fg.tif"
 #with rio.open(out_path, "w", **profile) as dst:
 #    dst.write(eligible, 1)
 

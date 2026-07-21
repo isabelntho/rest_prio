@@ -1,0 +1,84 @@
+{
+  "schema_note": "Provenance pointer manifest. Points to authoritative sources rather than embedding them. Revise the git_commit and any changed paths whenever this is regenerated.",
+  "model": {
+    "name": "rest_prio restoration prioritisation optimiser",
+    "type": "many-objective evolutionary optimisation (NSGA-III, pymoo)",
+    "study_area": "Kanton Bern, Switzerland",
+    "crs": "EPSG:2056 (Swiss LV95)",
+    "target_ecosystem": "forest + grassland (fg); LULC classes 12, 13, 16, 17"
+  },
+  "code_provenance": {
+    "vcs": "git",
+    "git_commit": "5fbf0a7921a23d6da3f53d20b09186c70dc5438c",
+    "git_branch": "unit_dev",
+    "note": "Update git_commit when regenerating this manifest.",
+    "core_package": "Core_optimisation/",
+    "change_log": "Documentation/DEVELOPMENT_TRACKER.md"
+  },
+  "environment": {
+    "python": {
+      "manager": "pixi",
+      "spec": "pixi.toml",
+      "lockfile": "pixi.lock",
+      "conda_env_export": "environment.yml"
+    },
+    "r": {
+      "manager": "renv",
+      "lockfile": "renv.lock"
+    }
+  },
+  "input_data": {
+    "directory": "data/",
+    "crs": "EPSG:2056",
+    "note": "All rasters co-registered to a common extent, CRS, and resolution.",
+    "primary_rasters": [
+      {"file": "data/abiotic_condition_anomaly.tif", "role": "baseline abiotic condition anomaly (signed float; negative = degraded)"},
+      {"file": "data/biotic_condition_anomaly.tif", "role": "baseline biotic condition anomaly (signed float; negative = degraded)"},
+      {"file": "data/implementation_cost_corrected.tif", "role": "per-pixel restoration cost (default cost raster)"},
+      {"file": "data/eligible_pixels_fg.tif", "role": "eligible-pixel mask (target LULC intersected with valid objective values)"}
+    ],
+    "derived_layers": {
+      "note": "Computed in-memory by data_loader.py at load time, NOT read as primary inputs. The data/landscape_context.tif and data/restoration_potential.tif files exist but are legacy/unused for the default path.",
+      "restoration_potential": "mean of abiotic + biotic baseline anomaly per eligible pixel",
+      "landscape_context": "hybrid 0.75*sn_dens[300 m] + 0.25*good-neighbour-fraction[500 m]; higher = more supportive (redefined 2026-06-24)",
+      "connectivity_gain": "per-pixel focal-habitat gain, circular kernel radius ~100 m"
+    },
+    "scenario_rasters": {
+      "directory": "data/anomaly_scenarios/",
+      "role": "condition-anomaly scenarios: global vs upper_q75 benchmark, and leave-one-out indicator variants",
+      "generator": "data/ec_anomalies.r"
+    },
+    "superseded": [
+      {"file": "data/implementation_cost.tif", "note": "superseded by implementation_cost_corrected.tif (zero-cost grassland bug fixed 2026-04-16)"}
+    ]
+  },
+  "run_provenance": {
+    "run_registry": "outputs/run_registry.jsonl",
+    "note": "Append-only log of runs. Per-run reports and pkl outputs are written to the outputs/ tree.",
+    "seed_robustness": "outputs/multi_seed_results/",
+    "spatial_agreement": "spatial_agreement_solutions_fg_2503_2.csv"
+  },
+  "key_parameters_snapshot": {
+    "note": "Values from Core_optimisation/ run scripts (run_custom.py, run_planning_unit_optimization.py). See artifacts/assumptions.md for rationale and confidence.",
+    "max_restoration_fraction": 0.05,
+    "budget_tolerance": "+/-5% (patch, pixel_tolerance=0.05); evaluated at +/-7.5%; planning-unit runs use 0.20",
+    "abiotic_effect": 0.01,
+    "biotic_effect": 0.01,
+    "anomaly_weight_scale_sigma": "1.0 in restoration_effect(), 0.5 in build_repair_scores() (code paths disagree; no run script sets the key)",
+    "anomaly_weight_gamma": 3.0,
+    "neighbour_radius_px": 3,
+    "neighbour_effect_decay": 0.2,
+    "patch_size_px": 2,
+    "algorithm": "NSGA-III",
+    "nsga3_n_partitions": 12,
+    "mutation_prob_var": "200/n_var (~200 bit-flips per individual per generation)",
+    "n_generations": 100
+  },
+  "related_artifacts": [
+    "artifacts/model_card.md",
+    "artifacts/conceptual_model.md",
+    "artifacts/assumptions.md",
+    "artifacts/uncertainty_register.md",
+    "artifacts/evaluation_report.md"
+  ]
+}

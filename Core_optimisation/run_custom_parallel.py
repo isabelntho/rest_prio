@@ -34,6 +34,7 @@ from .resto_anom import run_optimization_instance, main
 from .data_loader import load_initial_conditions
 from .grid_parallel import run_tag, run_factorial_cell
 from .logger_setup import setup_logger
+from .paths import LOGS_DIR, R_INPUTS_DIR
 
 # Available ecosystem run modes:
 # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
@@ -60,7 +61,7 @@ SCENARIO_MODE = "factorial"
 # fallback. Bound by available RAM (each concurrent run holds its own rasters).
 GRID_WORKERS = 4
 
-# Condition scenario tag — selects pre-computed anomaly rasters from inputs/anomaly_scenarios/
+# Condition scenario tag — selects pre-computed anomaly rasters from data/anomaly_scenarios/
 CONDITION_SCENARIO = "global_all"
 
 # Seeds used by both condition_grid and policy_grid modes.
@@ -69,7 +70,7 @@ SEEDS = [101, 102, 103, 104, 105]  # 5 seed replicates (iEMSs run matrix, Block 
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
 
-log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
+log_path = setup_logger(log_dir=str(LOGS_DIR), run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
 if log_path:
     print(f"Verbose output → {log_path}")
 
@@ -225,7 +226,7 @@ def _run_condition_grid(ecosystem_for_loader, all_results, run_times, run_label)
 
     # One parent dir for the whole grid: r_inputs/{timestamp}_{RUN_LABEL}/
     _grid_ts = datetime.now().strftime('%Y%m%d_%H%M')
-    _grid_r_parent = os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+    _grid_r_parent = os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
     os.makedirs(_grid_r_parent, exist_ok=True)
     print(f"  Grid R export parent: {_grid_r_parent}/")
     print(f"  Condition grid: {_grid_total} runs ({len(_condition_tags)} tags × {len(_seeds)} seeds), "
@@ -319,7 +320,7 @@ def _run_factorial(ecosystem_for_loader, all_results, run_times, run_label):
     _grid_times = {}
 
     _grid_ts = datetime.now().strftime('%Y%m%d_%H%M')
-    _grid_r_parent = os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+    _grid_r_parent = os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
     os.makedirs(_grid_r_parent, exist_ok=True)
     print(f"  Factorial design: {_grid_total} runs "
           f"({len(FACTORIAL_FORMS)} form × {len(FACTORIAL_SCALINGS)} scaling × "
@@ -453,7 +454,7 @@ def _run():
                 _grid_done  = 0
                 _grid_times = {}
                 _grid_ts = datetime.now().strftime('%Y%m%d_%H%M')
-                _pg_r_parent = os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _pg_r_parent = os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 os.makedirs(_pg_r_parent, exist_ok=True)
                 print(f"  Grid R export parent: {_pg_r_parent}/")
                 # ── policy variants ──────────────────────────────────────────────

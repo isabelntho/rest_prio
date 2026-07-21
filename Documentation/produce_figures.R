@@ -24,7 +24,7 @@ source("Documentation/_plot_functions.R")
 # ----------------------------------------------------------------------------
 # CONFIG  — edit these paths after running the full matrix (Track A step 4)
 # ----------------------------------------------------------------------------
-R_INPUTS <- "r_inputs"
+R_INPUTS <- "outputs/r_inputs"
 
 # Which figure groups to run. Set to "all" (default) to run everything, or list
 # the top-level groups you want, e.g. c("R2") or c("R1", "R3"). Subsections run
@@ -67,7 +67,7 @@ BASELINE_SCENARIO <- "global_all"
 # Benchmark scenario names within Blocks 1+2 (dim_type = "benchmark", not "indicator").
 BENCHMARK_SCENARIOS <- c("upper_q75_all")
 
-OUT_DIR <- "figs/iEMSs/iEMSs_fact_nopol"
+OUT_DIR <- "outputs/figs/iEMSs/iEMSs_fact_nopol"
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
   
 # R3 robustness map is produced at these spatial scales (metres; x,y are EPSG:2056
@@ -82,9 +82,9 @@ R3_AGG_CELLS <- c(0, 1000, 2000)
 LULC_RASTER    <- "Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif"
 HABITAT_RASTER <- "Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/Delarze/habitatmap_v1_1_20241025.tif"
 DELARZE_CSV    <- "Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/Delarze/typoch_num_lookuptable_26112025.csv"
-ABIOTIC_RASTER <- file.path("inputs", "anomaly_scenarios",
+ABIOTIC_RASTER <- file.path("data", "anomaly_scenarios",
                              paste0("abiotic_", BASELINE_SCENARIO, ".tif"))
-BIOTIC_RASTER  <- file.path("inputs", "anomaly_scenarios",
+BIOTIC_RASTER  <- file.path("data", "anomaly_scenarios",
                              paste0("biotic_",  BASELINE_SCENARIO, ".tif"))
 
 # ----------------------------------------------------------------------------
@@ -1438,7 +1438,7 @@ if (.run("R5")) {
 message("\nR5 -- cross-formulation regret matrix")
 
 R5_BUDGET   <- 21855L   # max_action_pixels; same for every factorial cell
-R5_ANOM_DIR <- file.path("inputs", "anomaly_scenarios")
+R5_ANOM_DIR <- file.path("data", "anomaly_scenarios")
 R5_THRESH   <- 0.0      # threshold form counts pixels with combined_anomaly > this
 
 # Helper: parse one factor token from a run-dir name (matches .r3d_tok style).

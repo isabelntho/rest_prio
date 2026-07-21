@@ -11,6 +11,7 @@ import time
 from .resto_anom import run_optimization_instance, main
 from .data_loader import load_initial_conditions
 from .logger_setup import setup_logger
+from .paths import LOGS_DIR, R_INPUTS_DIR
 
 # Available ecosystem run modes:
 # - 'forest'/'agricultural'/'grassland': run one filtered ecosystem
@@ -22,7 +23,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "notol_test"
+RUN_LABEL = "refactor_test"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -36,7 +37,7 @@ REGION = "Bern"
 #                    FACTORIAL_CONSTRUCTIONS x FACTORIAL_POLICIES x SEEDS (iEMSs Block 4)
 SCENARIO_MODE = "custom"
 
-# Condition scenario tag — selects pre-computed anomaly rasters from inputs/anomaly_scenarios/
+# Condition scenario tag — selects pre-computed anomaly rasters from data/anomaly_scenarios/
 # Available tags:
 #   global_all | global_drop_smd | global_drop_sbd | global_drop_soc |
 #   global_drop_uzl | global_drop_tsd | global_drop_can | global_drop_cdi |
@@ -52,7 +53,7 @@ SEEDS = 101
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
 
-log_path = setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
+log_path = setup_logger(log_dir=str(LOGS_DIR), run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
 if log_path:
     print(f"Verbose output → {log_path}")
 
@@ -141,7 +142,7 @@ BENCHMARK_SCENARIOS = ["upper_q75_all"]
 #                           "all" = full indicator set; "drop_<ind>" / reduced builds.
 #                           PLACEHOLDER — fill once the 2–3 construction levels are
 #                           defined (and the matching crossed rasters exist in
-#                           inputs/anomaly_scenarios/, produced by ec_anomalies.r).
+#                           data/anomaly_scenarios/, produced by ec_anomalies.r).
 #   FACTORIAL_POLICIES      policy/governance lever → overrides on custom_scenario_params.
 #
 # scaling × construction together select the condition_scenario raster tag,
@@ -288,7 +289,7 @@ def _run():
                 import os as _os
                 from datetime import datetime as _dt
                 _grid_ts = _dt.now().strftime('%Y%m%d_%H%M')
-                _grid_r_parent = _os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _grid_r_parent = _os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 _os.makedirs(_grid_r_parent, exist_ok=True)
                 print(f"  Grid R export parent: {_grid_r_parent}/")
                 for _tag in _condition_tags:
@@ -375,7 +376,7 @@ def _run():
                 import os as _os
                 from datetime import datetime as _dt
                 _grid_ts = _dt.now().strftime('%Y%m%d_%H%M')
-                _pg_r_parent = _os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _pg_r_parent = _os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 _os.makedirs(_pg_r_parent, exist_ok=True)
                 print(f"  Grid R export parent: {_pg_r_parent}/")
                 # ── policy variants ──────────────────────────────────────────────
@@ -514,7 +515,7 @@ def _run():
                 import os as _os
                 from datetime import datetime as _dt
                 _grid_ts = _dt.now().strftime('%Y%m%d_%H%M')
-                _grid_r_parent = _os.path.join("r_inputs", f"{_grid_ts}_{RUN_LABEL}")
+                _grid_r_parent = _os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 _os.makedirs(_grid_r_parent, exist_ok=True)
                 print(f"  Factorial design: {_grid_total} runs "
                       f"({len(FACTORIAL_FORMS)} form × {len(FACTORIAL_SCALINGS)} scaling × "

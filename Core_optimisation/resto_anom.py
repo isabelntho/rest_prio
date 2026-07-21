@@ -31,6 +31,7 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from .spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache
 from .data_loader import load_initial_conditions
 from .results_saving import save_results_with_reports
+from .paths import OUTPUT_DIR
 from .patch_approach import (
     create_patch_mappings,
     PatchRepair,
@@ -1649,7 +1650,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      hv_min_improvement=1e-6, n_jobs=None, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
-                                     output_dir=".", save_snapshots=False,
+                                     output_dir=str(OUTPUT_DIR), save_snapshots=False,
                                      run_label="", run_config=None,
                                      n_partitions=8, warm_seeding=True,
                                      r_export_parent=None):

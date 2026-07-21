@@ -2,7 +2,7 @@
 # ECOSYSTEM CONDITION ANOMALIES CALCULATION
 # =============================================================================
 # Calculates abiotic and biotic anomalies across 13 condition scenarios and
-# writes all outputs to inputs/anomaly_scenarios/.
+# writes all outputs to data/anomaly_scenarios/.
 #
 # Scenario dimensions:
 #   Benchmark:          global | upper_q75 | zones
@@ -32,7 +32,7 @@ ECT_CATEGORIES <- list(
     "landscape" = c("snh", "frag", "tcd")
 )
 
-OUTPUT_DIR <- "inputs/anomaly_scenarios"
+OUTPUT_DIR <- "data/anomaly_scenarios"
 
 # Indicator directionality:
 #   positive  — higher raw value = better condition (default; z-score as-is)

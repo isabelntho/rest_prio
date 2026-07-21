@@ -4,8 +4,10 @@ import logging
 import os
 from datetime import datetime
 
+from .paths import LOGS_DIR
 
-def setup_logger(log_dir="logs", run_label=None):
+
+def setup_logger(log_dir=None, run_label=None):
     """
     Configure the 'resto_prio' named logger.
 
@@ -21,6 +23,9 @@ def setup_logger(log_dir="logs", run_label=None):
     Returns:
         str | None: Absolute path to the log file, or None if already configured.
     """
+    if log_dir is None:
+        log_dir = str(LOGS_DIR)
+
     logger = logging.getLogger("resto_prio")
 
     # Avoid adding duplicate handlers if already configured

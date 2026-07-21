@@ -40,7 +40,7 @@ flowchart TD
 
     PIXOPS & PATCHOPS --> REF["build_fixed_ref_point()<br/>warm-up: evaluate n_samples random solutions<br/>→ fixed HV reference point [n_obj float]"]
 
-    REF --> ALGO["_build_algorithm()<br/>NSGA2(sampling, HUX crossover,<br/>BitFlip mutation prob=0.1, repair)<br/>+ get_termination('n_gen', n_generations)"]
+    REF --> ALGO["_build_algorithm()<br/>NSGA3(ref_dirs=das-dennis n_partitions=12, sampling,<br/>HUX crossover, BitFlip mutation prob=1.0 prob_var=200/n_var, repair)<br/>+ get_termination('n_gen', n_generations)"]
 
     ALGO --> OPT["minimize() — NSGA-III loop<br/>(see Diagram 3)"]
 
@@ -76,7 +76,7 @@ flowchart TD
 
     WGT --> DIR["Direct effect on action cells<br/>updated[action_mask] = baseline + effect × weight"]
 
-    NBR --> EMASK["Neighbour effect (flat spillover — 2026-04-08)<br/>binary_dilation(action_mask, circular kernel radius r)<br/>→ neighbour_mask  (action cells excluded)<br/>updated[neighbour_mask] += effect × decay<br/>(no anomaly weighting on neighbours: flat benefit regardless of neighbour anomaly value)"]
+    NBR --> EMASK["Neighbour effect (anomaly-weighted spillover)<br/>binary_dilation(action_mask, circular kernel radius r)<br/>-> neighbour_mask  (action cells excluded)<br/>updated[neighbour_mask] = baseline + effect x decay x w(neighbour anomaly)<br/>(same anomaly_improvement_weight() applied per neighbour; flat-spillover variant was tried and reverted 2026-04-08)"]
 
     NBR --> EMASK["Mask back to restoration_eligible_mask<br/>(changes outside eligible area reverted)"]
 
@@ -106,7 +106,7 @@ flowchart TD
 flowchart TD
 
     subgraph INIT["Initialisation"]
-        SAMP["Sampling.do(problem, pop_size)<br/>PIXEL — AdaptiveSampling<br/>  random select max_action_pixels from eligible pixels<br/>  optional spatial clustering / burden-sharing<br/>PATCH — PatchAwareSampling<br/>  score-guided patch selection (score_temperature, random_share)<br/>  target pixel count enforced within tolerance<br/>→ population [n_ref_dirs × n_var binary]<br/>  (n_ref_dirs = 45 for n_partitions=8, 3 objectives)"]
+        SAMP["Sampling.do(problem, pop_size)<br/>PIXEL — AdaptiveSampling<br/>  random select max_action_pixels from eligible pixels<br/>  optional spatial clustering / burden-sharing<br/>PATCH — PatchAwareSampling<br/>  score-guided patch selection (score_temperature, random_share)<br/>  target pixel count enforced within tolerance<br/>→ population [n_ref_dirs × n_var binary]<br/>  (n_ref_dirs = ~91 for n_partitions=12, 3 objectives; scales with n_obj)"]
         IREPAIR["Initial repair pass<br/>PIXEL — AdaptiveRepair: exact pixel count enforced by score<br/>PATCH — PatchRepair: whole-patch add/remove by score"]
         SAMP --> IREPAIR
     end
@@ -115,11 +115,11 @@ flowchart TD
 
     EVAL0 --> GL["=== GENERATION LOOP ==="]
 
-    GL --> SEL["NSGA-III reference-direction-based selection<br/>Das-Dennis structured ref dirs (n_partitions=8 → 45 dirs)<br/>association: each solution assigned to nearest ref dir<br/>→ parent pairs selected by ref-dir niche count"]
+    GL --> SEL["NSGA-III reference-direction-based selection<br/>Das-Dennis structured ref dirs (n_partitions=12 -> ~91 dirs for 3 obj)<br/>association: each solution assigned to nearest ref dir<br/>→ parent pairs selected by ref-dir niche count"]
 
     SEL --> CROSS["HUX crossover<br/>swap complementary half-bits between parents<br/>→ offspring [pop_size × n_var binary]"]
 
-    CROSS --> MUT["BitFlip mutation  (prob = 0.1 per bit)<br/>→ mutated offspring [pop_size × n_var binary]"]
+    CROSS --> MUT["BitFlip mutation  (prob=1.0, prob_var=200/n_var -> ~200 flips/individual)<br/>-> mutated offspring [pop_size x n_var binary]"]
 
     MUT --> REP["Repair operator<br/>PIXEL — AdaptiveRepair<br/>  count actions; add/remove individual pixels by priority score<br/>  until n_actions == max_action_pixels exactly<br/>PATCH — PatchRepair  (pixel_count or patch_count mode)<br/>  add/remove whole patches by score-guided sampling<br/>  eval tolerance = pixel_tolerance × 1.5  (allows discretisation slack)"]
 

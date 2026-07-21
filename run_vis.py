@@ -6,6 +6,7 @@ from collections import Counter
 
 # Import HVCallback to enable pickle loading
 from Core_optimisation.resto_anom import HVCallback
+from Core_optimisation.paths import FIGS_DIR
 
 from visualisations import (
     load_results,
@@ -75,7 +76,7 @@ def run_visualizations(pkl_file, visualizations="all"):
         return
     
     print(f"📊 Running visualizations for: {pkl_file}")
-    os.makedirs("figs", exist_ok=True)
+    os.makedirs(str(FIGS_DIR), exist_ok=True)
     
     # Load data and setup
     raw_results, results = run_basic_analysis(pkl_path)
@@ -87,22 +88,22 @@ def run_visualizations(pkl_file, visualizations="all"):
         "eligible_pixels": lambda: plot_eligible_pixels(initial_conditions, save_path='eligible_pixels.png') if initial_conditions else print("Skipping eligible pixels"),
         "frequency_map": lambda: create_selection_frequency_map(
             pkl_path=pkl_path,
-            save_path=f"figs/RFOP_{pkl_file}.png",
+            save_path=f"{FIGS_DIR}/RFOP_{pkl_file}.png",
             cmap='YlOrRd',
             title="Relative frequency of occurrence in the Pareto Front (RFOP)"
         ),
         "example_solution": lambda: plot_example_solution(pkl_path=pkl_path, choose="random"),
         "param_controlled": lambda: create_param_controlled_frequency_maps_multiscenario(
             pkl_path=pkl_path, param_names=param_names, fixed_values=fixed_values,
-            save_path=f"figs/RFOP_paramd_{pkl_file}.png"
+            save_path=f"{FIGS_DIR}/RFOP_paramd_{pkl_file}.png"
         ),
         "export_scenarios": lambda: export_scenarios_to_csv(pkl_path=pkl_path, csv_path=f"scenarios_{pkl_file}.csv"),
         "baseline_summary": lambda: selection_freq_baseline_summary(raw_results, pkl_path),
-        "effect_summary": lambda: create_effect_summary_visualization(pkl_path=pkl_path, save_path=f"figs/effect_summary_{pkl_file}.png"),
-        "spatial_contrasts": lambda: show_key_spatial_contrasts(pkl_path=pkl_path, save_path=f"figs/key_spatial_contrasts_{pkl_file}.png"),
-        "parameter_effects": lambda: quantify_parameter_effects(pkl_path=pkl_path, save_path=f"figs/parameter_effects_{pkl_file}.png", figsize=(10, 6)),
-        "pareto_front": lambda: plot_pareto_front(pkl_path=pkl_path, save_path=f"figs/pareto_front_{pkl_file}.png", figsize=(10, 8), alpha=0.7),
-        "parallel_coords": lambda: plot_parallel_coordinates(pkl_path=pkl_path, save_path=f"figs/parallel_coords_{pkl_file}.png", figsize=(12, 7), alpha_background=0.15)
+        "effect_summary": lambda: create_effect_summary_visualization(pkl_path=pkl_path, save_path=f"{FIGS_DIR}/effect_summary_{pkl_file}.png"),
+        "spatial_contrasts": lambda: show_key_spatial_contrasts(pkl_path=pkl_path, save_path=f"{FIGS_DIR}/key_spatial_contrasts_{pkl_file}.png"),
+        "parameter_effects": lambda: quantify_parameter_effects(pkl_path=pkl_path, save_path=f"{FIGS_DIR}/parameter_effects_{pkl_file}.png", figsize=(10, 6)),
+        "pareto_front": lambda: plot_pareto_front(pkl_path=pkl_path, save_path=f"{FIGS_DIR}/pareto_front_{pkl_file}.png", figsize=(10, 8), alpha=0.7),
+        "parallel_coords": lambda: plot_parallel_coordinates(pkl_path=pkl_path, save_path=f"{FIGS_DIR}/parallel_coords_{pkl_file}.png", figsize=(12, 7), alpha_background=0.15)
     }
     
     # Determine which to run

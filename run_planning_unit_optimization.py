@@ -34,6 +34,7 @@ Created: May 2026
 import time as _time
 import sys
 import os
+from Core_optimisation.paths import OUTPUT_DIR as OUTPUTS_BASE, LOGS_DIR
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -128,7 +129,7 @@ BENCHMARK_SCENARIOS = ["upper_q75_all"]
 
 # --- Output ---
 SAVE_RESULTS = True
-OUTPUT_DIR   = "."      # PKL files go to results_files/ inside this directory
+OUTPUT_DIR   = str(OUTPUTS_BASE)   # results_files/, r_inputs/, etc. created under outputs/
 VERBOSE      = True
 
 # ---------------------------------------------------------------------------
@@ -151,7 +152,7 @@ def _run():
     from Core_optimisation.logger_setup import setup_logger
     import traceback
 
-    setup_logger(log_dir="logs", run_label=f"{ECOSYSTEM}_{REGION.lower()}_pu")
+    setup_logger(log_dir=str(LOGS_DIR), run_label=f"{ECOSYSTEM}_{REGION.lower()}_pu")
 
     workspace_dir = "."
     ecosystem_for_loader = ECOSYSTEM if ECOSYSTEM != "combined" else "all"

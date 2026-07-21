@@ -20,6 +20,7 @@ import tempfile
 import rasterio as rio
 import geopandas as gpd
 from .spatial_operations import compute_sn_dens, compute_sn_dens_array, compute_connectivity_gain_array
+from .paths import DATA_DIR
 
 logger = logging.getLogger("resto_prio")
 
@@ -608,24 +609,24 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                            Objective arrays are block-averaged; eligibility masks use any-eligible logic.
                            None or 1 disables aggregation.
         condition_scenario: Tag identifying which pre-computed anomaly rasters to load from
-                           inputs/anomaly_scenarios/. E.g. 'global_all', 'global_drop_smd',
+                           data/anomaly_scenarios/. E.g. 'global_all', 'global_drop_smd',
                            'upper_q75_all'. Defaults to 'global_all'.
     Returns:
         dict: Initial conditions for specified objectives and ecosystem
     """
     # Define all possible objectives and their file mappings.
     # A value of None means the objective is computed in-memory (no file required).
-    # Abiotic and biotic paths resolve from inputs/anomaly_scenarios/ via condition_scenario.
+    # Abiotic and biotic paths resolve from data/anomaly_scenarios/ via condition_scenario.
     all_objectives = {
-        'abiotic': f'inputs/anomaly_scenarios/abiotic_{condition_scenario}.tif',
-        'biotic':  f'inputs/anomaly_scenarios/biotic_{condition_scenario}.tif',
-        'landscape': 'inputs/sn_dens.tif',
+        'abiotic': str(DATA_DIR / 'anomaly_scenarios' / f'abiotic_{condition_scenario}.tif'),
+        'biotic':  str(DATA_DIR / 'anomaly_scenarios' / f'biotic_{condition_scenario}.tif'),
+        'landscape': str(DATA_DIR / 'sn_dens.tif'),
         'connectivity': None,  # Computed in-memory from landscape LULC; no file required
         # landscape_context / restoration_potential are ALWAYS computed in-memory from the
         # scenario's abiotic/biotic rasters (None → computed below), never loaded from a
         # pre-computed .tif.
         #
-        # Previously 'global_all' loaded inputs/{landscape_context,restoration_potential}.tif
+        # Previously 'global_all' loaded data/{landscape_context,restoration_potential}.tif
         # while every other condition_scenario recomputed in-memory. That put the baseline
         # cell on a different construction route than the LOO / q75 cells: if the saved
         # rasters were not byte-identical to the in-memory computation, a file-vs-recompute
@@ -640,8 +641,8 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         # (see RestorationProblem.evaluate_raw_objectives). None → treated as a computed
         # objective; only an enable flag is set in initial_conditions.
         'spatial_clustering': None,
-        'cost': 'inputs/implementation_cost_corrected.tif',
-        'population_proximity': 'inputs/population_proximity.tif',
+        'cost': str(DATA_DIR / 'implementation_cost_corrected.tif'),
+        'population_proximity': str(DATA_DIR / 'population_proximity.tif'),
         'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',
         'es_future_robustness': 'robustness/blce-robustness-data-archive/Undesirable_deviation_sum_of_change_ES.tif',
     }
@@ -1066,7 +1067,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         logger.info(f"Applied {f}x spatial aggregation: {(h, w)} → {new_shape} "
                     f"({new_shape[0]*new_shape[1]} pixels)")
 
-        # Save aggregated objective rasters to inputs/ for inspection
+        # Save aggregated objective rasters to data/ for inspection
         coarse_crs = initial_conditions['crs']
         coarse_transform = initial_conditions['transform']
         for key, orig_path in data_files.items():

@@ -86,3 +86,10 @@ Documentation/BE_bern.rds
 Documentation/map_bern_landuse.R
 .quarto/vdoc/.vdoc.2702a178-a164-47d3-af39-931d7435ced0.r
 Documentation/CH_switzerland.rds
+
+# Consolidated output tree (regenerated; see Core_optimisation/paths.py)
+/outputs/
+
+# Keep tracked modeling artifacts despite the broad *.json ignore above
+!/artifacts/
+!/artifacts/**
