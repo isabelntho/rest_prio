@@ -520,11 +520,19 @@ class RestorationProblem(ElementwiseProblem):
         self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
 
         # spatial_clustering objective metric:
-        #   'adjacency'  – count orthogonal shared edges between selected pixels
-        #                  (compactness; correlates strongly with cost in tests).
-        #   'components' – count disconnected clusters (4-connectivity); minimised.
-        #                  Insensitive to cluster size/shape, so it measures pure
-        #                  fragmentation and may decouple from cost.
+        #   'adjacency'            - count orthogonal shared edges between selected
+        #                            pixels (compactness; correlates strongly with
+        #                            cost in tests).
+        #   'components'           - count disconnected clusters (4-connectivity);
+        #                            minimised. Insensitive to cluster size/shape, so
+        #                            it measures pure fragmentation and may decouple
+        #                            from cost.
+        #   'inter_patch_adjacency'- like 'adjacency' but counts ONLY shared edges
+        #                            that cross a patch boundary (pixels in different
+        #                            patches), excluding the internal edges guaranteed
+        #                            inside each selected patch (4 for a 2x2 patch).
+        #                            Measures inter-patch contiguity; needs the patch
+        #                            approach.
         self.clustering_metric = str(scenario_params.get('clustering_metric', 'adjacency')).lower()
         # First-order per-pixel condition gain from restoration, applied to the combined
         # (abiotic + biotic) restoration_potential score used by the threshold formulation.
@@ -655,8 +663,10 @@ class RestorationProblem(ElementwiseProblem):
                     # clusters. Scale by the pixel budget so normalised ∈ ~[0, 1].
                     scale = float(_max_pix)
                 else:
-                    # A perfectly compact block of N pixels has at most ~2N shared
-                    # edges, so scale by 2 × the pixel budget → normalised ∈ ~[-1, 0].
+                    # 'adjacency' or 'inter_patch_adjacency': a perfectly compact
+                    # block of N pixels has at most ~2N shared edges (inter-patch
+                    # edges are a subset), so scale by 2 x the pixel budget ->
+                    # normalised in ~[-1, 0].
                     scale = float(2 * _max_pix)
             elif obj_name == 'es_future_val':
                 esv = self.initial_conditions['es_future_val_1d']
@@ -752,12 +762,39 @@ class RestorationProblem(ElementwiseProblem):
                 if self.clustering_metric == 'components':
                     # Number of disconnected clusters (4-connectivity). Fewer = more
                     # clumped. Minimised directly. Insensitive to cluster size/shape
-                    # — measures pure fragmentation — so it need not track cost the
-                    # way edge count (∝ amount of contiguous land bought) does.
+                    # -- measures pure fragmentation -- so it need not track cost the
+                    # way edge count (proportional to amount of contiguous land bought) does.
                     _, n_comp = ndimage.label(sel_mask)
                     obj_value = float(n_comp)
+                elif self.clustering_metric == 'inter_patch_adjacency':
+                    # Inter-patch adjacency: orthogonal shared edges between selected
+                    # pixels that lie in DIFFERENT patches. Excludes the internal
+                    # edges guaranteed inside each fully-selected patch (4 for a 2x2
+                    # patch), so it measures how much selected patches touch each
+                    # other rather than trivial within-patch compactness. Negated so
+                    # the minimiser maximises inter-patch contact. Requires the patch
+                    # approach; without it every pixel is its own patch, so all
+                    # adjacencies are inter-patch and this reduces to full adjacency.
+                    pm = self.initial_conditions.get('patch_mappings')
+                    patch_grid = (pm['restoration_patches']['patch_grid']
+                                  if pm is not None else None)
+                    if patch_grid is None:
+                        horiz = np.count_nonzero(sel_mask[:, :-1] & sel_mask[:, 1:])
+                        vert = np.count_nonzero(sel_mask[:-1, :] & sel_mask[1:, :])
+                    else:
+                        # Bitwise & binds tighter than !=, so parenthesise the
+                        # patch-id comparison.
+                        horiz = np.count_nonzero(
+                            sel_mask[:, :-1] & sel_mask[:, 1:]
+                            & (patch_grid[:, :-1] != patch_grid[:, 1:])
+                        )
+                        vert = np.count_nonzero(
+                            sel_mask[:-1, :] & sel_mask[1:, :]
+                            & (patch_grid[:-1, :] != patch_grid[1:, :])
+                        )
+                    obj_value = -float(horiz + vert)
                 else:
-                    # 'adjacency' (default): orthogonal like-adjacencies — pairs of
+                    # 'adjacency' (default): orthogonal like-adjacencies -- pairs of
                     # selected pixels sharing an edge. More shared edges = more
                     # compact. Negated so the pymoo minimiser maximises it. Cheap:
                     # two boolean shift-AND reductions, no neighbourhood convolution.
@@ -1256,8 +1293,10 @@ class ProgressCallback:
                   f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}")
 
         # Hypervolume-based early stopping
-        if self.hv_callback.converged:
-            algorithm.termination.force_termination = True
+        # TEMP: early stopping disabled - runs will always go to the full
+        # n_generations. Re-enable by uncommenting the two lines below.
+        # if self.hv_callback.converged:
+        #     algorithm.termination.force_termination = True
 
 
 def _filter_initial_conditions_for_return(initial_conditions):
@@ -1282,7 +1321,8 @@ def _filter_initial_conditions_for_return(initial_conditions):
 
 
 def _build_operators(initial_conditions, scenario_params, problem, use_patch_approach,
-                     use_repair, patch_constraint_type, pixel_tolerance, verbose, warm_seeding=True):
+                     use_repair, patch_constraint_type, pixel_tolerance, verbose, warm_seeding=True,
+                     capture_repair_diag=False, n_capture_gens=5, n_generations=None, diag_dir=None):
     """
     Build sampling and repair operators for the chosen optimization mode.
 
@@ -1383,6 +1423,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             ref_dirs=repair_ref_dirs,
             score_obj_indices=_score_obj_indices,
             patch_region_assignments=patch_region_assignments,
+            capture_diag=capture_repair_diag, n_generations=n_generations,
+            n_capture=n_capture_gens, diag_dir=diag_dir,
         ) if use_repair else None
 
         if verbose:
@@ -1395,7 +1437,9 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         scores = build_repair_scores(initial_conditions, scenario_params)
         sampling = AdaptiveSampling(initial_conditions, problem.max_action_pixels, scenario_params)
         repair = AdaptiveRepair(
-            initial_conditions, problem.max_action_pixels, scenario_params, scores
+            initial_conditions, problem.max_action_pixels, scenario_params, scores,
+            capture_diag=capture_repair_diag, n_generations=n_generations,
+            n_capture=n_capture_gens, diag_dir=diag_dir,
         ) if use_repair else None
 
         if verbose:
@@ -1413,7 +1457,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
     return sampling, repair
 
 
-def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8):
+def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8,
+                     mutation_prob_var=None):
     """
     Construct the NSGA-III algorithm and generation-based termination criterion.
 
@@ -1432,11 +1477,16 @@ def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8):
     """
     n_obj = problem.n_obj
     ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_partitions)
+    # Per-variable flip probability. Default keeps historical behaviour of ~200
+    # expected flips per individual (prob_var = 200 / n_var); callers may override
+    # (e.g. mutation-rate sensitivity sweeps).
+    if mutation_prob_var is None:
+        mutation_prob_var = 200.0 / problem.n_var
     algorithm = NSGA3(
         ref_dirs=ref_dirs,
         sampling=sampling,
         crossover=HUX(),
-        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=200.0 / problem.n_var),
+        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=mutation_prob_var),
         repair=repair,
     )
     termination = get_termination("n_gen", n_generations)
@@ -1653,7 +1703,9 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      output_dir=str(OUTPUT_DIR), save_snapshots=False,
                                      run_label="", run_config=None,
                                      n_partitions=8, warm_seeding=True,
-                                     r_export_parent=None):
+                                     r_export_parent=None, mutation_prob_var=None,
+                                     mutation_flip_count=None,
+                                     capture_repair_diag=False, n_capture_gens=5):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
@@ -1680,6 +1732,18 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         n_partitions: Number of partitions for NSGA-III Das-Dennis reference directions.
             Controls population size: n_partitions=8 → 45 ref dirs (≈ pop of 45).
             Increase to explore more of the objective space at the cost of more evaluations.
+        mutation_prob_var: Per-variable bitflip probability for the mutation operator.
+            None (default) reproduces the historical rate of 200 / n_var (i.e. ~200
+            expected flips per individual). Pass a float to override, e.g. for a
+            mutation-rate sensitivity sweep.
+        capture_repair_diag: If True (pixel mode / AdaptiveRepair only), dump paired
+            pre-repair vs post-repair genotype matrices and their raw objectives at a
+            few evenly-spaced generations to <output_dir>/repair_diagnostics/. Used to
+            compare genotype (pairwise Hamming) and phenotype (objective spread)
+            diversity before vs after repair. Analyse with
+            Debugs_tests/repair_diversity_report.py.
+        n_capture_gens: Number of evenly-spaced generations (including first and last)
+            to capture when capture_repair_diag is True.
 
     Returns:
         dict: Optimization results, or None if optimization failed.
@@ -1740,10 +1804,21 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             print("✓ Optimisation setup verified.")
 
     # --- 5. Build operators ---
+    # Each run captures into its own subfolder so pixel/patch runs (different
+    # genotype dimensions) and successive runs never mix in one directory.
+    if capture_repair_diag:
+        _diag_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _diag_mode = 'patch' if use_patch_approach else 'pixel'
+        _diag_sub = f"{run_label + '_' if run_label else ''}{_diag_mode}_{_diag_stamp}"
+        repair_diag_dir = os.path.join(output_dir, 'repair_diagnostics', _diag_sub)
+    else:
+        repair_diag_dir = None
     sampling, repair = _build_operators(
         initial_conditions, scenario_params, problem,
         use_patch_approach, use_repair, patch_constraint_type, pixel_tolerance, verbose,
         warm_seeding=warm_seeding,
+        capture_repair_diag=capture_repair_diag, n_capture_gens=n_capture_gens,
+        n_generations=n_generations, diag_dir=repair_diag_dir,
     )
 
     # --- 6. Build HV reference point ---
@@ -1757,7 +1832,11 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     )
 
     # --- 7. Build algorithm ---
-    algorithm, termination = _build_algorithm(problem, sampling, repair, n_generations, n_partitions)
+    # mutation_flip_count (int) takes precedence over mutation_prob_var (float) when set.
+    if mutation_flip_count is not None:
+        mutation_prob_var = mutation_flip_count / problem.n_var
+    algorithm, termination = _build_algorithm(problem, sampling, repair, n_generations, n_partitions,
+                                              mutation_prob_var=mutation_prob_var)
 
     # --- 8. Initial sampling quality check (patch mode only) ---
     if use_patch_approach and verbose:

@@ -23,7 +23,7 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "refactor_test"
+RUN_LABEL = "corrected_repair_pixel"
 
 # Region used for validation reference in load_initial_conditions
 REGION = "Bern"
@@ -87,8 +87,12 @@ N_GENERATIONS = 100
 N_JOBS = 12
 RANDOM_SEED = 101 #42
 N_SAMPLES_PER_PARAM = 3
-N_PARTITIONS = 12 #6 # for 4 objectives 6
+N_PARTITIONS = 12#for 3 objectives 12 # for 4 objectives 6
 WARM_SEEDING = True
+# Expected number of bitflips per individual per generation (k in prob_var = k / n_var).
+# None keeps the historical default of 200. Increase for more exploration, decrease to
+# converge faster (at the risk of premature convergence).
+MUTATION_FLIP_COUNT = None  # e.g. 100, 200, 400
 #previously n partitions 12, pop size 50
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
@@ -107,9 +111,12 @@ custom_scenario_params = {
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
     # Metric for the "spatial_clustering" objective (only used when it is in OBJECTIVES):
-    #   "adjacency"  = shared-edge count (compactness); strongly correlated with cost
-    #   "components" = number of disconnected clusters (fragmentation); test for decoupling
-    "clustering_metric": "adjacency",
+    #   "adjacency"             = shared-edge count (compactness); strongly correlated with cost
+    #   "components"            = number of disconnected clusters (fragmentation); test for decoupling
+    #   "inter_patch_adjacency" = shared edges crossing a patch boundary only (excludes the
+    #                             4 guaranteed internal edges of each 2x2 patch); inter-patch
+    #                             contiguity, may decouple from cost. Needs the patch approach.
+    "clustering_metric": "inter_patch_adjacency",
 }
 
 # Named policy scenarios for SCENARIO_MODE == "policy_grid".
@@ -188,6 +195,14 @@ AGGREGATION_FACTOR = None
 # Set to True to save per-generation population snapshots for animation
 # Output: intermediate_results/X_history_{timestamp}.npz  shape=(n_gens, pop_size, n_var) int8
 SAVE_SNAPSHOTS = False
+
+# Set to True to capture paired pre-repair vs post-repair genotype/phenotype
+# diversity at a few evenly-spaced generations (pixel mode / AdaptiveRepair only).
+# Output: <output_dir>/repair_diagnostics/repair_diag_gen{NNNN}.npz
+#   X_pre, X_post (int8 genotypes), F_pre, F_post (raw objectives), n_pixels.
+# Analyse offline with Debugs_tests/repair_diversity_report.py.
+CAPTURE_REPAIR_DIAG = True
+N_CAPTURE_GENS = 5
 
 # Set to True to profile the run with cProfile and print the top 30 hotspots afterwards.
 # Results are also written to logs/profile_<run_label>.txt
@@ -324,11 +339,14 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                capture_repair_diag=CAPTURE_REPAIR_DIAG,
+                                n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_label,
                                 run_config=_grid_config,
                                 r_export_parent=_grid_r_parent,
+                                mutation_flip_count=MUTATION_FLIP_COUNT,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_label] = _item_elapsed
@@ -417,11 +435,14 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                capture_repair_diag=CAPTURE_REPAIR_DIAG,
+                                n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_lbl,
                                 run_config=_grid_config,
                                 r_export_parent=_pg_r_parent,
+                                mutation_flip_count=MUTATION_FLIP_COUNT,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed
@@ -470,11 +491,14 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                capture_repair_diag=CAPTURE_REPAIR_DIAG,
+                                n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
                                 warm_seeding=WARM_SEEDING,
                                 run_label=_run_lbl,
                                 run_config=_grid_config,
                                 r_export_parent=_pg_r_parent,
+                                mutation_flip_count=MUTATION_FLIP_COUNT,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed
@@ -586,11 +610,14 @@ def _run():
                                             patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                             pixel_tolerance=PIXEL_TOLERANCE,
                                             save_snapshots=SAVE_SNAPSHOTS,
+                                            capture_repair_diag=CAPTURE_REPAIR_DIAG,
+                                            n_capture_gens=N_CAPTURE_GENS,
                                             n_partitions=N_PARTITIONS,
                                             warm_seeding=WARM_SEEDING,
                                             run_label=_run_lbl,
                                             run_config=_grid_config,
                                             r_export_parent=_grid_r_parent,
+                                            mutation_flip_count=MUTATION_FLIP_COUNT,
                                         )
                                         _item_elapsed = time.perf_counter() - _item_start
                                         _grid_times[_run_lbl] = _item_elapsed
@@ -640,10 +667,13 @@ def _run():
                     patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                     pixel_tolerance=PIXEL_TOLERANCE,
                     save_snapshots=SAVE_SNAPSHOTS,
+                    capture_repair_diag=CAPTURE_REPAIR_DIAG,
+                    n_capture_gens=N_CAPTURE_GENS,
                     n_partitions=N_PARTITIONS,
                     warm_seeding=WARM_SEEDING,
                     run_label=RUN_LABEL,
                     run_config=run_config,
+                    mutation_flip_count=MUTATION_FLIP_COUNT,
                 )
 
             if SCENARIO_MODE not in ("condition_grid", "policy_grid", "factorial"):

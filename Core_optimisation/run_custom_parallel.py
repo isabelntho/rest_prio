@@ -111,8 +111,10 @@ custom_scenario_params = {
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
     # Metric for the "spatial_clustering" objective (only used when it is in OBJECTIVES):
-    #   "adjacency"  = shared-edge count (compactness)
-    #   "components" = number of disconnected clusters (fragmentation)
+    #   "adjacency"             = shared-edge count (compactness)
+    #   "components"            = number of disconnected clusters (fragmentation)
+    #   "inter_patch_adjacency" = shared edges crossing a patch boundary only (excludes the
+    #                             4 guaranteed internal edges of each 2x2 patch); needs patch approach
     "clustering_metric": "adjacency",
 }
 

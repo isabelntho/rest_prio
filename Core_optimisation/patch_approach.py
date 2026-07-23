@@ -52,6 +52,7 @@ The PatchRestorationProblem class (in resto_anom.py):
 Created: February 2026
 """
 
+import os
 import numpy as np
 from typing import Dict, Tuple, List
 
@@ -690,7 +691,8 @@ class PatchRepair(Repair):
                  patch_scores=None, score_temperature=0.5, top_k=12,
                  per_objective_patch_scores=None, ref_dirs=None,
                  score_obj_indices=None,
-                 patch_region_assignments=None):
+                 patch_region_assignments=None,
+                 capture_diag=False, n_generations=None, n_capture=5, diag_dir=None):
         super().__init__()
         self.constraint_type = constraint_type
         self.target_value = target_value
@@ -730,6 +732,20 @@ class PatchRepair(Repair):
         self.repair_log = []  # Per-generation bit-diff diagnostics
         self._total_calls = 0
         self._cached_all_patch_sizes = None  # lazily populated in _enforce_pixel_count
+
+        # Pre/post-repair diversity capture (opt-in diagnostic). Mirrors the
+        # AdaptiveRepair pixel-mode capture: at a few evenly-spaced generations,
+        # dump the paired pre/post patch-level genotype matrices plus their raw
+        # objectives to .npz for offline genotype (Hamming) / phenotype analysis.
+        self.capture_diag = bool(capture_diag)
+        self.diag_dir = diag_dir
+        if self.capture_diag and n_generations:
+            gens = np.linspace(1, int(n_generations), int(n_capture)).round().astype(int)
+            self._capture_gens = set(int(g) for g in np.unique(gens))
+            if self.diag_dir is not None:
+                os.makedirs(self.diag_dir, exist_ok=True)
+        else:
+            self._capture_gens = set()
         # Burden-sharing: per-patch region assignments (or None → disabled).
         # No effect on runs without burden sharing.
         self.patch_region_assignments = patch_region_assignments if patch_region_assignments else None
@@ -810,6 +826,32 @@ class PatchRepair(Repair):
             'std_bits_changed': float(np.std(diffs)),
             'max_bits_changed': int(np.max(diffs)),
         })
+
+        # Pre/post-repair diversity snapshot at selected generations. X_in is the
+        # patch-level population before repair; X is after. Genotype is patch-level
+        # here, so the active block is the first n_restoration_patches columns; we
+        # store that as 'n_pixels' so repair_diversity_report.py's --active-block-only
+        # masking works unchanged. Only a handful of generations pay the extra
+        # pop_size raw evaluations.
+        generation = self._total_calls
+        if self.capture_diag and generation in self._capture_gens and self.diag_dir is not None:
+            try:
+                F_pre = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X_in], dtype=float)
+                F_post = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X], dtype=float)
+                out_path = os.path.join(self.diag_dir, f"repair_diag_gen{generation:04d}.npz")
+                np.savez_compressed(
+                    out_path,
+                    X_pre=X_in.astype(np.int8),
+                    X_post=X.astype(np.int8),
+                    F_pre=F_pre,
+                    F_post=F_post,
+                    generation=generation,
+                    n_pixels=n_restoration_patches,
+                    mode='patch',
+                    n_restoration_patches=n_restoration_patches,
+                )
+            except Exception as e:
+                print(f"WARNING: patch repair diversity capture failed at gen {generation}: {e}")
 
         return X
     

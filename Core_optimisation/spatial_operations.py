@@ -9,6 +9,7 @@ This module contains:
 4. Utility functions for spatial analysis
 """
 
+import os
 import numpy as np
 from scipy import ndimage
 from pymoo.core.repair import Repair
@@ -441,24 +442,40 @@ class AdaptiveRepair(Repair):
     Consolidates previous ClusteringRepair, BurdenSharingRepair, CombinedRepair, ScoreCountRepair, and ExactCountRepair.
     """
     
-    def __init__(self, initial_conditions, max_restored_pixels, scenario_params=None, scores=None):
+    def __init__(self, initial_conditions, max_restored_pixels, scenario_params=None, scores=None,
+                 capture_diag=False, n_generations=None, n_capture=5, diag_dir=None):
         super().__init__()
         self.initial_conditions = initial_conditions
         self.max_restored_pixels = max_restored_pixels
         self.scores = scores
         self.rng = np.random.RandomState(None)  # Can be seeded later if needed
-        
+
         # Extract parameters from scenario_params
         if scenario_params is None:
             scenario_params = {}
         self.burden_sharing = scenario_params.get('burden_sharing', 'no') == 'yes'
         self.clustering_strength = scenario_params.get('spatial_clustering', 0.0)
         self.adjacency_beta = float(scenario_params.get('adjacency_beta', 0.25))  # Tunable adjacency weight
-        
+
         # Initialize repair logging
         self.call_log = []  # Store repair events: {'generation': int, 'type': str, 'individuals_repaired': int}
         self.total_calls = 0
         self.repair_log = []  # Per-generation bit-diff diagnostics
+
+        # Pre/post-repair diversity capture (opt-in diagnostic).
+        # At a few evenly-spaced generations, dump the paired pre-repair and
+        # post-repair genotype matrices plus their raw objectives to .npz so
+        # genotype (pairwise Hamming) and phenotype (objective spread) diversity
+        # can be compared before vs after repair, offline.
+        self.capture_diag = bool(capture_diag)
+        self.diag_dir = diag_dir
+        if self.capture_diag and n_generations:
+            gens = np.linspace(1, int(n_generations), int(n_capture)).round().astype(int)
+            self._capture_gens = set(int(g) for g in np.unique(gens))
+            if self.diag_dir is not None:
+                os.makedirs(self.diag_dir, exist_ok=True)
+        else:
+            self._capture_gens = set()
     
     def _do(self, problem, X, **kwargs):
         X_repaired = np.zeros_like(X)
@@ -544,6 +561,28 @@ class AdaptiveRepair(Repair):
             'max_bits_changed': int(np.max(diffs)),
             'fraction_repaired': float(individuals_repaired / max(len(X), 1)),
         })
+
+        # Pre/post-repair diversity snapshot at selected generations.
+        # X_in is the population after crossover+mutation but before repair;
+        # X_repaired is the post-repair population. Raw objectives are computed
+        # for both (evaluate_raw_objectives is side-effect-free). Only a handful
+        # of generations pay this extra pop_size evaluations.
+        if self.capture_diag and generation in self._capture_gens and self.diag_dir is not None:
+            try:
+                F_pre = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X_in], dtype=float)
+                F_post = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X_repaired], dtype=float)
+                out_path = os.path.join(self.diag_dir, f"repair_diag_gen{generation:04d}.npz")
+                np.savez_compressed(
+                    out_path,
+                    X_pre=X_in.astype(np.int8),
+                    X_post=X_repaired.astype(np.int8),
+                    F_pre=F_pre,
+                    F_post=F_post,
+                    generation=generation,
+                    n_pixels=problem.n_pixels,
+                )
+            except Exception as e:
+                print(f"WARNING: repair diversity capture failed at gen {generation}: {e}")
 
         return X_repaired
     
@@ -726,7 +765,18 @@ class InstrumentedBitflipMutation(BitflipMutation):
 
     def _do(self, problem, X, **kwargs):
         X_before = X.copy()
-        X_after = super()._do(problem, X, **kwargs)
+
+        # NOTE: pymoo's BitflipMutation._do flips with `Xp[flip] = ~X[flip]`, which is
+        # bitwise NOT. That only behaves as a logical flip on boolean arrays. Our
+        # decision vector is int 0/1 (type_var=int, xl=0, xu=1), so `~0 = -1` and
+        # `~1 = -2`, silently corrupting the genotype and making mutation directional
+        # (a flipped 0 becomes -1, still "unselected", so it is a no-op). We do the
+        # flip explicitly instead. `1 - (X == 1)` always yields {0,1} and self-heals
+        # any stray non-binary genes that may already be present.
+        prob_var = self.get_prob_var(problem, size=(len(X), 1))
+        X_after = X.copy()
+        flip = np.random.random(X.shape) < prob_var
+        X_after[flip] = (1 - (X_after[flip] == 1)).astype(X_after.dtype)
 
         flips_per_ind = np.sum(X_before != X_after, axis=1)  # (pop_size,)
         # Use _current_gen + 1 so the label matches the 1-based generation counter
