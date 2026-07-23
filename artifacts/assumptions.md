@@ -39,7 +39,7 @@ When pixel `i` is restored, its anomaly changes by
 | restoration_potential definition | mean of abiotic+biotic baseline anomaly at the pixel | Lower = more degraded on both = higher potential | medium |
 | landscape_context definition | hybrid: `0.75 * sn_dens[300 m semi-natural-habitat proportion] + 0.25 * good-neighbour-fraction[500 m, 11x11 box]`, range ~[0,1] | HIGHER = more supportive surroundings (structural anchor keeps it independent of restoration_potential; redefined 2026-06-24, see DEVELOPMENT_TRACKER). Objective negates ctx so the minimiser maximises it. | medium |
 | connectivity_gain definition | focal-habitat within radius (circular kernel, ~100 m) | Rewards converting pixels embedded in existing habitat | medium |
-| spatial_clustering definition | selected-pixel compactness: `adjacency` (count of orthogonal shared edges, default) or `components` (count of disconnected clusters) | Rewards clumped solutions; metric chosen via `clustering_metric` | medium |
+| spatial_clustering definition | selected-pixel compactness: `adjacency` (count of orthogonal shared edges, default), `components` (count of disconnected clusters), or `inter_patch_adjacency` (shared edges crossing a patch boundary only, excluding within-patch edges) | Rewards clumped solutions; metric chosen via `clustering_metric` | medium |
 | es_future_val / es_future_robustness (experimental) | sum of per-pixel ES performance / instability over selected pixels | Future-scenario ES gain (maximise) / instability (minimise); added 2026-05-19, not in settled set | low |
 
 ## Budget and decision space
