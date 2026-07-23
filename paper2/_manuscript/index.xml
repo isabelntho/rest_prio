@@ -129,8 +129,8 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
   <p>We frame restoration prioritisation as a many-objective
   optimisation problem: given a limited budget, where in an eligible
   landscape should restoration be allocated so as to best trade off
-  ecological improvement against cost? The solver optimises three
-  objectives simultaneously:</p>
+  improvement in ecosystem condition against cost? The solver optimises
+  three objectives simultaneously:</p>
   <list list-type="bullet">
     <list-item>
       <p>Maximise the restoration potential of the selected restoration
@@ -156,9 +156,120 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     to the target LULC classes (forest and grassland: classes 12, 13,
     16, 17) and (b) pixels with valid values in every objective raster.
     Only eligible pixels enter the decision vector.</p>
+    <fig id="fig-landuse">
+      <caption><p>Figure 1: Land use across Kanton Bern at 100 m
+      resolution (LV95, EPSG:2056). Forest (LULC classes 12, 13) and
+      grassland (16, 17) are the target ecosystems whose pixels are
+      eligible for restoration; agricultural land (class 15) is shown
+      for spatial context only. Pixels outside these classes are left
+      blank.</p></caption>
+      <graphic mimetype="image" mime-subtype="png" xlink:href="index_files/figure-jats/fig-landuse-output-1.png" />
+    </fig>
   </sec>
   <sec id="calculation-of-condition-anomalies">
     <title>Calculation of condition anomalies</title>
+    <p>Short description of the abiotic and biotic anomaly construction
+    / indicator sets, with references to the relevant sections of the
+    main paper.</p>
+    <table-wrap>
+      <table>
+        <colgroup>
+          <col width="20%" />
+          <col width="20%" />
+          <col width="20%" />
+          <col width="20%" />
+          <col width="20%" />
+        </colgroup>
+        <thead>
+          <tr>
+            <th>ECT group</th>
+            <th>ECT class</th>
+            <th>Indicator</th>
+            <th>Data source</th>
+            <th>Ecosystem type applied to</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Abiotic</td>
+            <td>Physical state characteristics</td>
+            <td>SMD</td>
+            <td></td>
+            <td>All</td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>SBD</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td>Chemical state characteristics</td>
+            <td>SOC</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td>Biotic</td>
+            <td>Compositional state characteristics</td>
+            <td>UZL</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>TSD</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td>Structural state characteristics</td>
+            <td>CAN</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>CDI</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>SWF_H</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>SWF_T</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td>Functional state characteristics</td>
+            <td>LAI</td>
+            <td></td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td></td>
+            <td>NDVI</td>
+            <td></td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </table-wrap>
     <p>Condition anomalies quantify how far each pixel departs from a
     reference (benchmark) condition, with negative values indicating
     degradation. The choice of benchmark defines the anomalies, and so
@@ -168,6 +279,26 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     how sensitive the prioritisation is to the benchmark and to the
     indicator set used to construct each anomaly.</p>
   </sec>
+  <sec id="input-data">
+    <title>Input data</title>
+    <p>Two precomputed layers enter the headline objectives directly:
+    the per-pixel restoration-potential score (the mean of the abiotic
+    and biotic baseline anomaly, lower values indicating pixels more
+    degraded on both dimensions) and the per-pixel implementation cost.
+    <xref alt="Figure 2" rid="fig-inputdata">Figure 2</xref> maps both
+    over the forest+grassland eligible pool and shows their
+    distributions across eligible pixels.</p>
+    <fig id="fig-inputdata">
+      <caption><p>Figure 2: Input objective layers over the
+      forest+grassland eligible pool. Top: spatial distribution of the
+      restoration-potential score (diverging scale centred at zero;
+      lower/redder = more degraded = higher potential) and normalised
+      implementation cost. Bottom: their frequency distributions across
+      eligible pixels. Colour limits are clipped at the 98th percentile
+      of magnitude for legibility.</p></caption>
+      <graphic mimetype="image" mime-subtype="png" xlink:href="index_files/figure-jats/fig-inputdata-output-1.png" />
+    </fig>
+  </sec>
   <sec id="decision-variables">
     <title>Decision variables</title>
     <p>We conceptualise a restoration strategy as the allocation of
@@ -176,9 +307,7 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     conversion action is also modelled it is a second binary
     decision:</p>
     <p><disp-formula><alternatives>
-    <tex-math><![CDATA[
-    x_i^{R} \in \{0,1\} \qquad x_j^{C} \in \{0,1\}
-    ]]></tex-math>
+    <tex-math><![CDATA[x_i^{R} \in \{0,1\} \qquad x_j^{C} \in \{0,1\}]]></tex-math>
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:msubsup><mml:mi>x</mml:mi><mml:mi>i</mml:mi><mml:mi>R</mml:mi></mml:msubsup><mml:mo>∈</mml:mo><mml:mo stretchy="false" form="prefix">{</mml:mo><mml:mn>0</mml:mn><mml:mo>,</mml:mo><mml:mn>1</mml:mn><mml:mo stretchy="false" form="postfix">}</mml:mo><mml:mspace width="2.0em"></mml:mspace><mml:msubsup><mml:mi>x</mml:mi><mml:mi>j</mml:mi><mml:mi>C</mml:mi></mml:msubsup><mml:mo>∈</mml:mo><mml:mo stretchy="false" form="prefix">{</mml:mo><mml:mn>0</mml:mn><mml:mo>,</mml:mo><mml:mn>1</mml:mn><mml:mo stretchy="false" form="postfix">}</mml:mo></mml:mrow></mml:math></alternatives></disp-formula></p>
     <p>where <inline-formula><alternatives>
     <tex-math><![CDATA[x_i^{R} = 1]]></tex-math>
@@ -207,15 +336,13 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     <tex-math><![CDATA[f]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>f</mml:mi></mml:math></alternatives></inline-formula>
     is the restoration fraction
-    (<monospace>max_restoration_fraction</monospace>, default 0.05) and
-    <inline-formula><alternatives>
+    (<monospace>max_restoration_fraction</monospace>, currently 0.05)
+    and <inline-formula><alternatives>
     <tex-math><![CDATA[N_{\text{elig}}]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:msub><mml:mi>N</mml:mi><mml:mtext mathvariant="normal">elig</mml:mtext></mml:msub></mml:math></alternatives></inline-formula>
     is the number of eligible pixels:</p>
     <p><disp-formula><alternatives>
-    <tex-math><![CDATA[
-    \sum_i x_i^{R} + \sum_j x_j^{C} \approx N_{\text{budget}}
-    ]]></tex-math>
+    <tex-math><![CDATA[\sum_i x_i^{R} + \sum_j x_j^{C} \approx N_{\text{budget}}]]></tex-math>
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:munder><mml:mo>∑</mml:mo><mml:mi>i</mml:mi></mml:munder><mml:msubsup><mml:mi>x</mml:mi><mml:mi>i</mml:mi><mml:mi>R</mml:mi></mml:msubsup><mml:mo>+</mml:mo><mml:munder><mml:mo>∑</mml:mo><mml:mi>j</mml:mi></mml:munder><mml:msubsup><mml:mi>x</mml:mi><mml:mi>j</mml:mi><mml:mi>C</mml:mi></mml:msubsup><mml:mo>≈</mml:mo><mml:msub><mml:mi>N</mml:mi><mml:mtext mathvariant="normal">budget</mml:mtext></mml:msub></mml:mrow></mml:math></alternatives></disp-formula></p>
     <p>The constraint is enforced by a repair operator applied after
     every variation step, within a tolerance window around the target. A
@@ -226,9 +353,9 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     the tolerance <inline-formula><alternatives>
     <tex-math><![CDATA[\tau]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>τ</mml:mi></mml:math></alternatives></inline-formula>
-    is 5% for patch mode (evaluated at a 1.5x wider window) and 20% for
-    planning-unit mode, reflecting the coarser, more variable unit
-    sizes.</p>
+    is 5% for patch mode (the constraint is evaluated at a 1.5x wider
+    window, 7.5%), and is widened for the coarser, more variable
+    planning-unit modes.</p>
     <p>The repair operator is score-guided but stochastic. When a
     solution is outside the window it ranks candidate patches (or units)
     by a priority score, takes the top
@@ -279,7 +406,7 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:msub><mml:mi>f</mml:mi><mml:mtext mathvariant="normal">SC</mml:mtext></mml:msub><mml:mo stretchy="false" form="prefix">(</mml:mo><mml:mi>x</mml:mi><mml:mo stretchy="false" form="postfix">)</mml:mo><mml:mo>=</mml:mo><mml:mi>−</mml:mi><mml:mspace width="0.167em"></mml:mspace><mml:mo minsize="120%" maxsize="120%" stretchy="true" form="prefix">(</mml:mo><mml:mtext mathvariant="normal">number of orthogonally adjacent selected-pixel pairs</mml:mtext><mml:mo minsize="120%" maxsize="120%" stretchy="true" form="postfix">)</mml:mo></mml:mrow></mml:math></alternatives></disp-formula></p>
     <p><bold>Implementation cost</bold></p>
     <p>Total implementation cost is the sum of per-pixel cost over all
-    pixels selected for action; cost has no spillover:</p>
+    pixels selected for action:</p>
     <p><disp-formula><alternatives>
     <tex-math><![CDATA[
     f_{\text{cost}}(x) =\sum_{k \in \Omega_{R}} y^{R}_{k}(x)\,c_{k}+\sum_{k \in \Omega_{C}} y^{C}_{k}(x)\,c_{k}
@@ -301,15 +428,13 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     is restored, its anomaly changes by an amount that depends on how
     degraded it already is:</p>
     <p><disp-formula><alternatives>
-    <tex-math><![CDATA[
-    a_i^{1} = a_i^{0} + \alpha \, w(a_i^{0})
-    ]]></tex-math>
+    <tex-math><![CDATA[a_i^{1} = a_i^{0} + \alpha \, w(a_i^{0})]]></tex-math>
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:msubsup><mml:mi>a</mml:mi><mml:mi>i</mml:mi><mml:mn>1</mml:mn></mml:msubsup><mml:mo>=</mml:mo><mml:msubsup><mml:mi>a</mml:mi><mml:mi>i</mml:mi><mml:mn>0</mml:mn></mml:msubsup><mml:mo>+</mml:mo><mml:mi>α</mml:mi><mml:mspace width="0.167em"></mml:mspace><mml:mi>w</mml:mi><mml:mo stretchy="false" form="prefix">(</mml:mo><mml:msubsup><mml:mi>a</mml:mi><mml:mi>i</mml:mi><mml:mn>0</mml:mn></mml:msubsup><mml:mo stretchy="false" form="postfix">)</mml:mo></mml:mrow></mml:math></alternatives></disp-formula></p>
     <p>where <inline-formula><alternatives>
     <tex-math><![CDATA[\alpha]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>α</mml:mi></mml:math></alternatives></inline-formula>
-    is the effect magnitude (<monospace>abiotic_effect</monospace> and
-    <monospace>biotic_effect</monospace>, default 0.01 each) and
+    is the effect magnitude (<monospace>abiotic_effect</monospace> =
+    0.01 and <monospace>biotic_effect</monospace> = 0.01) and
     <inline-formula><alternatives>
     <tex-math><![CDATA[w]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>w</mml:mi></mml:math></alternatives></inline-formula>
@@ -323,34 +448,30 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:mi>a</mml:mi><mml:mo>≥</mml:mo><mml:mn>0</mml:mn></mml:mrow></mml:math></alternatives></inline-formula>.
     For degraded pixels:</p>
     <p><disp-formula><alternatives>
-    <tex-math><![CDATA[
-    w(a) = \left(1 - e^{-\frac{|a|}{s}}\right)^{\gamma}
-    ]]></tex-math>
+    <tex-math><![CDATA[w(a) = \left(1 - e^{-\frac{|a|}{s}}\right)^{\gamma}]]></tex-math>
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:mi>w</mml:mi><mml:mo stretchy="false" form="prefix">(</mml:mo><mml:mi>a</mml:mi><mml:mo stretchy="false" form="postfix">)</mml:mo><mml:mo>=</mml:mo><mml:msup><mml:mrow><mml:mo stretchy="true" form="prefix">(</mml:mo><mml:mn>1</mml:mn><mml:mo>−</mml:mo><mml:msup><mml:mi>e</mml:mi><mml:mrow><mml:mi>−</mml:mi><mml:mfrac><mml:mrow><mml:mo stretchy="false" form="prefix">|</mml:mo><mml:mi>a</mml:mi><mml:mo stretchy="false" form="prefix">|</mml:mo></mml:mrow><mml:mi>s</mml:mi></mml:mfrac></mml:mrow></mml:msup><mml:mo stretchy="true" form="postfix">)</mml:mo></mml:mrow><mml:mi>γ</mml:mi></mml:msup></mml:mrow></mml:math></alternatives></disp-formula></p>
-    <p>with shape parameters <inline-formula><alternatives>
+    <p>with scale <inline-formula><alternatives>
     <tex-math><![CDATA[s]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>s</mml:mi></mml:math></alternatives></inline-formula>
-    (<monospace>anomaly_weight_scale</monospace>, default 1.0) and
-    <inline-formula><alternatives>
+    (<monospace>anomaly_weight_scale</monospace>, 1.0 by default in the
+    effect model) and exponent <inline-formula><alternatives>
     <tex-math><![CDATA[\gamma]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>γ</mml:mi></mml:math></alternatives></inline-formula>
-    (<monospace>anomaly_weight_gamma</monospace>, default 3). The weight
-    is small for anomalies near zero and increases toward 1 as the
-    anomaly becomes more negative, so that improvement is concentrated
-    on the most degraded pixels.</p>
+    (fixed at 3.0 in the code). The weight is small for anomalies near
+    zero and increases toward 1 as the anomaly becomes more negative, so
+    that improvement is concentrated on the most degraded pixels.</p>
     <p>Restoration also spills over to neighbouring pixels within a
-    fixed radius (<monospace>neighbour_radius</monospace> = 3 pixels),
-    at a reduced magnitude set by a decay factor
-    (<monospace>neighbour_effect_decay</monospace> = 0.2):</p>
+    fixed radius (<monospace>neighbor_radius</monospace> = 3 pixels), at
+    a reduced magnitude set by a decay factor
+    (<monospace>neighbor_effect_decay</monospace> = 0.2):</p>
     <p><disp-formula><alternatives>
-    <tex-math><![CDATA[
-    a_k^{1} = a_k^{0} + \alpha \, \lambda \, w(a_k^{0})
-    ]]></tex-math>
+    <tex-math><![CDATA[a_k^{1} = a_k^{0} + \alpha \, \lambda \, w(a_k^{0})]]></tex-math>
     <mml:math display="block" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:msubsup><mml:mi>a</mml:mi><mml:mi>k</mml:mi><mml:mn>1</mml:mn></mml:msubsup><mml:mo>=</mml:mo><mml:msubsup><mml:mi>a</mml:mi><mml:mi>k</mml:mi><mml:mn>0</mml:mn></mml:msubsup><mml:mo>+</mml:mo><mml:mi>α</mml:mi><mml:mspace width="0.167em"></mml:mspace><mml:mi>λ</mml:mi><mml:mspace width="0.167em"></mml:mspace><mml:mi>w</mml:mi><mml:mo stretchy="false" form="prefix">(</mml:mo><mml:msubsup><mml:mi>a</mml:mi><mml:mi>k</mml:mi><mml:mn>0</mml:mn></mml:msubsup><mml:mo stretchy="false" form="postfix">)</mml:mo></mml:mrow></mml:math></alternatives></disp-formula></p>
     <p>where <inline-formula><alternatives>
-    <tex-math><![CDATA[\lambda = 0.2]]></tex-math>
-    <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mrow><mml:mi>λ</mml:mi><mml:mo>=</mml:mo><mml:mn>0.2</mml:mn></mml:mrow></mml:math></alternatives></inline-formula>
-    and the same anomaly-dependent weight <inline-formula><alternatives>
+    <tex-math><![CDATA[\lambda]]></tex-math>
+    <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>λ</mml:mi></mml:math></alternatives></inline-formula>
+    = 0.2 and the same anomaly-dependent weight
+    <inline-formula><alternatives>
     <tex-math><![CDATA[w]]></tex-math>
     <mml:math display="inline" xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:mi>w</mml:mi></mml:math></alternatives></inline-formula>
     is applied per neighbour. Implementation cost has no spillover.</p>
@@ -365,11 +486,11 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
     directions. Key settings:</p>
     <list list-type="bullet">
       <list-item>
-        <p><bold>Reference directions / population:</bold>
-        <monospace>n_partitions = 12</monospace>, which for three
-        objectives gives roughly 91 reference directions; NSGA-III sets
-        the population size equal to the number of reference directions,
-        so both scale with the number of objectives.</p>
+        <p><bold>Reference directions / population:</bold> the number of
+        partitions (<monospace>n_partitions</monospace>) is 12, which
+        for 3 objectives gives 91 reference directions; NSGA-III sets
+        the population size equal to the number of reference
+        directions.</p>
       </list-item>
       <list-item>
         <p><bold>Variation operators:</bold> HUX crossover and bit-flip
@@ -390,15 +511,16 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
         generations.</p>
       </list-item>
       <list-item>
-        <p><bold>Initial population and warm seeding.</bold> The initial
-        population is built by score-guided stochastic selection of
-        patches (or units) up to the budget.</p>
+        <p><bold>Initial population</bold> The initial population is
+        built by score-guided stochastic selection of patches (or units)
+        up to the budget.</p>
       </list-item>
       <list-item>
-        <p>** One “extreme” solution per objective is added by greedily
-        selecting the patches ranked highest for that single objective.
-        These anchor individuals give NSGA-III points near the extremes
-        of each objective axis from the first generation.</p>
+        <p><bold>Warm seeding</bold> One “extreme” solution per
+        objective is added by greedily selecting the patches ranked
+        highest for that single objective. These anchor individuals give
+        NSGA-III points near the extremes of each objective axis from
+        the first generation.</p>
       </list-item>
     </list>
   </sec>
@@ -413,7 +535,7 @@ draft" vocab-term-identifier="https://credit.niso.org/contributor-roles/writing-
   <list list-type="bullet">
     <list-item>
       <p><bold>Condition grid:</bold> the condition benchmark used to
-      build the anomalies is varied (e.g. dropping individual
+      build the anomalies is varied (e.g. dropping individual
       indicators, or shifting the reference to an upper quantile of the
       distribution), to test how sensitive the prioritisation is to the
       definition of degradation.</p>
