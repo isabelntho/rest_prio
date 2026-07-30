@@ -616,10 +616,14 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     """
     # Define all possible objectives and their file mappings.
     # A value of None means the objective is computed in-memory (no file required).
-    # Abiotic and biotic paths resolve from data/anomaly_scenarios/ via condition_scenario.
+    # Abiotic and biotic anomaly rasters live in a region-specific subfolder of
+    # data/: the whole-Switzerland run (region='CH') writes to data/CH_wide/,
+    # every other region uses data/anomaly_scenarios/. The scenario tag selects
+    # the file within that folder.
+    anomaly_dir = 'CH_wide' if region == 'CH' else 'anomaly_scenarios'
     all_objectives = {
-        'abiotic': str(DATA_DIR / 'anomaly_scenarios' / f'abiotic_{condition_scenario}.tif'),
-        'biotic':  str(DATA_DIR / 'anomaly_scenarios' / f'biotic_{condition_scenario}.tif'),
+        'abiotic': str(DATA_DIR / anomaly_dir / f'abiotic_{condition_scenario}.tif'),
+        'biotic':  str(DATA_DIR / anomaly_dir / f'biotic_{condition_scenario}.tif'),
         'landscape': str(DATA_DIR / 'sn_dens.tif'),
         'connectivity': None,  # Computed in-memory from landscape LULC; no file required
         # landscape_context / restoration_potential are ALWAYS computed in-memory from the
@@ -636,12 +640,22 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         # the formulation under test.
         'landscape_context': None,
         'restoration_potential': None,
+        # restoration_benefit: spatially-explicit benefit. Unlike the static
+        # restoration_potential, it is the total abiotic+biotic anomaly improvement
+        # (incl. neighbour spillover) achieved by a plan, so it depends on WHICH pixels
+        # AND their arrangement. Computed at evaluation time in RestorationProblem from
+        # the abiotic/biotic anomaly rasters (auto-loaded as dependencies below).
+        'restoration_benefit': None,
         # spatial_clustering has no underlying raster: it is a configuration-dependent
         # compactness metric computed from the selected-pixel geometry at evaluation time
         # (see RestorationProblem.evaluate_raw_objectives). None → treated as a computed
         # objective; only an enable flag is set in initial_conditions.
         'spatial_clustering': None,
-        'cost': str(DATA_DIR / 'implementation_cost_corrected.tif'),
+        # Cost layer is region-specific: the whole-Switzerland run (region='CH')
+        # loads data/CH_wide/cost_combined.tif; every other region uses the
+        # corrected Bern layer at the data/ root.
+        'cost': str(DATA_DIR / 'CH_wide' / 'cost_combined.tif') if region == 'CH'
+                else str(DATA_DIR / 'implementation_cost_corrected.tif'),
         'population_proximity': str(DATA_DIR / 'population_proximity.tif'),
         'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',
         'es_future_robustness': 'robustness/blce-robustness-data-archive/Undesirable_deviation_sum_of_change_ES.tif',
@@ -673,7 +687,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
 
     # Auto-load abiotic/biotic as data dependencies for computed objectives that require them,
     # even when they are not standalone optimisation objectives.
-    _needs_abiotic_biotic = {'landscape_context', 'restoration_potential'}
+    _needs_abiotic_biotic = {'landscape_context', 'restoration_potential', 'restoration_benefit'}
     _dependency_keys = set()  # keys loaded as data-only, not as objectives
     if computed_objectives & _needs_abiotic_biotic:
         for _dep, _dep_key in [('abiotic', 'abiotic_anomaly'), ('biotic', 'biotic_anomaly')]:
@@ -1365,6 +1379,13 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     if 'spatial_clustering' in computed_objectives:
         initial_conditions['spatial_clustering_enabled'] = True
         logger.info("spatial_clustering objective enabled (configuration-dependent compactness)")
+
+    # restoration_benefit is likewise computed at evaluation time (from the updated
+    # abiotic/biotic anomalies incl. neighbour spillover), so only a flag is set here.
+    # The abiotic/biotic anomaly rasters it needs were auto-loaded as dependencies.
+    if 'restoration_benefit' in computed_objectives:
+        initial_conditions['restoration_benefit_enabled'] = True
+        logger.info("restoration_benefit objective enabled (spillover-aware abiotic+biotic improvement)")
 
     initial_conditions['sample_info'] = {
         'sample_fraction': sample_fraction,

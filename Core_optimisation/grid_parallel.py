@@ -6,7 +6,7 @@ The condition grid and the factorial design are both sets of fully independent
 optimisation runs. The pymoo solver is sequential across generations, and the
 within-generation ``n_jobs`` thread pool is GIL-bound (per-individual
 ``_evaluate`` is mostly Python-level work), so a single run leaves most cores
-idle. The runs themselves share nothing — so the real parallelism lives at the
+idle. The runs themselves share nothing - so the real parallelism lives at the
 grid level and is best exploited with *processes*, which sidestep the GIL.
 
 Each worker function below is the unit of work submitted to a process pool. It
@@ -14,13 +14,13 @@ loads ``initial_conditions`` once for its condition-scenario tag and reuses it
 across every run it owns, so the heavy raster I/O + connectivity computation +
 admin-shapefile clip happens once per worker rather than once per run. The large
 arrays never cross a process boundary, and only a lightweight summary is
-returned — full results are persisted to disk by
+returned - full results are persisted to disk by
 ``run_optimization_instance(save_results=True)``.
 
 Workers:
-  - ``run_tag``            : condition grid — one tag, all of its seeds.
-  - ``run_factorial_cell`` : factorial design — one (tag, seed) cell, all of its
-                             form × policy combinations.
+  - ``run_tag``            : condition grid - one tag, all of its seeds.
+  - ``run_factorial_cell`` : factorial design - one (tag, seed) cell, all of its
+                             form x policy combinations.
 
 This module deliberately has NO import-time side effects so it can be safely
 re-imported by ``spawn`` worker processes on Windows.
@@ -36,7 +36,7 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
     """Run one optimisation instance with the grid's shared settings.
 
     Process-level parallelism IS the parallelism here, so the inner thread pool
-    is forced serial (``n_jobs=1``) — it is GIL-bound and ineffective, and using
+    is forced serial (``n_jobs=1``) - it is GIL-bound and ineffective, and using
     it would only oversubscribe cores against the other workers.
     """
     return run_optimization_instance(
@@ -61,6 +61,14 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
         run_label=run_label,
         run_config=run_config,
         r_export_parent=cfg["r_parent"],
+        # Defaults reproduce the historical behaviour for callers (e.g.
+        # run_custom_parallel.py) whose cfg omits these keys: nsga3, no explicit
+        # mutation flip count, no repair-diagnostic capture. run_custom_nsga2.py
+        # sets them so its grid runs NSGA-II with its diag settings.
+        algorithm_type=cfg.get("algorithm_type", "nsga3"),
+        mutation_flip_count=cfg.get("mutation_flip_count", None),
+        capture_repair_diag=cfg.get("capture_repair_diag", False),
+        n_capture_gens=cfg.get("n_capture_gens", 5),
     )
 
 
@@ -109,19 +117,19 @@ def run_tag(task):
                 seed, cfg,
             )
             summaries.append((run_label, res is not None, time.perf_counter() - t0, None))
-        except Exception as e:  # noqa: BLE001 — report, never crash the whole pool
+        except Exception as e:  # noqa: BLE001 - report, never crash the whole pool
             summaries.append((run_label, False, time.perf_counter() - t0, str(e)))
 
     return summaries
 
 
 def run_factorial_cell(task):
-    """Factorial design: run all form × policy combinations for one (tag, seed).
+    """Factorial design: run all form x policy combinations for one (tag, seed).
 
     The condition raster tag is ``f"{scaling}_{construction}"``. A cell loads its
     IC once and runs every (form, policy) combination at the given seed, so the
     raster load is amortised over ``len(forms) * len(policies)`` runs. Choosing
-    the cell — rather than the whole tag — as the task keeps workers busy even
+    the cell - rather than the whole tag - as the task keeps workers busy even
     when only a single construction level is active.
 
     Parameters
@@ -132,7 +140,7 @@ def run_factorial_cell(task):
           - 'construction' : str
           - 'seed'         : int
           - 'forms'        : list[str]            FACTORIAL_FORMS
-          - 'policies'     : dict[str, dict]      name → scenario_params overrides
+          - 'policies'     : dict[str, dict]      name -> scenario_params overrides
           - 'cfg'          : dict                 run settings (cfg['scenario_params']
                                                   is the base custom_scenario_params)
 

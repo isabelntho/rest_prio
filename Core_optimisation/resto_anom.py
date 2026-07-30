@@ -28,7 +28,7 @@ from pymoo.indicators.hv import HV
 from pymoo.util.ref_dirs import get_reference_directions
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
-from .spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache
+from .spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache, RegionGrowingSampling, RegionGrowingMutation, SpatialCoverageSampling, RegionEvolveMutation, RegionSwapCrossover, MinPatchSizeRepair, WarmStartSampling, grow_region_plan, build_restoration_neighbor_table
 from .data_loader import load_initial_conditions
 from .results_saving import save_results_with_reports
 from .paths import OUTPUT_DIR
@@ -190,6 +190,41 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
     # below subsets reference-direction weights to the objectives that DO have scores.
 
     return scores
+
+
+def _map_objectives_to_pixel_scores(problem, initial_conditions, scenario_params):
+    """Map run objectives to their per-pixel score arrays.
+
+    Returns (per_obj_pixel_scores, score_keys, score_obj_indices):
+      per_obj_pixel_scores : dict from build_per_objective_repair_scores.
+      score_keys           : score-dict keys for objectives that HAVE a per-pixel
+                             score, row-aligned with...
+      score_obj_indices    : ...the objective's column index in the n_obj weight
+                             vector.
+    Objectives WITHOUT a meaningful per-pixel score (spatial_clustering, which is
+    configuration-level, and restoration_benefit, which is arrangement-dependent
+    via spillover) are intentionally omitted here - they get no static warm-seed
+    and are excluded from direction-aware repair blending. Callers that want to
+    seed those objectives handle them separately (e.g. single-objective pre-opt).
+    """
+    per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
+    obj_to_score_key = {
+        'abiotic_anomaly':       'abiotic',
+        'biotic_anomaly':        'biotic',
+        'implementation_cost':   'cost',
+        'landscape_context':     'landscape_context',
+        'restoration_potential': 'restoration_potential',
+    }
+    # Walk objective_names once so score_keys (which scores) and score_obj_indices
+    # (their column in the n_obj weight vector) stay row-aligned.
+    score_keys = []
+    score_obj_indices = []
+    for oi, obj in enumerate(problem.objective_names):
+        key = obj_to_score_key.get(obj)
+        if key is not None and key in per_obj_pixel_scores:
+            score_keys.append(key)
+            score_obj_indices.append(oi)
+    return per_obj_pixel_scores, score_keys, score_obj_indices
 
 
 # --- Patch Approach Initialization ---
@@ -374,8 +409,14 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     # _dependency_keys; their updated anomalies are never read by evaluate_raw_objectives,
     # so skipping them here avoids full-raster copies + dilation every evaluation.
     _dep_only = initial_conditions.get('_dependency_keys', set())
+    # restoration_benefit reads the UPDATED abiotic/biotic anomalies (incl. spillover)
+    # at evaluation time, so those two must be processed even when they are loaded as
+    # data-only dependencies (kept out of objective_names). Without this they would be
+    # skipped as _dependency_keys and the benefit branch would have no updated values.
+    _benefit_deps = ({'abiotic_anomaly', 'biotic_anomaly'}
+                     if initial_conditions.get('restoration_benefit_enabled', False) else set())
     available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']
-                                   if obj in initial_conditions and obj not in _dep_only]
+                                   if obj in initial_conditions and (obj not in _dep_only or obj in _benefit_deps)]
     
     for objective in available_anomaly_objectives:
         original_values = initial_conditions[objective].copy()
@@ -502,8 +543,11 @@ class RestorationProblem(ElementwiseProblem):
         self.effect_params = {
             'abiotic_effect': abiotic_effect,
             'biotic_effect': biotic_effect,
-            'neighbor_radius': 3,  # Fixed value
-            'neighbor_effect_decay': 0.2  # Fixed value
+            # Neighbour spillover: restoration improves un-restored eligible neighbours
+            # within neighbor_radius, decayed by neighbor_effect_decay. Defaults preserve
+            # the previous fixed values; overridable for sensitivity / disabling (radius 0).
+            'neighbor_radius': int(scenario_params.get('neighbor_radius', 3)),
+            'neighbor_effect_decay': float(scenario_params.get('neighbor_effect_decay', 0.2)),
         }
 
         # restoration_potential objective formulation (Axis 2 — uncertainty in how
@@ -553,6 +597,8 @@ class RestorationProblem(ElementwiseProblem):
             self.objective_names.append('landscape_context')
         if 'restoration_potential_1d' in initial_conditions:
             self.objective_names.append('restoration_potential')
+        if initial_conditions.get('restoration_benefit_enabled', False):
+            self.objective_names.append('restoration_benefit')
         if initial_conditions.get('spatial_clustering_enabled', False):
             self.objective_names.append('spatial_clustering')
         if 'implementation_cost' in initial_conditions:
@@ -578,7 +624,29 @@ class RestorationProblem(ElementwiseProblem):
         
         # Calculate max action pixels based on restoration eligible pixels
         self.max_action_pixels = int(max_restoration_fraction * n_restoration_pixels)
-        
+
+        # Minimum patch (connected-component) size constraint for the "price of
+        # contiguity" sweep. min_patch_size <= 1 disables it (feature off, and the
+        # problem keeps its single budget constraint). When > 1 a second constraint
+        # is added: every 4-connected component of selected restoration pixels must
+        # have >= min_patch_size pixels (enforced by MinPatchSizeRepair; reported in
+        # out["G"][1] as an audit). Clamped to the budget so it stays feasible.
+        self.min_patch_size = int(scenario_params.get('min_patch_size', 1))
+        # The min-patch-size constraint is only repaired on the region-based sampling
+        # paths (MinPatchSizeRepair is wired for region_grow / region_evolve). On the
+        # "scattered" path nothing repairs it, so leaving it active makes every scattered
+        # solution infeasible. Auto-disable it there rather than silently return no front.
+        _strategy = str(scenario_params.get('sampling_strategy', 'scattered')).lower()
+        if self.min_patch_size > 1 and _strategy not in ('region_grow', 'region_evolve'):
+            print(f"WARNING: min_patch_size ({self.min_patch_size}) is only enforced on the "
+                  f"region_grow / region_evolve paths; sampling_strategy='{_strategy}' has no "
+                  f"MinPatchSizeRepair. Disabling the constraint (min_patch_size=1) for this run.")
+            self.min_patch_size = 1
+        if self.min_patch_size > self.max_action_pixels:
+            print(f"WARNING: min_patch_size ({self.min_patch_size}) > budget "
+                  f"({self.max_action_pixels}); clamping to budget.")
+            self.min_patch_size = self.max_action_pixels
+
         # Store pixel counts for splitting decision vector
         self.n_restoration_pixels = n_restoration_pixels
         self.n_conversion_pixels = n_conversion_pixels
@@ -607,7 +675,8 @@ class RestorationProblem(ElementwiseProblem):
 
         # Initialize the problem
         kwargs = dict(
-            n_var=total_decision_vars, n_obj=n_objectives, n_constr=1,
+            n_var=total_decision_vars, n_obj=n_objectives,
+            n_constr=(2 if self.min_patch_size > 1 else 1),
             xl=0, xu=1, type_var=int, elementwise=True,
         )
         if elementwise_runner is not None:
@@ -647,6 +716,15 @@ class RestorationProblem(ElementwiseProblem):
                     scale = float(len(rp))
                 else:
                     scale = float(np.nansum(np.abs(rp)))
+            elif obj_name == 'restoration_benefit':
+                # Same scale basis as abiotic+biotic anomaly objectives: total absolute
+                # baseline anomaly over restoration-eligible pixels (both components).
+                _ab = self.initial_conditions['abiotic_anomaly']
+                _bi = self.initial_conditions['biotic_anomaly']
+                if rest_mask is not None:
+                    scale = float(np.nansum(np.abs(_ab[rest_mask])) + np.nansum(np.abs(_bi[rest_mask])))
+                else:
+                    scale = float(np.nansum(np.abs(_ab)) + np.nansum(np.abs(_bi)))
             elif obj_name == 'implementation_cost':
                 c = self.initial_conditions['implementation_cost']
                 if rest_mask is not None and conv_mask is not None:
@@ -750,6 +828,17 @@ class RestorationProblem(ElementwiseProblem):
                     # Total-improvement formulation: minimise summed baseline potential
                     # (selecting more degraded pixels gives a more negative sum).
                     obj_value = float(np.sum(rp[sel]))
+            elif obj_name == 'restoration_benefit':
+                # Spatially-explicit benefit: total abiotic+biotic anomaly improvement
+                # achieved by the plan, INCLUDING neighbour spillover (restoration_effect
+                # improves each restored cell and its un-restored eligible neighbours).
+                # Summed over restoration-eligible pixels; negated so the minimiser
+                # maximises improvement. Unlike restoration_potential this depends on the
+                # spatial arrangement (spillover overlap), not just which pixels.
+                mask = self.initial_conditions["restoration_eligible_mask"]
+                d_ab = updated_conditions['abiotic_anomaly'] - self.initial_conditions['abiotic_anomaly']
+                d_bi = updated_conditions['biotic_anomaly'] - self.initial_conditions['biotic_anomaly']
+                obj_value = -float(np.sum((d_ab + d_bi)[mask]))
             elif obj_name == 'spatial_clustering':
                 # Spatial clustering of the selected restoration pixels. Map the
                 # selected eligible pixels back to the 2D raster, then score one of
@@ -854,16 +943,39 @@ class RestorationProblem(ElementwiseProblem):
         
         # Constraint: total number of pixels with actions (restore + convert)
         out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
-        
+
+        # Minimum-patch-size constraint (price-of-contiguity sweep). Feasible when
+        # every 4-connected component of selected restoration pixels has >= S pixels;
+        # violation = max(0, S - smallest_component). MinPatchSizeRepair guarantees
+        # this, so out["G"][1] audits the repair (should stay 0).
+        if self.min_patch_size > 1:
+            out["G"].append(self._min_patch_size_violation(x_restore))
+
         # Log constraint violations (thread-safe: constraint_log is shared state)
+        _ctypes = ['budget', 'min_patch_size']
         for i, g_val in enumerate(out["G"]):
             if g_val > 0:
                 with self._eval_lock:
                     self.constraint_log.append({
-                        'generation': getattr(self, 'current_gen', 0), 
+                        'generation': getattr(self, 'current_gen', 0),
                         'violation_value': g_val,
-                        'constraint_type': 'budget'
+                        'constraint_type': _ctypes[i] if i < len(_ctypes) else f'constraint_{i}'
                     })
+
+    def _min_patch_size_violation(self, x_restore):
+        """max(0, min_patch_size - smallest 4-connected component of the selection)."""
+        sel_idx = self.initial_conditions['restoration_eligible_indices'][x_restore == 1]
+        if sel_idx.size == 0:
+            return float(self.min_patch_size)
+        shape = self.initial_conditions['shape']
+        m = np.zeros(shape, dtype=bool)
+        rr, cc = np.divmod(sel_idx, shape[1])
+        m[rr, cc] = True
+        lab, nc = ndimage.label(m)
+        if nc == 0:
+            return float(self.min_patch_size)
+        smallest = int(np.bincount(lab.ravel())[1:].min())
+        return float(max(0, self.min_patch_size - smallest))
 
 
 # --- Patch-Based Problem ---
@@ -1023,6 +1135,11 @@ class PatchRestorationProblem(RestorationProblem):
         
         out["G"] = [constraint_value]
 
+        # Parity with RestorationProblem: keep out["G"] length == n_constr when the
+        # minimum-patch-size constraint is active (computed on the pixel selection).
+        if self.min_patch_size > 1:
+            out["G"].append(self._min_patch_size_violation(x_restore_pixels))
+
     def evaluate_raw_objectives(self, x_patches):
         """Return raw objectives for patch-level decisions via pixel conversion."""
         from .patch_approach import convert_patch_decisions_to_pixels
@@ -1094,7 +1211,7 @@ class HVCallback:
     is observed for a specified number of generations.
     """
     
-    def __init__(self, patience=10, min_improvement=1e-6, verbose=True, ref_point=None):
+    def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None):
         """
         Initialize hypervolume callback.
         
@@ -1233,7 +1350,7 @@ class ProgressCallback:
     """
 
     def __init__(self, verbose=True, n_generations=100,
-                 hv_patience=10, hv_min_improvement=1e-6, ref_point=None,
+                 hv_patience=15, hv_min_improvement=1e-6, ref_point=None,
                  save_snapshots=False, snapshot_dir=None):
         """
         Args:
@@ -1292,11 +1409,10 @@ class ProgressCallback:
             print(f"   Generation {gen}/{self.n_generations} ({progress:.1f}%) - "
                   f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}")
 
-        # Hypervolume-based early stopping
-        # TEMP: early stopping disabled - runs will always go to the full
-        # n_generations. Re-enable by uncommenting the two lines below.
-        # if self.hv_callback.converged:
-        #     algorithm.termination.force_termination = True
+        # Hypervolume-based early stopping: once the HVCallback has seen no
+        # improvement for hv_patience generations, tell pymoo to terminate.
+        if self.hv_callback.converged:
+            algorithm.termination.force_termination = True
 
 
 def _filter_initial_conditions_for_return(initial_conditions):
@@ -1320,6 +1436,178 @@ def _filter_initial_conditions_for_return(initial_conditions):
 # --- Optimization Run Helpers ---
 
 
+class SingleObjectiveView(ElementwiseProblem):
+    """Expose ONE objective of a multi-objective RestorationProblem as n_obj=1.
+
+    Reuses the base problem's full _evaluate (all objective logic plus the budget
+    / min-patch constraints) and slices out a single objective column, so a
+    single-objective GA can search for that objective's extreme. This is how
+    warm seeding handles arrangement-dependent objectives (restoration_benefit,
+    spatial_clustering) that have no static per-pixel score: the extreme is found
+    by the real objective evaluation rather than a proxy.
+
+    Operator-relevant attributes are copied from the base problem so the same
+    sampling/repair/mutation/crossover operators run unchanged against this view.
+    """
+
+    def __init__(self, base, obj_index):
+        self.base = base
+        self.obj_index = int(obj_index)
+        # Operators read these off `problem`; mirror them from the base problem.
+        self.initial_conditions = base.initial_conditions
+        self.n_restoration_pixels = base.n_restoration_pixels
+        self.n_conversion_pixels = base.n_conversion_pixels
+        self.n_pixels = getattr(base, 'n_pixels', base.n_restoration_pixels)
+        self.max_action_pixels = base.max_action_pixels
+        self.min_patch_size = getattr(base, 'min_patch_size', 1)
+        super().__init__(
+            n_var=base.n_var, n_obj=1,
+            n_constr=(2 if self.min_patch_size > 1 else 1),
+            xl=0, xu=1, type_var=int, elementwise=True,
+        )
+
+    def _evaluate(self, x, out, *args, **kwargs):
+        o = {}
+        self.base._evaluate(x, o, *args, **kwargs)
+        F = np.asarray(o["F"], dtype=float)
+        out["F"] = [float(F[self.obj_index])]
+        if o.get("G") is not None:
+            out["G"] = o["G"]
+
+
+def _single_objective_seed(problem, obj_index, base_sampling, repair, mutation,
+                           crossover, pop, gens, seed, verbose=False):
+    """Run a short single-objective GA on one objective; return its best genotype.
+
+    Reuses the run's operators so the seed is feasible and (for region strategies)
+    contiguous. The GA runs serially over a SingleObjectiveView. Diagnostic state
+    on the repair operator is snapshotted and restored so this pre-run does not
+    pollute the main run's repair logs / capture schedule.
+    """
+    from pymoo.algorithms.soo.nonconvex.ga import GA
+
+    view = SingleObjectiveView(problem, obj_index)
+    _mut = mutation if mutation is not None else InstrumentedBitflipMutation(
+        prob=1.0, prob_var=200.0 / problem.n_var)
+    _cx = crossover if crossover is not None else HUX()
+
+    # Snapshot mutable diagnostic state on the repair so the pre-run leaves it as
+    # it found it (capture disabled during the pre-run; counters/logs restored).
+    _saved = None
+    if repair is not None:
+        _saved = (
+            getattr(repair, 'capture_diag', None),
+            getattr(repair, 'total_calls', None),
+            list(getattr(repair, 'call_log', [])),
+            list(getattr(repair, 'repair_log', [])),
+        )
+        if hasattr(repair, 'capture_diag'):
+            repair.capture_diag = False
+
+    try:
+        ga = GA(
+            pop_size=int(pop),
+            sampling=base_sampling,
+            crossover=_cx,
+            mutation=_mut,
+            repair=repair,
+            eliminate_duplicates=True,
+        )
+        res = minimize(view, ga, get_termination("n_gen", int(gens)),
+                       seed=int(seed), verbose=False)
+    except Exception as e:
+        if verbose:
+            print(f"  Warm-start pre-opt for objective index {obj_index} failed: {e}")
+        res = None
+    finally:
+        if _saved is not None:
+            cap, tc, cl, rl = _saved
+            if cap is not None:
+                repair.capture_diag = cap
+            if tc is not None:
+                repair.total_calls = tc
+            if hasattr(repair, 'call_log'):
+                repair.call_log[:] = cl
+            if hasattr(repair, 'repair_log'):
+                repair.repair_log[:] = rl
+
+    if res is None or getattr(res, 'X', None) is None:
+        return None
+    return np.asarray(res.X, dtype=int).ravel()
+
+
+def build_warm_start_seeds(problem, initial_conditions, scenario_params,
+                           base_sampling, repair, mutation, crossover,
+                           sampling_strategy, random_seed, verbose=False):
+    """Build warm-seed genotypes for the non-patch path (hybrid).
+
+    - Objectives WITH a per-pixel score get a cheap static seed: greedy top-k by
+      score for 'scattered'; a single contiguous grown region for the region
+      strategies.
+    - Arrangement-dependent objectives (no per-pixel score, e.g. restoration_benefit,
+      spatial_clustering) get a short single-objective pre-optimisation GA.
+
+    Returns an int array (n_seed, n_var), or None when nothing is seeded.
+    """
+    n_var = problem.n_var
+    n_rest = problem.n_restoration_pixels
+    k = min(int(problem.max_action_pixels), n_rest)
+    rng = np.random.RandomState(None if random_seed is None else int(random_seed))
+    strategy = str(sampling_strategy).lower()
+    region_mode = strategy in ('region_grow', 'region_evolve')
+
+    per_obj_pixel_scores, score_keys, score_obj_indices = _map_objectives_to_pixel_scores(
+        problem, initial_conditions, scenario_params)
+
+    seeds = []
+
+    # --- Static-score seeds (objectives that have a per-pixel score) ---
+    nbr = None
+    if region_mode and score_keys:
+        nbr, _rows, _cols = build_restoration_neighbor_table(initial_conditions)
+    for key in score_keys:
+        score = np.asarray(per_obj_pixel_scores[key], dtype=np.float64)
+        if score.shape[0] != n_rest:
+            # Score length must align with restoration-eligible pixels; skip if not.
+            if verbose:
+                print(f"  Warm-start: skipping static seed '{key}' "
+                      f"(len {score.shape[0]} != n_rest {n_rest})")
+            continue
+        row = np.zeros(n_var, dtype=int)
+        if region_mode:
+            sel = grow_region_plan(nbr, n_rest, k, 1, score, 'scored', rng)
+            row[:n_rest] = np.asarray(sel, dtype=int)
+        else:
+            # Greedy top-k by score; tiny tie jitter avoids raster-order bias
+            # (mirrors PatchAwareSampling._build_extreme_solution).
+            jitter = 1e-9 * rng.random(n_rest)
+            top = np.argsort(-(score + jitter))[:k]
+            row[top] = 1
+        seeds.append(row)
+
+    # --- Pre-optimisation seeds (arrangement-dependent objectives) ---
+    mapped = set(score_obj_indices)
+    arrangement_indices = [oi for oi in range(len(problem.objective_names))
+                           if oi not in mapped]
+    if arrangement_indices:
+        pop = int(scenario_params.get('warm_seed_preopt_pop', 40))
+        gens = int(scenario_params.get('warm_seed_preopt_gens', 30))
+        base_seed = 0 if random_seed is None else int(random_seed)
+        for oi in arrangement_indices:
+            if verbose:
+                print(f"  Warm-start: pre-optimising objective "
+                      f"'{problem.objective_names[oi]}' (pop={pop}, gens={gens})...")
+            seed_x = _single_objective_seed(
+                problem, oi, base_sampling, repair, mutation, crossover,
+                pop=pop, gens=gens, seed=base_seed + 1000 + oi, verbose=verbose)
+            if seed_x is not None and seed_x.shape[0] == n_var:
+                seeds.append(seed_x)
+
+    if not seeds:
+        return None
+    return np.vstack(seeds).astype(int)
+
+
 def _build_operators(initial_conditions, scenario_params, problem, use_patch_approach,
                      use_repair, patch_constraint_type, pixel_tolerance, verbose, warm_seeding=True,
                      capture_repair_diag=False, n_capture_gens=5, n_generations=None, diag_dir=None):
@@ -1331,6 +1619,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
     tuple
         (sampling, repair) — repair is None when use_repair is False.
     """
+    mutation = None   # region pixel modes supply a custom mutation
+    crossover = None  # region_evolve supplies a region-swap crossover
     if use_patch_approach:
         restoration_scores = build_repair_scores(initial_conditions, scenario_params)
         patch_scores = aggregate_patch_scores_from_pixel_scores(
@@ -1349,31 +1639,14 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         # PatchRepair uses these weights at repair time to blend the three score
         # vectors, so cost-axis individuals get repaired toward cheap patches,
         # abiotic-axis individuals toward high-abiotic patches, etc.
-        per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
-        # Map internal objective names → score keys used by build_per_objective_repair_scores.
-        # This ensures per_obj_patch_scores matches the actual objectives in the run.
+        # Map internal objective names -> per-pixel score keys (shared helper).
         # Objectives WITHOUT a meaningful per-patch score (e.g. spatial_clustering,
-        # which is configuration-level) are intentionally absent here. They get no
+        # which is configuration-level) are intentionally absent. They get no
         # warm-seed and are excluded from direction-aware repair blending via
-        # _score_obj_indices below — never given a placeholder score, which would
+        # _score_obj_indices - never given a placeholder score, which would
         # otherwise collapse argsort-based seeding to raster scan order.
-        _obj_to_score_key = {
-            'abiotic_anomaly':     'abiotic',
-            'biotic_anomaly':      'biotic',
-            'implementation_cost': 'cost',
-            'landscape_context':   'landscape_context',
-            'restoration_potential': 'restoration_potential',
-        }
-        # Walk objective_names once so _score_keys (which scores) and
-        # _score_obj_indices (their column in the n_obj ref-direction weight vector)
-        # stay row-aligned with per_obj_patch_scores.
-        _score_keys = []
-        _score_obj_indices = []
-        for _oi, obj in enumerate(problem.objective_names):
-            key = _obj_to_score_key.get(obj)
-            if key is not None and key in per_obj_pixel_scores:
-                _score_keys.append(key)
-                _score_obj_indices.append(_oi)
+        per_obj_pixel_scores, _score_keys, _score_obj_indices = _map_objectives_to_pixel_scores(
+            problem, initial_conditions, scenario_params)
         per_obj_patch_scores = np.stack([
             aggregate_patch_scores_from_pixel_scores(
                 patch_mappings=initial_conditions['patch_mappings'],
@@ -1435,60 +1708,185 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             )
     else:
         scores = build_repair_scores(initial_conditions, scenario_params)
-        sampling = AdaptiveSampling(initial_conditions, problem.max_action_pixels, scenario_params)
-        repair = AdaptiveRepair(
-            initial_conditions, problem.max_action_pixels, scenario_params, scores,
-            capture_diag=capture_repair_diag, n_generations=n_generations,
-            n_capture=n_capture_gens, diag_dir=diag_dir,
-        ) if use_repair else None
+        sampling_strategy = str(scenario_params.get('sampling_strategy', 'scattered')).lower()
 
-        if verbose:
-            burden_sharing = scenario_params.get('burden_sharing', 'no')
-            clustering_strength = scenario_params.get('spatial_clustering', 0.0)
-            strategy_desc = []
-            if burden_sharing == 'yes':
-                strategy_desc.append("burden-sharing")
-            if clustering_strength > 0.0:
-                strategy_desc.append(f"clustering({clustering_strength})")
-            if not strategy_desc:
-                strategy_desc.append("random with score-based repair")
-            print(f"Using adaptive operators: {', '.join(strategy_desc)}")
+        if sampling_strategy in ('region_grow', 'region_evolve'):
+            # Region operators build contiguous, arbitrary-shape regions so the search
+            # can reach clustered (non-scattered) plans where cost and spatial_clustering
+            # actually vary. region_evolve additionally makes the SEARCH explore the
+            # landscape (relocate/spawn/swap whole regions) instead of collapsing onto
+            # one basin. See [[hv-stagnation-flat-objectives]].
+            region_seeds = int(scenario_params.get('region_seeds', 25))
+            region_seeds_min = scenario_params.get('region_seeds_min', None)
+            region_random_share = float(scenario_params.get('region_random_share', 0.0))
+            growth_bias = str(scenario_params.get('region_growth_bias', 'scored')).lower()
+            region_edits = int(scenario_params.get('region_mutation_edits', 100))
+            region_seed_grid = int(scenario_params.get('region_seed_grid', 16))
 
-    return sampling, repair
+            # Minimum-patch-size constraint (price-of-contiguity sweep). When active,
+            # cap the seed count so the initial regions are already >= S on average
+            # (avg region size ~ budget / seeds), leaving little for the repair to fix.
+            min_patch_size = int(getattr(problem, 'min_patch_size', 1))
+            if min_patch_size > 1:
+                max_seeds_for_S = max(1, problem.max_action_pixels // min_patch_size)
+                region_seeds = min(region_seeds, max_seeds_for_S)
+                if region_seeds_min is not None:
+                    region_seeds_min = min(int(region_seeds_min), region_seeds)
+
+            # 'scored' growth prefers high restoration score AND low cost: blend the
+            # standardised base score with negated standardised per-pixel cost so
+            # regions form in cheap, high-value areas (exposing the cost gradient).
+            region_scores = np.asarray(scores, dtype=np.float64)
+            cost2d = initial_conditions.get('implementation_cost')
+            rmask = initial_conditions.get('restoration_eligible_mask')
+            if growth_bias == 'scored' and cost2d is not None and rmask is not None:
+                cpix = np.asarray(cost2d)[rmask].astype(np.float64)
+                if cpix.size == region_scores.size:
+                    def _z(a):
+                        sd = a.std()
+                        return (a - a.mean()) / sd if sd > 0 else np.zeros_like(a)
+                    region_scores = _z(region_scores) - _z(cpix)
+
+            if sampling_strategy == 'region_evolve':
+                # Seed regions SPREAD across the map (coverage), evolve them with
+                # region-level moves, and recombine whole regions (not HUX).
+                sampling = SpatialCoverageSampling(
+                    initial_conditions, problem.max_action_pixels, region_scores,
+                    region_seeds=region_seeds, region_seeds_min=region_seeds_min,
+                    growth_bias='neutral', seed_grid=region_seed_grid,
+                )
+                mutation = RegionEvolveMutation(
+                    initial_conditions, problem.max_action_pixels, region_scores,
+                    n_edits=region_edits, growth_bias=growth_bias,
+                    pixel_tolerance=pixel_tolerance,
+                )
+                crossover = RegionSwapCrossover(
+                    initial_conditions, problem.max_action_pixels, region_scores,
+                    growth_bias=growth_bias, pixel_tolerance=pixel_tolerance,
+                )
+                if verbose:
+                    print(f"Using region-evolve operators (seeds<={region_seeds}, "
+                          f"grid={region_seed_grid}, bias={growth_bias})")
+            else:
+                sampling = RegionGrowingSampling(
+                    initial_conditions, problem.max_action_pixels, region_scores,
+                    region_seeds=region_seeds, growth_bias=growth_bias,
+                    region_seeds_min=region_seeds_min, random_share=region_random_share,
+                )
+                mutation = RegionGrowingMutation(
+                    initial_conditions, problem.max_action_pixels, region_scores,
+                    n_edits=region_edits, growth_bias=growth_bias,
+                    pixel_tolerance=pixel_tolerance,
+                )
+                if verbose:
+                    print(f"Using region-growing operators (seeds={region_seeds}, "
+                          f"bias={growth_bias}, edits={region_edits})")
+            if not use_repair:
+                repair = None
+            else:
+                # Region modes always use the contiguity-preserving repair, so every
+                # min-patch-size level differs ONLY in the floor S. S=1 means "no size
+                # floor" but still uses the same scored contiguous budget regrowth - so
+                # the price-of-contiguity sweep is a controlled comparison rather than
+                # having S=1 fall through to the scattered AdaptiveRepair (which does
+                # different optimisation work and made S=1 non-comparable).
+                repair = MinPatchSizeRepair(
+                    initial_conditions, problem.max_action_pixels, min_patch_size,
+                    scores=region_scores, pixel_tolerance=pixel_tolerance,
+                    growth_bias=growth_bias,
+                )
+                if verbose:
+                    print(f"Using MinPatchSizeRepair (S={min_patch_size}, "
+                          f"seeds<={region_seeds})")
+        else:
+            sampling = AdaptiveSampling(initial_conditions, problem.max_action_pixels, scenario_params)
+            # repair_scored=False makes the budget repair NEUTRAL: passing scores=None
+            # routes AdaptiveRepair to _enforce_count_random (constraints-only, no score
+            # bias), giving an operator-unbiased front. Default True preserves the
+            # historical score-based repair for every other run.
+            repair_scored = bool(scenario_params.get('repair_scored', True))
+            repair = AdaptiveRepair(
+                initial_conditions, problem.max_action_pixels, scenario_params,
+                scores if repair_scored else None,
+                capture_diag=capture_repair_diag, n_generations=n_generations,
+                n_capture=n_capture_gens, diag_dir=diag_dir,
+            ) if use_repair else None
+
+            if verbose:
+                burden_sharing = scenario_params.get('burden_sharing', 'no')
+                clustering_strength = scenario_params.get('spatial_clustering', 0.0)
+                repair_desc = "score-based repair" if repair_scored else "neutral (random) repair"
+                strategy_desc = []
+                if burden_sharing == 'yes':
+                    strategy_desc.append("burden-sharing")
+                if clustering_strength > 0.0:
+                    strategy_desc.append(f"clustering({clustering_strength})")
+                if not strategy_desc:
+                    strategy_desc.append(f"random with {repair_desc}")
+                print(f"Using adaptive operators: {', '.join(strategy_desc)}")
+
+    return sampling, repair, mutation, crossover
 
 
 def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8,
-                     mutation_prob_var=None):
+                     mutation_prob_var=None, mutation=None, crossover=None,
+                     algorithm_type="nsga3", pop_size=None):
     """
-    Construct the NSGA-III algorithm and generation-based termination criterion.
+    Construct the multi-objective algorithm and generation-based termination.
 
-    NSGA-III uses structured reference directions (Das-Dennis simplex lattice)
-    instead of crowding distance for diversity preservation. This restores
-    selection pressure in 3-objective space where NSGA-II degenerates because
-    nearly all solutions end up on rank 0.
-
-    With n_partitions=12 and 3 objectives, 45 reference directions are generated. NSGA-III sets population size equal to the number of
-    reference directions
+    algorithm_type:
+      "nsga3" (default) - NSGA-III with structured reference directions
+                          (Das-Dennis simplex lattice) instead of crowding
+                          distance. Restores selection pressure in 3-objective
+                          space where NSGA-II degenerates because nearly all
+                          solutions end up on rank 0. Population size equals the
+                          number of reference directions (n_partitions=12, 3 obj
+                          -> 45 ref dirs -> pop 45).
+      "nsga2"           - classic NSGA-II with explicit pop_size and crowding
+                          distance. Appropriate for 2-objective problems where
+                          the Pareto front is a curve and crowding distance
+                          preserves diversity well. Uses pop_size directly.
 
     Returns
     -------
     tuple
         (algorithm, termination)
     """
-    n_obj = problem.n_obj
-    ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_partitions)
     # Per-variable flip probability. Default keeps historical behaviour of ~200
     # expected flips per individual (prob_var = 200 / n_var); callers may override
     # (e.g. mutation-rate sensitivity sweeps).
     if mutation_prob_var is None:
         mutation_prob_var = 200.0 / problem.n_var
-    algorithm = NSGA3(
-        ref_dirs=ref_dirs,
-        sampling=sampling,
-        crossover=HUX(),
-        mutation=InstrumentedBitflipMutation(prob=1.0, prob_var=mutation_prob_var),
-        repair=repair,
-    )
+    # Region-growing runs supply a contiguity-preserving mutation; otherwise use
+    # the default per-variable bitflip mutation.
+    if mutation is None:
+        mutation = InstrumentedBitflipMutation(prob=1.0, prob_var=mutation_prob_var)
+    # region_evolve supplies a region-swap crossover; otherwise use HUX.
+    if crossover is None:
+        crossover = HUX()
+
+    algorithm_type = str(algorithm_type).lower()
+    if algorithm_type == "nsga2":
+        from pymoo.algorithms.moo.nsga2 import NSGA2
+        if pop_size is None:
+            raise ValueError("NSGA-II requires an explicit pop_size")
+        algorithm = NSGA2(
+            pop_size=pop_size,
+            sampling=sampling,
+            crossover=crossover,
+            mutation=mutation,
+            repair=repair,
+        )
+    else:
+        n_obj = problem.n_obj
+        ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=n_partitions)
+        algorithm = NSGA3(
+            ref_dirs=ref_dirs,
+            sampling=sampling,
+            crossover=crossover,
+            mutation=mutation,
+            repair=repair,
+        )
     termination = get_termination("n_gen", n_generations)
     return algorithm, termination
 
@@ -1696,7 +2094,7 @@ def _print_failure_diagnostics(result, problem, initial_conditions):
 
 def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      n_generations=100, save_results=True, verbose=True,
-                                     skip_diagnostics=False, hv_patience=10,
+                                     skip_diagnostics=False, hv_patience=25,
                                      hv_min_improvement=1e-6, n_jobs=None, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
@@ -1705,7 +2103,8 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      n_partitions=8, warm_seeding=True,
                                      r_export_parent=None, mutation_prob_var=None,
                                      mutation_flip_count=None,
-                                     capture_repair_diag=False, n_capture_gens=5):
+                                     capture_repair_diag=False, n_capture_gens=5,
+                                     algorithm_type="nsga3"):
     """
     Run the multi-objective restoration optimization for a single scenario.
 
@@ -1744,6 +2143,13 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             Debugs_tests/repair_diversity_report.py.
         n_capture_gens: Number of evenly-spaced generations (including first and last)
             to capture when capture_repair_diag is True.
+        algorithm_type: Which multi-objective algorithm to run.
+            "nsga3" (default) - NSGA-III with Das-Dennis reference directions;
+                population size is set by n_partitions (pop_size is ignored).
+                Best for >=3 objectives.
+            "nsga2" - classic NSGA-II with crowding distance and an explicit
+                pop_size. Natural choice for 2-objective problems where the
+                Pareto front is a curve.
 
     Returns:
         dict: Optimization results, or None if optimization failed.
@@ -1813,13 +2219,31 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         repair_diag_dir = os.path.join(output_dir, 'repair_diagnostics', _diag_sub)
     else:
         repair_diag_dir = None
-    sampling, repair = _build_operators(
+    sampling, repair, mutation, crossover = _build_operators(
         initial_conditions, scenario_params, problem,
         use_patch_approach, use_repair, patch_constraint_type, pixel_tolerance, verbose,
         warm_seeding=warm_seeding,
         capture_repair_diag=capture_repair_diag, n_capture_gens=n_capture_gens,
         n_generations=n_generations, diag_dir=repair_diag_dir,
     )
+
+    # --- 5b. Warm-start seeding (non-patch path) ---
+    # The patch path seeds inside PatchAwareSampling; here we build objective-extreme
+    # seeds (static per-pixel scores + single-objective pre-optimisation for
+    # arrangement-dependent objectives) and inject them via a generic decorator so
+    # the same wrapped sampler feeds both the HV ref point and the algorithm.
+    if warm_seeding and not use_patch_approach:
+        _sampling_strategy = str(scenario_params.get('sampling_strategy', 'scattered')).lower()
+        seed_X = build_warm_start_seeds(
+            problem, initial_conditions, scenario_params,
+            sampling, repair, mutation, crossover,
+            _sampling_strategy, random_seed, verbose=verbose,
+        )
+        if seed_X is not None:
+            sampling = WarmStartSampling(sampling, seed_X)
+            if verbose:
+                print(f"  Warm-start: injecting {seed_X.shape[0]} objective-extreme "
+                      f"seed(s) into the initial population.")
 
     # --- 6. Build HV reference point ---
     hv_warmup_samples = int(scenario_params.get("hv_warmup_samples", 40 if use_patch_approach else 200))
@@ -1836,7 +2260,9 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     if mutation_flip_count is not None:
         mutation_prob_var = mutation_flip_count / problem.n_var
     algorithm, termination = _build_algorithm(problem, sampling, repair, n_generations, n_partitions,
-                                              mutation_prob_var=mutation_prob_var)
+                                              mutation_prob_var=mutation_prob_var, mutation=mutation,
+                                              crossover=crossover, algorithm_type=algorithm_type,
+                                              pop_size=pop_size)
 
     # --- 8. Initial sampling quality check (patch mode only) ---
     if use_patch_approach and verbose:

@@ -10,10 +10,13 @@ This module contains:
 """
 
 import os
+import heapq
 import numpy as np
 from scipy import ndimage
 from pymoo.core.repair import Repair
 from pymoo.core.sampling import Sampling
+from pymoo.core.mutation import Mutation
+from pymoo.core.crossover import Crossover
 from pymoo.operators.mutation.bitflip import BitflipMutation
 import rasterio
 from scipy.ndimage import generic_filter
@@ -432,6 +435,35 @@ class AdaptiveSampling(Sampling):
         return X
 
 
+class WarmStartSampling(Sampling):
+    """Decorate a base sampler by injecting precomputed warm-seed individuals.
+
+    Strategy-agnostic: wraps any Sampling operator and places the fixed seed
+    genotypes in the LAST rows of the initial population, filling the remaining
+    rows via the base sampler. Mirrors the patch path, which reserves the tail
+    of the population for objective-extreme seeds (see PatchAwareSampling).
+
+    seed_X : int array (n_seed, n_var) or None. When None, or when the requested
+    n_samples is not larger than n_seed, the base sampler is used unchanged so at
+    least one stochastic individual always remains.
+    """
+
+    def __init__(self, base_sampling, seed_X):
+        super().__init__()
+        self.base_sampling = base_sampling
+        self.seed_X = (
+            np.asarray(seed_X, dtype=int) if seed_X is not None and len(seed_X) > 0
+            else None
+        )
+
+    def _do(self, problem, n_samples, **kwargs):
+        n_seed = 0 if self.seed_X is None else self.seed_X.shape[0]
+        if n_seed == 0 or n_samples <= n_seed:
+            return self.base_sampling._do(problem, n_samples, **kwargs)
+        X = self.base_sampling._do(problem, n_samples - n_seed, **kwargs)
+        return np.vstack([np.asarray(X, dtype=int), self.seed_X])
+
+
 # =============================================================================
 # CUSTOM REPAIR OPERATOR
 # =============================================================================
@@ -789,3 +821,732 @@ class InstrumentedBitflipMutation(BitflipMutation):
             'total_raw_flips': int(np.sum(flips_per_ind)),
         })
         return X_after
+
+
+# =============================================================================
+# REGION-GROWING OPERATORS (contiguous, arbitrary-shape restoration regions)
+# =============================================================================
+#
+# Motivation: the pixel-level sampler/mutation only reach spatially SCATTERED
+# plans. On that manifold cost is near-constant (a ~22k/437k random subset
+# averages to ~mean cost) and spatial_clustering stays frozen, so the 3-objective
+# problem collapses to ~single-objective and HV freezes. Concentrating the budget
+# in contiguous regions instead swings total cost by ~14x and gives clustering
+# real range. These operators build and preserve contiguous regions of ANY shape
+# (not square patches), so the search can reach that part of the space.
+#
+# Shared machinery: a precomputed 4-neighbour table over the restoration-eligible
+# pixels (local index -> up to 4 eligible neighbour local indices, -1 for none),
+# built once from restoration_eligible_indices + shape. O(1) neighbour lookup, no
+# per-pixel Python scans.
+
+
+def build_restoration_neighbor_table(initial_conditions):
+    """Precompute the 4-neighbourhood over restoration-eligible pixels.
+
+    Returns (nbr, rows, cols) where:
+      nbr  : int32 array (n_rest, 4) of eligible-neighbour LOCAL indices (-1 if the
+             orthogonal neighbour is off-grid or not restoration-eligible),
+      rows : int32 array (n_rest,) raster row of each local pixel,
+      cols : int32 array (n_rest,) raster col of each local pixel.
+
+    Cached on initial_conditions under '_restoration_nbr_table' so repeated
+    operator builds (e.g. across a sweep) pay for it once.
+    """
+    cache = initial_conditions.get('_restoration_nbr_table')
+    if cache is not None:
+        return cache
+
+    shape = initial_conditions['shape']
+    H, W = int(shape[0]), int(shape[1])
+    elig_idx = np.asarray(initial_conditions['restoration_eligible_indices'], dtype=np.int64)
+    n_rest = elig_idx.size
+    rows = (elig_idx // W).astype(np.int32)
+    cols = (elig_idx % W).astype(np.int32)
+
+    # Grid of local indices (-1 where not restoration-eligible) for O(1) lookup.
+    elig_grid = np.full((H, W), -1, dtype=np.int32)
+    elig_grid[rows, cols] = np.arange(n_rest, dtype=np.int32)
+
+    nbr = np.full((n_rest, 4), -1, dtype=np.int32)
+    for d, (dr, dc) in enumerate([(-1, 0), (1, 0), (0, -1), (0, 1)]):
+        rr = rows.astype(np.int64) + dr
+        cc = cols.astype(np.int64) + dc
+        valid = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+        nbr[valid, d] = elig_grid[rr[valid], cc[valid]]
+
+    cache = (nbr, rows, cols)
+    initial_conditions['_restoration_nbr_table'] = cache
+    return cache
+
+
+def grow_region_plan(nbr, n_rest, target_k, n_seeds, scores, mode, rng):
+    """Build one contiguous-region restoration plan (boolean array of length n_rest).
+
+    Grows regions from n_seeds seeds by a score- or random-ordered frontier walk
+    over the 4-neighbour table until target_k pixels are selected. mode='scored'
+    grows toward high-score pixels (heap keyed by -score); mode='neutral' grows in
+    random order (heap keyed by a random draw), giving arbitrary-shaped but
+    location-neutral regions. Re-seeds from a random unselected pixel if a region
+    saturates before the budget is met.
+    """
+    selected = np.zeros(n_rest, dtype=bool)
+    in_heap = np.zeros(n_rest, dtype=bool)
+    heap = []  # (key, local_idx); smaller key popped first
+
+    def _key(idx):
+        return -float(scores[idx]) if mode == 'scored' else float(rng.random())
+
+    def _push_neighbours(idx):
+        for d in range(4):
+            nb = nbr[idx, d]
+            if nb >= 0 and not selected[nb] and not in_heap[nb]:
+                heapq.heappush(heap, (_key(nb), int(nb)))
+                in_heap[nb] = True
+
+    def _add_seed():
+        # Pick a seed among currently-unselected pixels.
+        if mode == 'scored':
+            # Weighted by score so seeds start in good areas; cheap top-biased draw.
+            avail = np.where(~selected)[0]
+            if avail.size == 0:
+                return False
+            w = scores[avail].astype(np.float64)
+            w = w - w.min()
+            s = w.sum()
+            p = (w / s) if s > 0 else None
+            seed = int(rng.choice(avail, p=p))
+        else:
+            seed = int(rng.integers(n_rest))
+            if selected[seed]:
+                avail = np.where(~selected)[0]
+                if avail.size == 0:
+                    return False
+                seed = int(rng.choice(avail))
+        selected[seed] = True
+        _push_neighbours(seed)
+        return True
+
+    count = 0
+    for _ in range(max(1, int(n_seeds))):
+        if count >= target_k:
+            break
+        if _add_seed():
+            count += 1
+
+    while count < target_k:
+        if not heap:
+            if not _add_seed():
+                break
+            count += 1
+            continue
+        _, idx = heapq.heappop(heap)
+        in_heap[idx] = False
+        if selected[idx]:
+            continue
+        selected[idx] = True
+        count += 1
+        _push_neighbours(idx)
+
+    return selected
+
+
+class RegionGrowingSampling(Sampling):
+    """Initial population of contiguous, arbitrary-shape restoration regions.
+
+    Each individual is grown from `region_seeds` seeds to exactly the pixel budget
+    (problem.max_action_pixels). growth_bias='scored' steers toward high-score
+    (and, via the score vector passed in, low-cost) areas; 'neutral' grows in
+    random order. The conversion block (if any) is left at zero, matching the
+    scattered pixel-mode sampler for the restoration-only objective set.
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, scores,
+                 region_seeds=25, growth_bias='scored',
+                 region_seeds_min=None, random_share=0.0):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = int(max_restored_pixels)
+        self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
+        self.region_seeds = int(region_seeds)
+        # Per-individual seed-count variety: when region_seeds_min < region_seeds,
+        # each individual draws its own S in [min, max], so the population spans
+        # single-blob to many-cluster plans (the number-of-regions DOF). Default
+        # (min == max) reproduces a fixed S.
+        self.region_seeds_min = int(region_seeds_min) if region_seeds_min is not None else int(region_seeds)
+        # Fraction of individuals grown with NEUTRAL (uniform) placement instead of
+        # scored, to inject diversity along the cost/value axis and avoid every
+        # individual converging on the same high-value regions. 0 = all scored.
+        self.random_share = float(np.clip(random_share, 0.0, 1.0))
+        self.growth_bias = str(growth_bias).lower()
+        self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
+
+    def _do(self, problem, n_samples, **kwargs):
+        n_var = problem.n_var
+        n_rest = problem.n_restoration_pixels
+        k = min(self.max_restored_pixels, n_rest)
+        scores = self.scores if self.scores is not None else np.zeros(n_rest)
+        base_scored = (self.growth_bias == 'scored' and self.scores is not None)
+        s_lo = max(1, min(self.region_seeds_min, self.region_seeds))
+        s_hi = max(s_lo, self.region_seeds)
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+
+        X = np.zeros((n_samples, n_var), dtype=int)
+        for i in range(n_samples):
+            s_i = int(rng.integers(s_lo, s_hi + 1))
+            # Per-individual mode: some individuals grown neutrally for diversity.
+            mode_i = 'scored' if (base_scored and rng.random() >= self.random_share) else 'neutral'
+            sel = grow_region_plan(self.nbr, n_rest, k, s_i, scores, mode_i, rng)
+            X[i, :n_rest] = sel.astype(int)
+        return X
+
+
+class RegionGrowingMutation(Mutation):
+    """Contiguity-preserving mutation: grow at the frontier, peel at the boundary.
+
+    Instead of scattering isolated bit flips (which erode clusters), each mutated
+    individual GROWS by adding ~m unselected frontier pixels (selected-adjacent)
+    and PEELS ~m boundary pixels (selected pixels touching an unselected/ off-grid
+    neighbour), keeping the count near the budget. 'scored' adds high-score / peels
+    low-score; 'neutral' does both at random. Operates on the restoration block
+    only; the conversion block is passed through unchanged.
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, scores,
+                 n_edits=100, growth_bias='scored', pixel_tolerance=0.05, prob=1.0):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = int(max_restored_pixels)
+        self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
+        self.n_edits = int(n_edits)
+        self.growth_bias = str(growth_bias).lower()
+        self.pixel_tolerance = float(pixel_tolerance)
+        self.prob = float(prob)
+        self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
+        self.flip_log = []
+        self._current_gen = 0
+
+    def _boundary_and_frontier(self, sel):
+        """Return (frontier_unsel_idx, boundary_sel_idx) for a boolean selection.
+
+        frontier_unsel: unselected eligible pixels with >=1 selected neighbour.
+        boundary_sel:   selected pixels with >=1 unselected or off-grid neighbour.
+        """
+        nbr = self.nbr
+        valid = nbr >= 0                       # (n_rest, 4)
+        nb_clip = np.where(valid, nbr, 0)
+        nb_sel = valid & sel[nb_clip]          # neighbour is selected
+        any_nb_sel = nb_sel.any(axis=1)
+        nb_unsel = (valid & ~sel[nb_clip]) | (~valid)  # neighbour unselected or off-grid
+        any_nb_unsel = nb_unsel.any(axis=1)
+        frontier_unsel = np.where((~sel) & any_nb_sel)[0]
+        boundary_sel = np.where(sel & any_nb_unsel)[0]
+        return frontier_unsel, boundary_sel
+
+    def _pick(self, pool, m, prefer_high, rng):
+        """Pick up to m indices from pool: by score (prefer_high/low) or random."""
+        if pool.size == 0 or m <= 0:
+            return pool[:0]
+        m = int(min(m, pool.size))
+        if self.growth_bias == 'scored' and self.scores is not None:
+            s = self.scores[pool]
+            order = np.argsort(-s if prefer_high else s)
+            return pool[order[:m]]
+        return pool[rng.choice(pool.size, size=m, replace=False)]
+
+    def _do(self, problem, X, **kwargs):
+        n_rest = problem.n_restoration_pixels
+        k = self.max_restored_pixels
+        lo = int(k * (1 - self.pixel_tolerance))
+        hi = int(k * (1 + self.pixel_tolerance))
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        Xp = X.copy()
+        edits_per_ind = np.zeros(len(X), dtype=int)
+
+        for i in range(len(X)):
+            if rng.random() > self.prob:
+                continue
+            sel = Xp[i, :n_rest].astype(bool)
+            cur = int(sel.sum())
+            if cur == 0:
+                continue
+            frontier, boundary = self._boundary_and_frontier(sel)
+            # Nudge the net count toward the budget while staying contiguity-aware.
+            grow_m = self.n_edits + max(0, lo - cur)
+            peel_m = self.n_edits + max(0, cur - hi)
+            add = self._pick(frontier, grow_m, prefer_high=True, rng=rng)
+            rem = self._pick(boundary, peel_m, prefer_high=False, rng=rng)
+            if add.size:
+                sel[add] = True
+            if rem.size:
+                sel[rem] = False
+            # Safety: never let a mutation push outside the tolerance band.
+            cur2 = int(sel.sum())
+            if cur2 > hi:
+                on = np.where(sel)[0]
+                drop = self._pick(on, cur2 - hi, prefer_high=False, rng=rng)
+                sel[drop] = False
+            elif cur2 < lo:
+                off = np.where(~sel)[0]
+                addmore = self._pick(off, lo - cur2, prefer_high=True, rng=rng)
+                sel[addmore] = True
+            Xp[i, :n_rest] = sel.astype(Xp.dtype)
+            edits_per_ind[i] = int(np.sum(X[i, :n_rest] != Xp[i, :n_rest]))
+
+        self.flip_log.append({
+            'generation': self._current_gen + 1,
+            'mean_raw_flips': float(np.mean(edits_per_ind)),
+            'std_raw_flips': float(np.std(edits_per_ind)),
+            'total_raw_flips': int(np.sum(edits_per_ind)),
+        })
+        return Xp
+
+
+# =============================================================================
+# REGION-EVOLVE OPERATORS (spatially-exploring search inside NSGA-III)
+# =============================================================================
+#
+# Goal: let the search EXPLORE the landscape (not collapse onto one basin) while
+# keeping region size free. A plan is the pixel selection; its "regions" are the
+# connected components of that selection (scipy.ndimage.label, 4-connectivity).
+# Operators act at the region level:
+#   - SpatialCoverageSampling seeds regions spread across the whole map,
+#   - RegionEvolveMutation relocates / grows / shrinks / spawns / deletes regions,
+#   - RegionSwapCrossover recombines WHOLE regions between parents (not HUX, which
+#     shatters contiguity).
+# All reuse build_restoration_neighbor_table (O(1) 4-neighbour lookup).
+
+
+def grow_regions_from_seeds(nbr, n_rest, target_k, seeds, scores, mode, rng,
+                            avoid=None, base=None):
+    """Grow a contiguous selection of target_k pixels from the given seed indices.
+
+    Adds only currently-unselected, non-avoided eligible pixels via a frontier walk
+    (heap keyed by -score when mode='scored', else random). Returns a boolean array
+    of the NEWLY grown pixels (length n_rest). `avoid` (bool array) marks pixels that
+    must not be added (e.g. pixels used by regions being kept). `base` optionally
+    marks already-selected pixels so the frontier does not re-add them.
+    """
+    grown = np.zeros(n_rest, dtype=bool)
+    in_heap = np.zeros(n_rest, dtype=bool)
+    blocked = np.zeros(n_rest, dtype=bool)
+    if avoid is not None:
+        blocked |= avoid
+    if base is not None:
+        blocked |= base
+    heap = []
+
+    def key(i):
+        return -float(scores[i]) if mode == 'scored' else float(rng.random())
+
+    def push_nbrs(idx):
+        row = nbr[idx]
+        for d in range(4):
+            nb = row[d]
+            if nb >= 0 and not grown[nb] and not in_heap[nb] and not blocked[nb]:
+                heapq.heappush(heap, (key(int(nb)), int(nb)))
+                in_heap[nb] = True
+
+    count = 0
+    for s in seeds:
+        s = int(s)
+        if count >= target_k:
+            break
+        if grown[s]:
+            continue
+        if blocked[s]:
+            # already-selected seed (base): don't re-add, but seed the frontier from it
+            if base is not None and base[s]:
+                push_nbrs(s)
+            continue
+        grown[s] = True
+        count += 1
+        push_nbrs(s)
+
+    while count < target_k:
+        if not heap:
+            allowed = np.where(~grown & ~blocked)[0]
+            if allowed.size == 0:
+                break
+            s = int(rng.choice(allowed))
+            grown[s] = True
+            count += 1
+            push_nbrs(s)
+            continue
+        _, idx = heapq.heappop(heap)
+        in_heap[idx] = False
+        if grown[idx] or blocked[idx]:
+            continue
+        grown[idx] = True
+        count += 1
+        push_nbrs(idx)
+
+    return grown
+
+
+def _label_components(sel, shape, rows, cols):
+    """Return list of local-index arrays, one per connected component (4-conn)."""
+    sidx = np.where(sel)[0]
+    if sidx.size == 0:
+        return []
+    m2 = np.zeros(shape, dtype=bool)
+    m2[rows[sidx], cols[sidx]] = True
+    lab, nc = ndimage.label(m2)
+    ids = lab[rows[sidx], cols[sidx]]
+    return [sidx[ids == c] for c in range(1, nc + 1)]
+
+
+def enforce_budget_contiguous(sel, nbr, shape, rows, cols, k, tol, scores, mode, rng):
+    """Bring a selection to within [k*(1-tol), k*(1+tol)] WITHOUT fragmenting regions.
+
+    Over budget: drop whole smallest components first (keeps the rest intact), then
+    peel boundary pixels only if a single large component still overshoots. Under
+    budget: grow contiguously outward from the current selection. Mutates sel in place.
+    """
+    lo = int(k * (1 - tol))
+    hi = int(k * (1 + tol))
+    cur = int(sel.sum())
+    if lo <= cur <= hi:
+        return
+    n_rest = sel.size
+    if cur > hi:
+        for c in sorted(_label_components(sel, shape, rows, cols), key=len):
+            if cur <= hi:
+                break
+            if cur - c.size >= lo:
+                sel[c] = False
+                cur -= int(c.size)
+        if cur > hi:
+            valid = nbr >= 0
+            nb_clip = np.where(valid, nbr, 0)
+            nb_unsel = (valid & ~sel[nb_clip]) | (~valid)
+            boundary = np.where(sel & nb_unsel.any(axis=1))[0]
+            if boundary.size:
+                order = boundary[np.argsort(scores[boundary])]
+                sel[order[:cur - hi]] = False
+    elif cur < lo:
+        seeds = np.where(sel)[0]
+        add = grow_regions_from_seeds(nbr, n_rest, k - cur, seeds, scores, mode, rng,
+                                      base=sel.copy())
+        sel |= add
+
+
+class MinPatchSizeRepair(Repair):
+    """Enforce the budget AND a minimum patch (component) size S, contiguity-preserving.
+
+    Implements the minimum-patch-size constraint of the "price of contiguity" sweep:
+    a feasible plan has every 4-connected component of its selected restoration pixels
+    of size >= min_patch_size. Per individual:
+      1. bring the restoration selection to the budget tolerance band WITHOUT
+         fragmenting (enforce_budget_contiguous), then
+      2. iteratively remove any component smaller than S and regrow the freed budget
+         by attaching to the surviving components (enforce_budget_contiguous grows from
+         the survivors' frontier, so no new sub-S fragments are spawned).
+    Guarantees min component size >= S while keeping the pixel count within tolerance.
+    S <= 1 reduces to plain contiguous budget enforcement (feature off). The conversion
+    block is passed through unchanged.
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, min_patch_size,
+                 scores=None, pixel_tolerance=0.05, growth_bias='scored', max_iters=8):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = int(max_restored_pixels)
+        self.min_patch_size = int(min_patch_size)
+        self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
+        self.pixel_tolerance = float(pixel_tolerance)
+        self.growth_bias = str(growth_bias).lower()
+        self.max_iters = int(max_iters)
+        self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
+        self.shape = tuple(initial_conditions['shape'])
+        self.call_log = []  # per-generation {min_comp_before, min_comp_after, iters}
+
+    def _repair_one(self, sel, k, scores, mode, rng):
+        tol = self.pixel_tolerance
+        # 1. contiguous budget enforcement (also seeds a region if sel is empty).
+        enforce_budget_contiguous(sel, self.nbr, self.shape, self.rows, self.cols,
+                                  k, tol, scores, mode, rng)
+        S = self.min_patch_size
+        if S <= 1:
+            return 0
+        # 2. remove sub-S components and regrow onto survivors until none remain.
+        iters = 0
+        for _ in range(self.max_iters):
+            comps = _label_components(sel, self.shape, self.rows, self.cols)
+            small = [c for c in comps if c.size < S]
+            if not small:
+                break
+            for c in small:
+                sel[c] = False
+            enforce_budget_contiguous(sel, self.nbr, self.shape, self.rows, self.cols,
+                                      k, tol, scores, mode, rng)
+            iters += 1
+        return iters
+
+    def _do(self, problem, X, **kwargs):
+        n_rest = problem.n_restoration_pixels
+        k = min(self.max_restored_pixels, n_rest)
+        scores = self.scores if self.scores is not None else np.zeros(n_rest)
+        mode = 'scored' if (self.growth_bias == 'scored' and self.scores is not None) else 'neutral'
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        Xp = X.copy()
+        audit = self.min_patch_size > 1   # component labeling is only needed for the audit
+        min_before, min_after, tot_iters = [], [], 0
+        for i in range(len(X)):
+            sel = Xp[i, :n_rest].astype(bool)
+            if audit:
+                pre = _label_components(sel, self.shape, self.rows, self.cols)
+                min_before.append(min((c.size for c in pre), default=0))
+            tot_iters += self._repair_one(sel, k, scores, mode, rng)
+            if audit:
+                post = _label_components(sel, self.shape, self.rows, self.cols)
+                min_after.append(min((c.size for c in post), default=0))
+            Xp[i, :n_rest] = sel.astype(Xp.dtype)
+        self.call_log.append({
+            'generation': kwargs.get('generation', len(self.call_log) + 1),
+            'min_comp_before': int(np.min(min_before)) if min_before else 0,
+            'min_comp_after': int(np.min(min_after)) if min_after else 0,
+            'total_iters': int(tot_iters),
+        })
+        return Xp
+
+
+class SpatialCoverageSampling(Sampling):
+    """Initial population whose regions are SPREAD across the whole map.
+
+    Seeds are drawn from many distinct cells of a coarse spatial grid (so starting
+    plans cover north/south/west, not just the high-score basin), then grown to the
+    pixel budget. Per-individual seed count varies for diversity in the number of
+    regions. growth_bias 'neutral' grows location-neutrally (keeps coverage).
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, scores,
+                 region_seeds=25, region_seeds_min=None, growth_bias='neutral',
+                 seed_grid=16):
+        super().__init__()
+        self.initial_conditions = initial_conditions
+        self.max_restored_pixels = int(max_restored_pixels)
+        self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
+        self.region_seeds = int(region_seeds)
+        self.region_seeds_min = int(region_seeds_min) if region_seeds_min is not None else 1
+        self.growth_bias = str(growth_bias).lower()
+        self.seed_grid = int(seed_grid)
+        self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
+        H, W = initial_conditions['shape']
+        gr = (self.rows.astype(np.int64) * self.seed_grid // max(H, 1))
+        gc = (self.cols.astype(np.int64) * self.seed_grid // max(W, 1))
+        self._cell = (gr * self.seed_grid + gc).astype(np.int64)
+        self._cells = np.unique(self._cell)
+        order = np.argsort(self._cell, kind='stable')
+        self._cell_sorted = self._cell[order]
+        self._idx_sorted = np.arange(self._cell.size)[order]
+
+    def _seed_from_cell(self, cell, rng):
+        lo = np.searchsorted(self._cell_sorted, cell, side='left')
+        hi = np.searchsorted(self._cell_sorted, cell, side='right')
+        if hi <= lo:
+            return None
+        return int(self._idx_sorted[rng.integers(lo, hi)])
+
+    def _do(self, problem, n_samples, **kwargs):
+        n_var = problem.n_var
+        n_rest = problem.n_restoration_pixels
+        k = min(self.max_restored_pixels, n_rest)
+        scores = self.scores if self.scores is not None else np.zeros(n_rest)
+        mode = 'scored' if (self.growth_bias == 'scored' and self.scores is not None) else 'neutral'
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+
+        X = np.zeros((n_samples, n_var), dtype=int)
+        for i in range(n_samples):
+            s_i = int(rng.integers(max(1, self.region_seeds_min), self.region_seeds + 1))
+            cells = rng.choice(self._cells, size=min(s_i, self._cells.size), replace=False)
+            seeds = [self._seed_from_cell(c, rng) for c in cells]
+            seeds = [s for s in seeds if s is not None]
+            if not seeds:
+                seeds = [int(rng.integers(n_rest))]
+            grown = grow_regions_from_seeds(self.nbr, n_rest, k, seeds, scores, mode, rng)
+            X[i, :n_rest] = grown.astype(int)
+        return X
+
+
+class RegionEvolveMutation(RegionGrowingMutation):
+    """Region-level mutation: relocate / grow / shrink / spawn / delete regions.
+
+    Reuses RegionGrowingMutation's neighbour table, frontier/boundary helper and
+    budget-safe _pick. Each mutated individual applies one region-level move, then is
+    trimmed/grown back to the budget tolerance. RELOCATE (move a whole region to a new
+    part of the map) is the key spatial-exploration move; SPAWN/DELETE vary the number
+    of regions; GROW/SHRINK vary region size.
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, scores,
+                 move_probs=None, **kw):
+        super().__init__(initial_conditions, max_restored_pixels, scores, **kw)
+        self._shape = initial_conditions['shape']
+        self.move_probs = move_probs or {
+            'relocate': 0.40, 'spawn': 0.20, 'delete': 0.10,
+            'grow': 0.15, 'shrink': 0.15,
+        }
+        self._moves = list(self.move_probs.keys())
+        self._mp = np.array([self.move_probs[m] for m in self._moves], dtype=float)
+        self._mp = self._mp / self._mp.sum()
+
+    def _components(self, sel):
+        sidx = np.where(sel)[0]
+        if sidx.size == 0:
+            return []
+        m2 = np.zeros(self._shape, dtype=bool)
+        m2[self.rows[sidx], self.cols[sidx]] = True
+        lab, nc = ndimage.label(m2)
+        ids = lab[self.rows[sidx], self.cols[sidx]]
+        return [sidx[ids == c] for c in range(1, nc + 1)]
+
+    def _random_unselected(self, sel, rng):
+        for _ in range(20):
+            i = int(rng.integers(sel.size))
+            if not sel[i]:
+                return i
+        un = np.where(~sel)[0]
+        return int(rng.choice(un)) if un.size else None
+
+    def _enforce_budget(self, sel, rng):
+        mode = 'scored' if self.growth_bias == 'scored' else 'neutral'
+        scores = self.scores if self.scores is not None else np.zeros(sel.size)
+        enforce_budget_contiguous(sel, self.nbr, self._shape, self.rows, self.cols,
+                                  self.max_restored_pixels, self.pixel_tolerance,
+                                  scores, mode, rng)
+
+    def _do(self, problem, X, **kwargs):
+        n_rest = problem.n_restoration_pixels
+        k = self.max_restored_pixels
+        scores = self.scores if self.scores is not None else np.zeros(n_rest)
+        mode = 'scored' if self.growth_bias == 'scored' else 'neutral'
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        Xp = X.copy()
+        edits = np.zeros(len(X), dtype=int)
+
+        for i in range(len(X)):
+            if rng.random() > self.prob:
+                continue
+            sel = Xp[i, :n_rest].astype(bool)
+            if sel.sum() == 0:
+                continue
+            move = self._moves[int(rng.choice(len(self._moves), p=self._mp))]
+            comps = self._components(sel)
+
+            if move == 'relocate' and comps:
+                c = comps[int(rng.integers(len(comps)))]
+                size = int(c.size)
+                sel[c] = False
+                anchor = self._random_unselected(sel, rng)
+                if anchor is not None:
+                    grown = grow_regions_from_seeds(self.nbr, n_rest, size, [anchor],
+                                                    scores, mode, rng, avoid=sel)
+                    sel |= grown
+            elif move == 'spawn':
+                anchor = self._random_unselected(sel, rng)
+                if anchor is not None:
+                    s = max(1, int(0.05 * k))
+                    grown = grow_regions_from_seeds(self.nbr, n_rest, s, [anchor],
+                                                    scores, mode, rng, avoid=sel)
+                    sel |= grown
+            elif move == 'delete' and len(comps) > 1:
+                c = comps[int(rng.integers(len(comps)))]
+                sel[c] = False
+            elif move == 'grow' and comps:
+                c = comps[int(rng.integers(len(comps)))]
+                grown = grow_regions_from_seeds(self.nbr, n_rest, int(c.size) + self.n_edits,
+                                                list(c), scores, mode, rng, base=sel)
+                sel |= grown
+            elif move == 'shrink' and comps:
+                c = comps[int(rng.integers(len(comps)))]
+                cmask = np.zeros(n_rest, dtype=bool)
+                cmask[c] = True
+                _, boundary = self._boundary_and_frontier(sel)
+                bnd = boundary[cmask[boundary]] if boundary.size else boundary
+                rem = self._pick(bnd, self.n_edits, prefer_high=False, rng=rng)
+                sel[rem] = False
+
+            self._enforce_budget(sel, rng)
+            Xp[i, :n_rest] = sel.astype(Xp.dtype)
+            edits[i] = int(np.sum(X[i, :n_rest] != Xp[i, :n_rest]))
+
+        self.flip_log.append({
+            'generation': self._current_gen + 1,
+            'mean_raw_flips': float(np.mean(edits)),
+            'std_raw_flips': float(np.std(edits)),
+            'total_raw_flips': int(np.sum(edits)),
+        })
+        return Xp
+
+
+class RegionSwapCrossover(Crossover):
+    """Recombine WHOLE regions between two parents, preserving contiguity.
+
+    Each child takes a random subset of parent A's connected components plus a random
+    subset of parent B's, then is trimmed/grown to the pixel budget. Unlike HUX (which
+    swaps individual pixels and shatters clumps), this keeps regions intact so the
+    search can recombine good spatial pieces.
+    """
+
+    def __init__(self, initial_conditions, max_restored_pixels, scores,
+                 growth_bias='scored', pixel_tolerance=0.05, **kw):
+        super().__init__(2, 2, **kw)
+        self.max_restored_pixels = int(max_restored_pixels)
+        self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
+        self.growth_bias = str(growth_bias).lower()
+        self.pixel_tolerance = float(pixel_tolerance)
+        self._shape = initial_conditions['shape']
+        self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
+
+    def _components(self, sel):
+        sidx = np.where(sel)[0]
+        if sidx.size == 0:
+            return []
+        m2 = np.zeros(self._shape, dtype=bool)
+        m2[self.rows[sidx], self.cols[sidx]] = True
+        lab, nc = ndimage.label(m2)
+        ids = lab[self.rows[sidx], self.cols[sidx]]
+        return [sidx[ids == c] for c in range(1, nc + 1)]
+
+    def _trim_grow(self, sel, rng):
+        mode = 'scored' if self.growth_bias == 'scored' else 'neutral'
+        scores = self.scores if self.scores is not None else np.zeros(sel.size)
+        enforce_budget_contiguous(sel, self.nbr, self._shape, self.rows, self.cols,
+                                  self.max_restored_pixels, self.pixel_tolerance,
+                                  scores, mode, rng)
+        return sel
+
+    def _do(self, problem, X, **kwargs):
+        _, n_matings, n_var = X.shape
+        n_rest = problem.n_restoration_pixels
+        k = self.max_restored_pixels
+        hi = int(k * (1 + self.pixel_tolerance))
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        Q = np.empty_like(X)
+        for m in range(n_matings):
+            pa = X[0, m, :n_rest].astype(bool)
+            pb = X[1, m, :n_rest].astype(bool)
+            comps = self._components(pa) + self._components(pb)
+            for off in range(2):
+                child = np.zeros(n_rest, dtype=bool)
+                if comps:
+                    # Assemble WHOLE regions in random order up to the budget, so the
+                    # child is a union of intact parent regions near the target size
+                    # (few components, minimal growth needed).
+                    order = rng.permutation(len(comps))
+                    tot = 0
+                    for j in order:
+                        c = comps[j]
+                        if tot >= k:
+                            break
+                        if tot + c.size <= hi:
+                            child[c] = True
+                            tot += int(c.size)
+                if not child.any():
+                    child = (pa if off == 0 else pb).copy()
+                self._trim_grow(child, rng)
+                Q[off, m, :n_rest] = child.astype(X.dtype)
+                if n_var > n_rest:
+                    Q[off, m, n_rest:] = X[off, m, n_rest:]
+        return Q
