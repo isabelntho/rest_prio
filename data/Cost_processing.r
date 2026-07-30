@@ -30,7 +30,7 @@ library(terra)
 # "CH" = whole of Switzerland. Ownership (GREIKA) is only available for
 #        Bern, so at CH extent the ownership driver is dropped and the
 #        remaining weights are renormalised (methodology section 4.5).
-extent        <- "KB"                    # "KB" or "CH"
+extent        <- "CH"                    # "KB" or "CH"
 use_ownership <- (extent == "KB")
 
 ## ---- Directories & inputs -------------------------------------------

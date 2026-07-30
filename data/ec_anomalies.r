@@ -12,12 +12,61 @@
 #   (smd/sbd/soc/uzl/cdi/swf_h/swf_t/ndvi) for the Block 3 factorial. zones uses
 #   all indicators only.
 
+# =============================================================================
+# REGION CONFIGURATION
+# =============================================================================
+# region controls which EC data and spatial mask are used:
+#   "KB" -> Kanton Bern subregion: individual aligned EC rasters + Bern mask
+#           (the original setup.R behaviour)
+#   "CH" -> whole Switzerland: the EC_stack.tif raster stack + CH-wide mask.
+#           The CH stack has no 'cdi' layer; it simply drops out downstream.
+region <- "CH"
+
 source("setup.R")
 
 # Load required packages
 required_packages <- c("dplyr", "terra", "sf", "readxl", "classInt", "tidyr")
 for (pkg in required_packages) {
     library(pkg, character.only = TRUE)
+}
+
+# ---------------------------------------------------------------------------
+# Region overrides. For region == "CH" the individual aligned rasters and the
+# Kanton Bern mask defined in setup.R are replaced by the CH-wide EC stack and
+# a whole-Switzerland land-use / boundary mask. Everything downstream is
+# unchanged: the anomaly, benchmark and diagnostic code all consume ec_data,
+# LU, kb and mask_by_ecosystem exactly as before. 'cdi' is absent from the CH
+# stack, so any scenario referencing it drops out naturally.
+# ---------------------------------------------------------------------------
+if (region == "CH") {
+    EC_STACK_PATH <- "Y:/CH_Kanton_Bern/03_Workspaces/03_Habitat_condition/Restoration_potential/Data/EC_stack.tif"
+    CH_LULC_PATH  <- "W:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif"
+    CH_BOUND_PATH <- "W:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_KANTONSGEBIET.shp"
+
+    cat("Region = CH: using EC_stack and whole-Switzerland mask\n")
+
+    ec_template <- rast(EC_STACK_PATH)
+
+    # CH-wide land use, resampled onto the EC stack grid so mask_by_ecosystem's
+    # mask(r, lu_mask) aligns (replaces the Bern-cropped LU from setup.R).
+    LU <- resample(rast(CH_LULC_PATH), ec_template[[1]], method = "near")
+
+    # Whole-Switzerland boundary (all cantons, no Bern filter) replaces 'kb'.
+    kb <- st_read(CH_BOUND_PATH, quiet = TRUE)
+    kb <- st_transform(kb, crs(ec_template))
+
+    # Load the EC stack as a named list keyed by variable code (no 'cdi'),
+    # matching the shape load_ec_data() returns for the KB region.
+    load_ec_data <- function() {
+        r <- rast(EC_STACK_PATH)
+        cat(sprintf("Loaded EC stack: %d layers (%s)\n",
+                    nlyr(r), paste(names(r), collapse = ", ")))
+        # as.list() drops layer names; restore them so downstream code can
+        # index ec_data[[var_code]] exactly as it does for the KB rasters.
+        lst <- as.list(r)
+        names(lst) <- names(r)
+        lst
+    }
 }
 
 # =============================================================================
@@ -361,7 +410,7 @@ cat(sprintf("Files written to %s: %d\n", OUTPUT_DIR, length(written_files)))
 cat(sprintf("Expected: %d (%d scenarios x 2 rasters)\n",
             length(CONDITION_SCENARIOS) * 2, length(CONDITION_SCENARIOS)))
 for (f in written_files) cat(sprintf("  %s\n", f))
-cat("\n✓ Ecosystem condition anomaly scenarios completed!\n")
+cat("\nEcosystem condition anomaly scenarios completed!\n")
 
 # =============================================================================
 # BASELINE INDICATOR CONTRIBUTION STATISTICS
@@ -538,4 +587,4 @@ cat(sprintf("\n  Saved: %s\n", out_csv))
 # Print summary
 cat("\n--- INDICATOR CONTRIBUTION SUMMARY (baseline: global_all) ---\n")
 print(contribution_stats, digits = 3, row.names = FALSE)
-cat("\n✓ Indicator contribution statistics complete!\n")
+cat("\nIndicator contribution statistics complete!\n")
