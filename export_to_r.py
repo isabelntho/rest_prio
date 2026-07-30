@@ -127,8 +127,11 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     scenario_params = r.get("scenario_params", {})
     algorithm_info = r.get("algorithm_info", {})
     problem_info = r.get("problem_info", {})
-    run_config = r.get("run_config", {})
-    ic = r.get("initial_conditions", {})
+    # `or {}` guards against the key existing with a None value (e.g. a run
+    # invoked without run_config), which a bare .get(..., {}) would not catch and
+    # which then breaks run_config.get(...) in the metadata block below.
+    run_config = r.get("run_config") or {}
+    ic = r.get("initial_conditions") or {}
     patch_mappings = r.get("patch_mappings") or ic.get("patch_mappings")
 
     n_solutions = len(objectives_raw)

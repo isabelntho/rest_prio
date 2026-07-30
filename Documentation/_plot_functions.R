@@ -118,11 +118,16 @@ make_pareto_extremes_plot <- function(run, obj_names = run$obj_names, obj_labels
   obj_labels <- .obj_labels(present)
   obj_names  <- present
 
-  if (length(obj_names) < 3) stop("make_pareto_extremes_plot requires at least 3 objectives in the data.")
+  if (length(obj_names) < 2) stop("make_pareto_extremes_plot requires at least 2 objectives in the data.")
 
-  # Positional mapping: [1]=x, [2]=y, [3]=fill, [4]=size (optional)
-  o1 <- obj_names[1]; o2 <- obj_names[2]; o3 <- obj_names[3]
-  l1 <- obj_labels[1]; l2 <- obj_labels[2]; l3 <- obj_labels[3]
+  # Positional mapping: [1]=x, [2]=y, [3]=fill (optional), [4]=size (optional).
+  # With only 2 objectives there is no fill/size dimension, so points are
+  # coloured by domination status instead (keeps the Pareto front legible).
+  o1 <- obj_names[1]; o2 <- obj_names[2]
+  l1 <- obj_labels[1]; l2 <- obj_labels[2]
+  has_fill <- length(obj_names) >= 3
+  o3 <- if (has_fill) obj_names[3] else NULL
+  l3 <- if (has_fill) obj_labels[3] else NULL
   has_size <- length(obj_names) >= 4
   o4 <- if (has_size) obj_names[4] else NULL
   l4 <- if (has_size) obj_labels[4] else NULL
@@ -136,7 +141,7 @@ make_pareto_extremes_plot <- function(run, obj_names = run$obj_names, obj_labels
       dplyr::select(-n_pixels)
     l1 <- paste0(l1, " / pixel")
     l2 <- paste0(l2, " / pixel")
-    l3 <- paste0(l3, " / pixel")
+    if (has_fill) l3 <- paste0(l3, " / pixel")
   }
 
   if (normalise) {
@@ -159,11 +164,24 @@ make_pareto_extremes_plot <- function(run, obj_names = run$obj_names, obj_labels
       scale_size_continuous(name = l4, range = c(1.5, 6)) +
       guides(size = guide_legend(override.aes = list(shape = 21, fill = "grey60"))) +
       labs(x = l1, y = l2)
-  } else {
+  } else if (has_fill) {
     p <- ggplot(df, aes(x = .data[[o1]], y = .data[[o2]])) +
       geom_point(aes(fill = .data[[o3]]), shape = 21, colour = "grey70",
                  size = 4, stroke = 0.8, alpha = 0.8) +
       scale_fill_viridis_c(name = l3, option = "plasma") +
+      labs(x = l1, y = l2)
+  } else {
+    # Two objectives: no third axis to encode as fill, so colour by domination
+    # status. The non-dominated points trace the 2-objective Pareto front.
+    df$.domination <- factor(
+      ifelse(df$is_nondominated == 1, "Non-dominated", "Dominated"),
+      levels = c("Non-dominated", "Dominated")
+    )
+    p <- ggplot(df, aes(x = .data[[o1]], y = .data[[o2]])) +
+      geom_point(aes(fill = .domination), shape = 21, colour = "grey70",
+                 size = 4, stroke = 0.8, alpha = 0.85) +
+      scale_fill_manual(values = c("Non-dominated" = COL_ND, "Dominated" = COL_DOM),
+                        name = NULL) +
       labs(x = l1, y = l2)
   }
 
@@ -203,7 +221,7 @@ make_pareto_pairwise <- function(run, obj_names = run$obj_names, obj_labels = .o
       labs(x = xl, y = yl)
   })
 
-  wrap_plots(plots, nrow = length(plots)/3, guides = "collect") +
+  wrap_plots(plots, nrow = ceiling(length(plots)/3), guides = "collect") +
     plot_annotation(theme = theme(plot.title = element_text(size = 13, face = "bold")))
 }
 
