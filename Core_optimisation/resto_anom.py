@@ -37,7 +37,7 @@ def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
     """
     Compute improvement weights based on baseline anomaly values.
     
-    Weight function w(a₀) is monotonic, peaks at anomaly=0, and decreases as |anomaly| increases.
+    Weight function w(a0) is monotonic, peaks at anomaly=0, and decreases as |anomaly| increases.
     
     Args:
         anomaly_values: Array of baseline anomaly values
@@ -55,7 +55,7 @@ def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
         # Exponential decay: w(a) = exp(-|a|/scale)
         weights = 1-(np.exp(-abs_anomaly / scale))
     elif shape == 'gaussian':
-        # Gaussian decay: w(a) = exp(-|a|²/(2*scale²))
+        # Gaussian decay: w(a) = exp(-|a|^2/(2*scale^2))
         weights = np.exp(-(abs_anomaly**2) / (2 * scale**2))
     else:
         raise ValueError(f"Unknown weight shape: {shape}. Use 'exponential' or 'gaussian'")
@@ -146,7 +146,7 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
     if "landscape_context_1d" in initial_conditions:
         ctx = initial_conditions["landscape_context_1d"].astype(np.float64)
         # Anomaly convention: HIGHER context anomaly = neighbours in better condition.
-        # Favour good-condition surroundings → higher ctx gets the higher repair score.
+        # Favour good-condition surroundings -> higher ctx gets the higher repair score.
         ctx_min, ctx_max = np.nanmin(ctx), np.nanmax(ctx)
         span = ctx_max - ctx_min
         if span > 1e-12:
@@ -156,7 +156,7 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
 
     if "restoration_potential_1d" in initial_conditions:
         rp = initial_conditions["restoration_potential_1d"].astype(np.float64)
-        # Invert: lower restoration_potential (more degraded) → higher repair score
+        # Invert: lower restoration_potential (more degraded) -> higher repair score
         rp_min, rp_max = np.nanmin(rp), np.nanmax(rp)
         span = rp_max - rp_min
         if span > 1e-12:
@@ -227,13 +227,9 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
 
 def conversion_mask(convert_vars, initial_conditions):
     """
-    Landscape calculation using full recalculation with compute_sn_dens.
-    
-    Previously used mathematical approximation for speed, but now uses full 
-    recalculation for accuracy. The approximation functions are kept for 
-    potential future use but are disabled.
-    
-    Note: No longer "fast" or "selective" - performs full landscape recalculation.
+    Landscape anomaly for a set of conversion decisions.
+
+    Full recalculation via compute_sn_dens (no approximation).
     """
     if not np.any(convert_vars):
         return initial_conditions['landscape_anomaly']
@@ -368,7 +364,7 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
         elif objective == 'landscape_anomaly':
             # Conversion affects landscape anomaly
             if np.any(conversion_mask_2d):
-                # Use fast selective approximation (combines approximation + selective processing)
+                # Full landscape recalculation over the converted pixels.
                 updated_landscape = conversion_mask(
                     convert_vars, initial_conditions
                 )
@@ -424,7 +420,7 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
                 )
         
         # Only apply changes to appropriate eligible pixels based on objective type
-        # This prevents affecting NaN→0 pixels outside the study area
+        # This prevents affecting NaN->0 pixels outside the study area
         if objective in ['abiotic_anomaly', 'biotic_anomaly']:
             # Use restoration eligible mask for restoration-affected objectives
             updated_values = np.where(restoration_eligible_mask, updated_values, original_values)
@@ -661,8 +657,8 @@ class RestorationProblem(ElementwiseProblem):
                 _n_rest = int(self.initial_conditions['n_restoration_pixels'])
                 _max_pix = max(int(_max_frac * _n_rest), 1)
                 if getattr(self, 'clustering_metric', 'adjacency') == 'components':
-                    # Worst case: every selected pixel its own component → ~max_pix
-                    # clusters. Scale by the pixel budget so normalised ∈ ~[0, 1].
+                    # Worst case: every selected pixel its own component -> ~max_pix
+                    # clusters. Scale by the pixel budget so normalised in ~[0, 1].
                     scale = float(_max_pix)
                 else:
                     # 'adjacency' or 'inter_patch_adjacency': a perfectly compact
@@ -725,7 +721,7 @@ class RestorationProblem(ElementwiseProblem):
                 obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
             elif obj_name == 'connectivity_gain':
                 # Precomputed per-pixel gain; sum over converted pixels.
-                # Negated: minimisation problem → maximise gain ↔ minimise negative gain.
+                # Negated: minimisation problem -> maximise gain <-> minimise negative gain.
                 cg = self.initial_conditions['connectivity_gain_1d']
                 obj_value = -float(np.sum(cg[x_convert == 1]))
             elif obj_name == 'landscape_context':
@@ -809,12 +805,12 @@ class RestorationProblem(ElementwiseProblem):
                     obj_value = -float(horiz + vert)
             elif obj_name == 'es_future_val':
                 # Sum of per-pixel ES performance over selected restoration pixels.
-                # Higher = greater total future ES gain → maximise (negate for pymoo minimisation).
+                # Higher = greater total future ES gain -> maximise (negate for pymoo minimisation).
                 esv = self.initial_conditions['es_future_val_1d']
                 obj_value = -float(np.sum(esv[x_restore == 1]))
             elif obj_name == 'es_future_robustness':
                 # Sum of per-pixel ES instability over selected restoration pixels.
-                # Lower = less total undesirable deviation = more robust → minimise directly.
+                # Lower = less total undesirable deviation = more robust -> minimise directly.
                 esr = self.initial_conditions['es_future_robustness_1d']
                 obj_value = float(np.sum(esr[x_restore == 1]))
             elif obj_name == 'implementation_cost':
@@ -828,13 +824,9 @@ class RestorationProblem(ElementwiseProblem):
 
     def _evaluate(self, x, out, *args, **kwargs):
         """
-        Evaluate a solution (restoration plan).
-        
-        Args:
-            x: Decision variables (binary array) - already clustered/burden-shared by sampling/repair
-                First n_restoration_pixels elements: restoration decisions for restoration-eligible pixels
-                Next n_conversion_pixels elements: conversion decisions for conversion-eligible pixels
-            out: Output dictionary for objectives and constraints
+        Evaluate a restoration plan. x is [restoration decisions over the
+        n_restoration_pixels eligible pixels | conversion decisions over the
+        n_conversion_pixels ones], already repaired by sampling/repair.
         """
         x_restore = x[:self.n_restoration_pixels]
         x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
@@ -913,15 +905,10 @@ class PatchRestorationProblem(RestorationProblem):
     def __init__(self, initial_conditions, scenario_params,
                  patch_constraint_type='pixel_count', pixel_tolerance=0.05):
         """
-        Initialize the patch-based optimization problem.
-
-        Args:
-            initial_conditions: Dict with initial conditions including patch_mappings
-            scenario_params: Dict with scenario parameters
-            patch_constraint_type: 'patch_count' or 'pixel_count'
-            pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
+        pixel_tolerance is the fractional slack on the 'pixel_count' constraint
+        (0.05 = +/-5%); _evaluate widens it by 50% to absorb whole-patch
+        discretisation that repair cannot remove.
         """
-        # Check if patch approach is initialized
         if not initial_conditions.get('patch_approach_enabled', False):
             raise ValueError(
                 "Patch approach not initialized. Call initialize_patch_approach() first."
@@ -967,29 +954,18 @@ class PatchRestorationProblem(RestorationProblem):
         print(f"Patch-based problem initialized:")
         print(f"  Decision variables: {self.n_var} patches "
               f"({self.n_restoration_patches} restoration + {self.n_conversion_patches} conversion)")
-        #print(f"  Constraint type: {patch_constraint_type}")
-        #print(f"  Target value: {self.target_constraint_value}")
-        #if patch_constraint_type == 'pixel_count':
-            #print(f"  Tolerance: ±{pixel_tolerance*100:.1f}%")
-        #print(f"  (pixel-based equivalent: {self.max_action_pixels} pixels)")
-    
+
+
     def _evaluate(self, x_patches, out, *args, **kwargs):
         """
-        Evaluate a patch-based solution.
-        
-        Args:
-            x_patches: Patch-level decision variables (binary array)
-                      First n_restoration_patches: restoration patch decisions
-                      Next n_conversion_patches: conversion patch decisions
-            out: Output dictionary for objectives and constraints
+        Evaluate a patch-level plan: [restoration patches | conversion patches].
+        Expanded to pixels, then scored by the parent's pixel-level _evaluate.
         """
         from .patch_approach import convert_patch_decisions_to_pixels
-        
-        # Split patch decisions into restoration and conversion
+
         x_restore_patches = x_patches[:self.n_restoration_patches]
         x_convert_patches = x_patches[self.n_restoration_patches:]
-        
-        # Convert patch-level decisions to pixel-level decisions
+
         x_restore_pixels = convert_patch_decisions_to_pixels(
             x_restore_patches,
             self.restoration_patches,
@@ -1002,39 +978,30 @@ class PatchRestorationProblem(RestorationProblem):
             self.n_conversion_pixels
         )
         
-        # Create combined pixel-level decision vector for parent class evaluation
         x_pixels = np.concatenate([x_restore_pixels, x_convert_pixels])
-        
-        # Use parent class evaluation with pixel-level decisions
         super()._evaluate(x_pixels, out, *args, **kwargs)
-        
-        # Override constraint based on constraint type
+
+        # Override the parent's budget constraint with the patch-mode one.
         if self.patch_constraint_type == 'patch_count':
             n_patches_used = np.sum(x_restore_patches) + np.sum(x_convert_patches)
             constraint_value = abs(n_patches_used - self.target_constraint_value)
-        
+
         elif self.patch_constraint_type == 'pixel_count':
-            # Count actual restoration + conversion pixels separately
             n_restore_pixels = np.sum(x_restore_pixels)
             n_convert_pixels = np.sum(x_convert_pixels)
             n_pixels_used = n_restore_pixels + n_convert_pixels
-            
-            # Use LARGER tolerance for constraint evaluation than repair uses
-            # This accounts for discretization errors from whole-patch constraints
-            # that repair cannot perfectly fix
-            evaluation_tolerance = self.pixel_tolerance * 1.5  # 50% larger tolerance
-            
+
+            # Wider than the repair's tolerance: whole-patch granularity leaves
+            # discretisation error that repair cannot remove.
+            evaluation_tolerance = self.pixel_tolerance * 1.5
+
+
             min_pixels = int(self.target_constraint_value * (1 - evaluation_tolerance))
             max_pixels = int(self.target_constraint_value * (1 + evaluation_tolerance))
             
-            # DEBUG: Print constraint check details
-            if not hasattr(self, '_constraint_debug_count'):
-                self._constraint_debug_count = 0
-            if self._constraint_debug_count < 5:
-                #print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
-                #print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
-                self._constraint_debug_count += 1
-            
+            # Only the first few violations are printed below.
+            self._constraint_debug_count = getattr(self, '_constraint_debug_count', 0) + 1
+
             if min_pixels <= n_pixels_used <= max_pixels:
                 constraint_value = 0  # Accept as feasible
             else:
@@ -1116,12 +1083,9 @@ class HVCallback:
     
     def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None):
         """
-        Initialize hypervolume callback.
-        
-        Args:
-            patience: Number of generations to wait for improvement before stopping
-            min_improvement: Minimum relative hypervolume improvement threshold
-            verbose: Print convergence information
+        patience: generations without a >= min_improvement RELATIVE HV gain before
+        declaring convergence. ref_point is required (fixed across the run so HV is
+        comparable between generations); see build_fixed_ref_point.
         """
         self.patience = patience
         self.min_improvement = min_improvement
@@ -1147,12 +1111,6 @@ class HVCallback:
         self._x_memory_warned = False  # print estimate only once
     
     def __call__(self, algorithm):
-        """
-        Called at each generation to check for convergence.
-        
-        Args:
-            algorithm: The optimization algorithm object
-        """
         # Get current population objectives
         if hasattr(algorithm, 'pop') and algorithm.pop is not None:
             F = algorithm.pop.get("F")
@@ -1175,10 +1133,10 @@ class HVCallback:
                         if not self._x_memory_warned and algorithm.n_gen == 1:
                             batch_mb = self.batch_size * X_pop.shape[0] * X_pop.shape[1] / 1e6
                             total_mb = self._n_generations_est * X_pop.shape[0] * X_pop.shape[1] / 1e6
-                            print(f"   X snapshots: {X_pop.shape[1]} vars × {X_pop.shape[0]} pop, "
+                            print(f"   X snapshots: {X_pop.shape[1]} vars x {X_pop.shape[0]} pop, "
                                   f"batch RAM ~{batch_mb:.0f} MB, est. total on disk ~{total_mb:.0f} MB")
                             if total_mb > 1000:
-                                print(f"   Warning: estimated X_history size exceeds 1 GB — consider reduce n_generations")
+                                print(f"   Warning: estimated X_history size exceeds 1 GB - consider reduce n_generations")
                             self._x_memory_warned = True
                         self.X_batch.append(X_pop.astype(np.int8))
                         if len(self.X_batch) >= self.batch_size:
@@ -1220,12 +1178,12 @@ class HVCallback:
                     if self.verbose:
                         print(f"   Warning: HV calculation failed at gen {algorithm.n_gen}: {e}")
             else:
-                # F is None or empty — keep hv_history length-aligned
+                # F is None or empty - keep hv_history length-aligned
                 if self.verbose:
                     print(f"   Warning: HVCallback skipped at gen {algorithm.n_gen}: pop F unavailable")
                 self.hv_history.append(float('nan'))
         else:
-            # pop unavailable — keep hv_history length-aligned
+            # pop unavailable - keep hv_history length-aligned
             if self.verbose:
                 print(f"   Warning: HVCallback skipped at gen {getattr(algorithm, 'n_gen', '?')}: pop unavailable")
             self.hv_history.append(float('nan'))
@@ -1252,14 +1210,8 @@ class ProgressCallback:
                  hv_patience=15, hv_min_improvement=1e-6, ref_point=None,
                  save_snapshots=False, snapshot_dir=None):
         """
-        Args:
-            verbose: Print progress every 10 generations.
-            n_generations: Total generation budget (used for ETA calculation).
-            hv_patience: Patience parameter forwarded to HVCallback.
-            hv_min_improvement: Min improvement threshold forwarded to HVCallback.
-            ref_point: Fixed hypervolume reference point forwarded to HVCallback.
-            save_snapshots: If True, capture full population X at every generation.
-            snapshot_dir: Directory to write temporary batch .npz files.
+        hv_* and ref_point are forwarded to HVCallback. save_snapshots captures the
+        full population X every generation into snapshot_dir as batched .npz files.
         """
         self.verbose = verbose
         self.n_generations = n_generations
@@ -1514,7 +1466,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
     Returns
     -------
     tuple
-        (sampling, repair) — repair is None when use_repair is False.
+        (sampling, repair) - repair is None when use_repair is False.
     """
     mutation = None   # region pixel modes supply a custom mutation
     crossover = None  # region_evolve supplies a region-swap crossover
@@ -1785,25 +1737,8 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
                      save_snapshots=False, run_label="", run_config=None,
                      r_export_parent=None):
     """
-    Assemble the optimization results dict and optionally save to disk.
-
-    Parameters
-    ----------
-    result : pymoo Result
-        Raw result returned by ``minimize()``.
-    problem : RestorationProblem or PatchRestorationProblem
-    initial_conditions, scenario_params : dicts
-    callback : ProgressCallback
-    use_patch_approach : bool
-    pop_size, n_generations, hv_patience, hv_min_improvement : run settings
-    save_results : bool
-    output_dir : str
-    verbose : bool
-
-    Returns
-    -------
-    dict
-        optimization_results ready for downstream use.
+    Assemble the optimization results dict from a pymoo Result and optionally save
+    it to disk. Returns the dict, ready for downstream use.
     """
     if verbose:
         convergence_reason = "hypervolume plateau" if callback.hv_callback.converged else "generation limit"
@@ -1914,7 +1849,7 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
                         pass
                 optimization_results['X_history_path'] = x_history_path
                 if verbose:
-                    print(f"\u2713 X_history saved: {X_history.shape} → {x_history_path}")
+                    print(f"\u2713 X_history saved: {X_history.shape} -> {x_history_path}")
             except Exception as e:
                 if verbose:
                     print(f"Warning: Could not assemble X_history: {e}")
@@ -1995,56 +1930,26 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      algorithm_type="nsga3"):
     """
     Run the multi-objective restoration optimization for a single scenario.
+    Returns the results dict, or None if the optimization produced no front.
 
-    Args:
-        initial_conditions: Initial objective conditions
-        scenario_params: Dict with scenario parameters
-        pop_size: Ignored — NSGA-III population size is determined by n_partitions (kept for API compatibility)
-        n_generations: Number of optimization generations
-        save_results: Whether to save results to files
-        verbose: Print progress information
-        skip_diagnostics: Skip optimization setup diagnostics
-        hv_patience: Generations to wait for hypervolume improvement before stopping
-        hv_min_improvement: Minimum hypervolume improvement to reset patience counter
-        use_repair: Whether to use repair operator for constraints
-        random_seed: Random seed for reproducibility
-        use_patch_approach: Use patch-based optimization instead of pixel-based
-        patch_size: Size of patches in pixels (for patch approach)
-        patch_constraint_type: Constraint type for patch approach:
-            - 'pixel_count': Constrain total number of pixels (RECOMMENDED)
-            - 'patch_count': Constrain number of patches
-        pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
-        output_dir: Directory to save results (default: current directory)
-        n_partitions: Number of partitions for NSGA-III Das-Dennis reference directions.
-            Controls population size: n_partitions=8 → 45 ref dirs (≈ pop of 45).
-            Increase to explore more of the objective space at the cost of more evaluations.
-        mutation_prob_var: Per-variable bitflip probability for the mutation operator.
-            None (default) reproduces the historical rate of 200 / n_var (i.e. ~200
-            expected flips per individual). Pass a float to override, e.g. for a
-            mutation-rate sensitivity sweep.
-        capture_repair_diag: If True (pixel mode / AdaptiveRepair only), dump paired
-            pre-repair vs post-repair genotype matrices and their raw objectives at a
-            few evenly-spaced generations to <output_dir>/repair_diagnostics/. Used to
-            compare genotype (pairwise Hamming) and phenotype (objective spread)
-            diversity before vs after repair. Analyse with
-            Debugs_tests/repair_diversity_report.py.
-        n_capture_gens: Number of evenly-spaced generations (including first and last)
-            to capture when capture_repair_diag is True.
-        algorithm_type: Which multi-objective algorithm to run.
-            "nsga3" (default) - NSGA-III with Das-Dennis reference directions;
-                population size is set by n_partitions (pop_size is ignored).
-                Best for >=3 objectives.
-            "nsga2" - classic NSGA-II with crowding distance and an explicit
-                pop_size. Natural choice for 2-objective problems where the
-                Pareto front is a curve.
+    Only the non-obvious arguments are documented here; scenario_params keys are
+    documented at their point of use (see RestorationProblem.__init__).
 
-    Returns:
-        dict: Optimization results, or None if optimization failed.
+    algorithm_type: "nsga3" (default, best for >=3 objectives) sizes the population
+        from n_partitions and IGNORES pop_size; "nsga2" (2-objective fronts) uses
+        pop_size directly. n_partitions=8 -> 45 Das-Dennis ref dirs -> pop 45.
+    patch_constraint_type: 'pixel_count' (recommended) or 'patch_count'.
+    mutation_prob_var / mutation_flip_count: per-variable bitflip probability, or the
+        expected flip COUNT (converted to a probability; takes precedence). None keeps
+        the historical 200 / n_var.
+    capture_repair_diag / n_capture_gens: pixel mode + AdaptiveRepair only. Dumps paired
+        pre/post-repair genotypes and raw objectives at n_capture_gens evenly-spaced
+        generations to <output_dir>/repair_diagnostics/, for comparing genotype (pairwise
+        Hamming) and phenotype diversity across repair. Analyse with
+        Debugs_tests/repair_diversity_report.py.
     """
     # --- 1. Initialize patch approach if not already done ---
     if use_patch_approach and not initial_conditions.get('patch_approach_enabled', False):
-        #if verbose:
-            #print(f"Initializing patch approach with patch_size={patch_size}...")
         initial_conditions = initialize_patch_approach(initial_conditions, patch_size=patch_size)
 
     # --- 2. Print run header ---
@@ -2205,7 +2110,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
 
     except Exception as e:
         if verbose:
-            print(f"✗ Error during optimization: {e}")
+            print(f"ERROR during optimization: {e}")
         return None
 
 # --- Main ---
@@ -2214,25 +2119,12 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
          pop_size=50, n_generations=100, save_results=True, verbose=True, random_seed=42,
          sample_fraction=None, sample_seed=42, ecosystem='all', lulc_path=None):
     """
-    Main execution function for restoration optimization.
-    
-    Args:
-        workspace_dir: Directory containing input data
-        scenario: Scenario to run ('all' for all scenarios, or integer index for specific scenario)
-        objectives: List of objectives to use (e.g., ['abiotic', 'biotic', 'landscape', 'cost])
-                   If None, uses all available objectives
-        n_samples_per_param: Number of samples to draw from each continuous parameter
-        pop_size: Population size for optimization
-        n_generations: Number of optimization generations
-        save_results: Whether to save results
-        verbose: Print progress information
-        random_seed: Random seed for reproducible parameter sampling
-        sample_fraction: Fraction of eligible pixels to use for optimization
-                        If None, uses all eligible pixels
-        sample_seed: Random seed for spatial sampling (default: 42)
-        
-    Returns:
-        dict: Optimization results
+    Load data and run one scenario, or every sampled scenario when scenario == "all".
+
+    scenario: "all", or an integer index into sample_scenario_parameters().
+    objectives: list of objective names (None = all available); see all_objectives in
+        data_loader.py for the catalogue.
+    sample_fraction / sample_seed: spatial subsampling of eligible pixels (None = all).
     """
 
     from .run_scenarios import run_all_scenarios_optimization
