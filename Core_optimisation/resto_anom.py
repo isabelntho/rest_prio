@@ -630,10 +630,20 @@ class RestorationProblem(ElementwiseProblem):
                 scale = float(np.nansum(np.abs(ctx)))
             elif obj_name == 'restoration_potential':
                 rp = self.initial_conditions['restoration_potential_1d']
-                if getattr(self, 'rp_formulation', 'sum') == 'threshold':
+                _rp_form = getattr(self, 'rp_formulation', 'sum')
+                if _rp_form == 'threshold':
                     # Count-based objective: scale by the number of eligible pixels
                     # so the normalised value falls in [-1, 0].
                     scale = float(len(rp))
+                elif _rp_form == 'shortfall':
+                    # Gain-based objective: scale by the total closable shortfall over
+                    # ALL eligible pixels (the value of restoring everything), so the
+                    # normalised value falls in [-1, 0]. Same "max attainable" logic as
+                    # the threshold form's pixel count.
+                    _ref = getattr(self, 'rp_threshold', 0.0)
+                    _imp = getattr(self, 'rp_improvement', 0.0)
+                    scale = float(np.nansum(np.minimum(rp + _imp, _ref)
+                                            - np.minimum(rp, _ref)))
                 else:
                     scale = float(np.nansum(np.abs(rp)))
             elif obj_name == 'restoration_benefit':
@@ -744,6 +754,21 @@ class RestorationProblem(ElementwiseProblem):
                     # minimiser maximises the restored area reaching the target.
                     post_rp = rp[sel] + self.rp_improvement
                     obj_value = -float(np.count_nonzero(post_rp > self.rp_threshold))
+                elif self.rp_formulation == 'shortfall':
+                    # Shortfall-closure formulation: sum the reduction in the gap between
+                    # condition and the reference level (rp_threshold), crediting
+                    # improvement only up to the reference and nothing beyond it:
+                    #   closure = min(rp + improvement, ref) - min(rp, ref)
+                    # Pixels already at/above the reference contribute nothing; pixels
+                    # more than `improvement` below it contribute the full improvement;
+                    # pixels in between contribute the part that closes the gap.
+                    # Unselected eligible pixels contribute 0, so this is equivalently
+                    # the sum over ALL eligible pixels. Negated so the minimiser
+                    # maximises total closure.
+                    sel_rp = rp[sel]
+                    closed = (np.minimum(sel_rp + self.rp_improvement, self.rp_threshold)
+                              - np.minimum(sel_rp, self.rp_threshold))
+                    obj_value = -float(np.sum(closed))
                 else:
                     # Total-improvement formulation: minimise summed baseline potential
                     # (selecting more degraded pixels gives a more negative sum).

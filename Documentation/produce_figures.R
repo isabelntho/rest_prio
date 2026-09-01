@@ -49,7 +49,7 @@ AXIS3_DIR <- NULL   # (legacy "policy axis" — unused; policy lives in Block 3)
 AXIS2_DIR <- NULL   # (legacy "formulation axis" — unused; form lives in Block 3)
 
 # Block 3 — fully-crossed factorial export root (SCENARIO_MODE = "factorial" in
-# run_custom_parallel.py): form {sum, threshold} × scaling {anomaly/global, q75}
+# run_custom_parallel.py): form {sum, threshold, shortfall} x scaling {anomaly/global, q75}
 # × construction × policy {status_quo, ...}, seed-replicated. Set this to the
 # r_inputs/<timestamp>_<label> grid folder once the factorial has been run; else
 # NULL and the Block 3 outputs (R3d-factorial, R3d-full, R3d comparison, R4f,
@@ -328,13 +328,16 @@ if (!is.na(.baseline_dir)) {
 # R2 — How each uncertainty axis reshapes the frontier (SHARED-reference HV)
 # ----------------------------------------------------------------------------
 # Uses compute_shared_hv() so HV is comparable across scenarios (the optimiser's
-# per-run HV is not — different reference point + per-run normalisation). Only
+# per-run HV is not - different reference point + per-run normalisation). Only
 # the SUM objective form is comparable in a shared objective space: the
-# 'threshold' form changes restoration_potential's units, so threshold-form
-# factorial runs are EXCLUDED here (kept = the form-sum half of Block 3).
+# 'threshold' form (a pixel count) and the 'shortfall' form (summed gap closure,
+# capped at rp_improvement per pixel) each change restoration_potential's units,
+# so threshold-form AND shortfall-form factorial runs are EXCLUDED here
+# (kept = the form-sum share of Block 3). This is deliberate, not an oversight.
 # ============================================================================
 if (.run("R2")) {
 message("\nR2 - shared-reference hypervolume across scenarios (indicator + policy + sum-form factorial)")
+message("  (threshold- and shortfall-form factorial runs excluded: incomparable rp units)")
 runs_meta <- list()
 for (root in c(AXIS1_DIR, AXIS3_DIR)) {
   for (d in .list_run_dirs(root)) {
@@ -1419,15 +1422,15 @@ if (!is.null(FACTORIAL_DIR) && dir.exists(FACTORIAL_DIR)) {
 # where V_p,f = RP score of plan p's pixel selection evaluated under
 # formulation f's objective, and V*_f = formulation f's own optimum
 # (the score its champion plan achieves, used as the denominator so regret
-# is unit-free and comparable across sum and threshold forms).
+# is unit-free and comparable across the objective forms).
 #
-# Formulations (columns): 4 = (form=sum/threshold) x (scaling=global/q75).
+# Formulations (columns): 6 = (form=sum/threshold/shortfall) x (scaling=global/q75).
 # Plans        (rows):    one champion plan per formulation (best RP solution
 #                         pooled over all constructions and seeds) + core plan.
 # Core plan = top R5_BUDGET pixels by consensus RFOP from runs_factorial.
 #
-# Both forms are normalised to their own V*; regret fractions are comparable
-# across sum-gain and area-over-threshold despite different native units.
+# Every form is normalised to its own V*; regret fractions are comparable across
+# sum-gain, area-over-threshold and shortfall-closure despite different native units.
 #
 # Outputs:
 #   R5_regret_matrix.csv    -- regret matrix (%, 2 d.p.)
@@ -1439,7 +1442,12 @@ message("\nR5 -- cross-formulation regret matrix")
 
 R5_BUDGET   <- 21855L   # max_action_pixels; same for every factorial cell
 R5_ANOM_DIR <- file.path("data", "anomaly_scenarios")
-R5_THRESH   <- 0.0      # threshold form counts pixels with combined_anomaly > this
+R5_THRESH   <- 0.0      # threshold form counts pixels with combined_anomaly > this;
+                        # also the REFERENCE LEVEL for the shortfall form
+# Nominal per-pixel condition gain = 0.5 * (abiotic_effect + biotic_effect), i.e.
+# RestorationProblem.rp_improvement. Only the shortfall form uses it. KEEP IN SYNC
+# with abiotic_effect / biotic_effect in the run drivers (both 0.01 by default).
+R5_IMPROVE  <- 0.01
 
 # Helper: parse one factor token from a run-dir name (matches .r3d_tok style).
 .r5_tok <- function(nm, key) {
@@ -1505,20 +1513,34 @@ if (all(vapply(r5_rasts, is.null, logical(1)))) {
 # Helper: compute RP score from extracted anomaly values.
 #   sum form       -> -sum(vals)          (negative anomaly -> positive degradation sum)
 #   threshold form -> count(vals < thresh) (count degraded pixels below the threshold)
-# Both return positive numbers that increase with restoration potential, matching
+#   shortfall form -> sum of gap closure toward the reference, credited only up to it:
+#                     sum( min(v + imp, ref) - min(v, ref) )
+#                     Pixels at/above the reference contribute 0; pixels more than
+#                     `imp` below it contribute the full `imp`. Mirrors
+#                     RestorationProblem.evaluate_raw_objectives exactly (before its
+#                     sign flip), so no negation is needed here.
+# All three return positive numbers that increase with restoration potential, matching
 # the sign convention in objectives.csv after load_run_data's sign inversion.
 .r5_score <- function(vals, form) {
   v <- vals[!is.na(vals)]
   if (length(v) == 0L) return(NA_real_)
-  if (form == "sum") -sum(v) else sum(v < R5_THRESH)
+  if (form == "sum") {
+    -sum(v)
+  } else if (form == "shortfall") {
+    sum(pmin(v + R5_IMPROVE, R5_THRESH) - pmin(v, R5_THRESH))
+  } else {
+    sum(v < R5_THRESH)
+  }
 }
 
-# Four formulations (the objective-function space).
+# Six formulations (the objective-function space): 3 forms x 2 scalings.
 r5_forms <- list(
   "sum/global"    = list(form = "sum",       scaling = "global",    scal_key = "global"),
   "sum/q75"       = list(form = "sum",       scaling = "upper_q75", scal_key = "upper_q75"),
   "thresh/global" = list(form = "threshold", scaling = "global",    scal_key = "global"),
-  "thresh/q75"    = list(form = "threshold", scaling = "upper_q75", scal_key = "upper_q75")
+  "thresh/q75"    = list(form = "threshold", scaling = "upper_q75", scal_key = "upper_q75"),
+  "short/global"  = list(form = "shortfall", scaling = "global",    scal_key = "global"),
+  "short/q75"     = list(form = "shortfall", scaling = "upper_q75", scal_key = "upper_q75")
 )
 
 # Status-quo dirs only (ambitious + burden_shared already excluded by

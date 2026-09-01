@@ -98,13 +98,14 @@ custom_scenario_params = {
     "patch_score_temperature": 2.0,
     "patch_repair_top_k": 100,
     "burden_sharing": "no",
+    # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
+    # rp_threshold is the "good state" cutoff / reference level for the latter two.
+    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (resto_anom.py).
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
-    # Metric for the "spatial_clustering" objective (only used when it is in OBJECTIVES):
-    #   "adjacency"             = shared-edge count (compactness)
-    #   "components"            = number of disconnected clusters (fragmentation)
-    #   "inter_patch_adjacency" = shared edges crossing a patch boundary only (excludes the
-    #                             4 guaranteed internal edges of each 2x2 patch); needs patch approach
+    # spatial_clustering metric (only used when that objective is in OBJECTIVES):
+    # "adjacency" (default) / "components" / "inter_patch_adjacency" (needs patch approach).
+    # See RestorationProblem.__init__ (resto_anom.py) for what each measures.
     "clustering_metric": "adjacency",
 }
 
@@ -118,19 +119,19 @@ POLICY_VARIANTS = {
                                 "burden_sharing": "yes"},
 }
 
-# Benchmark condition scenarios run in policy_grid mode with baseline params × SEEDS.
+# Benchmark condition scenarios run in policy_grid mode with baseline params x SEEDS.
 BENCHMARK_SCENARIOS = ["upper_q75_all"]
 
-# ── Factorial design (SCENARIO_MODE == "factorial") — iEMSs Block 4 ──────────
-FACTORIAL_FORMS = ["sum", "threshold"]
+# -- Factorial design (SCENARIO_MODE == "factorial") - iEMSs Block 4 ----------
+FACTORIAL_FORMS = ["sum", "threshold", "shortfall"]
 FACTORIAL_SCALINGS = ["global", "upper_q75"]
 FACTORIAL_CONSTRUCTIONS = [
     "all",
     "drop_sbd",
     "drop_soc",
     "drop_ndvi",
-    # "drop_<highest_leverage_1>",   # ← fill from Block 2 R3c Jaccard
-    # "drop_<highest_leverage_2>",   # ← fill from Block 2 R3c Jaccard
+    # "drop_<highest_leverage_1>",   # <- fill from Block 2 R3c Jaccard
+    # "drop_<highest_leverage_2>",   # <- fill from Block 2 R3c Jaccard
 ]
 FACTORIAL_POLICIES = {
     "status_quo":    {},

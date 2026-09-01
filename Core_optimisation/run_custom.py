@@ -87,27 +87,19 @@ custom_scenario_params = {
     "patch_score_temperature": 2.0,
     "patch_repair_top_k": 100,
     "burden_sharing": "no",
-    # Axis 2 — restoration_potential objective formulation:
-    #   "sum"       = total improvement (default)
-    #   "threshold" = area of restored pixels reaching 'good' condition (> rp_threshold)
+    # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
+    # rp_threshold is the "good state" cutoff / reference level for the latter two.
+    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (resto_anom.py).
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
-    # Metric for the "spatial_clustering" objective (only used when it is in OBJECTIVES):
-    #   "adjacency"             = shared-edge count (compactness); strongly correlated with cost
-    #   "components"            = number of disconnected clusters (fragmentation); test for decoupling
-    #   "inter_patch_adjacency" = shared edges crossing a patch boundary only (excludes the
-    #                             4 guaranteed internal edges of each 2x2 patch); inter-patch
-    #                             contiguity, may decouple from cost. Needs the patch approach.
+    # spatial_clustering metric (only used when that objective is in OBJECTIVES):
+    # "adjacency" (default) / "components" / "inter_patch_adjacency" (needs patch approach).
+    # See RestorationProblem.__init__ (resto_anom.py) for what each measures.
     "clustering_metric": "inter_patch_adjacency",
     # Pixel-mode sampling strategy (ignored when USE_PATCH_APPROACH=True):
-    #   "scattered"    = default AdaptiveSampling + bitflip mutation (historical).
-    #   "region_grow"  = RegionGrowingSampling + RegionGrowingMutation: build and
-    #                    preserve contiguous, arbitrary-shape regions so the search
-    #                    can reach clustered plans where cost/clustering actually vary.
-    #   "region_evolve"= SpatialCoverageSampling + RegionEvolveMutation +
-    #                    RegionSwapCrossover: seed regions SPREAD across the map, then
-    #                    relocate/spawn/grow/shrink and recombine WHOLE regions so the
-    #                    SEARCH explores the landscape instead of collapsing onto one basin.
+    # "scattered" (default, scattered plans) / "region_grow" (contiguous regions) /
+    # "region_evolve" (regions that relocate/spawn/recombine as wholes, avoiding one
+    # basin). See _build_operators (resto_anom.py) for the operator wiring.
     "sampling_strategy": "scattered",
     # Minimum-patch-size constraint (price-of-contiguity). Every 4-connected component
     # of selected pixels must be >= min_patch_size pixels, enforced by MinPatchSizeRepair
