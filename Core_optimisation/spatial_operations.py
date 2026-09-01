@@ -1455,7 +1455,14 @@ class RegionEvolveMutation(RegionGrowingMutation):
                 sel[c] = False
             elif move == 'grow' and comps:
                 c = comps[int(rng.integers(len(comps)))]
-                grown = grow_regions_from_seeds(self.nbr, n_rest, int(c.size) + self.n_edits,
+                # target_k counts only NEWLY grown pixels: base=sel blocks every
+                # already-selected pixel, including this component's own cells,
+                # so the seeds do not count toward it. Asking for
+                # c.size + n_edits therefore added the component's own size on
+                # top of the intended n_edits, roughly doubling the region and
+                # forcing the budget step below to reclaim the overshoot by
+                # deleting unrelated regions. Ask for n_edits.
+                grown = grow_regions_from_seeds(self.nbr, n_rest, self.n_edits,
                                                 list(c), scores, mode, rng, base=sel)
                 sel |= grown
             elif move == 'shrink' and comps:
