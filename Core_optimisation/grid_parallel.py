@@ -22,11 +22,14 @@ Workers:
   - ``run_tag``            : condition grid - one tag, all of its seeds.
   - ``run_factorial_cell`` : factorial design - one (tag, seed) cell, all of its
                              form x policy combinations.
+  - ``run_custom_seed``    : custom mode - one seed of the single custom scenario.
 
 This module deliberately has NO import-time side effects so it can be safely
 re-imported by ``spawn`` worker processes on Windows.
 """
 
+import os
+import sys
 import time
 
 from .data_loader import load_initial_conditions
@@ -68,6 +71,11 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
         mutation_flip_count=cfg.get("mutation_flip_count", None),
         capture_repair_diag=cfg.get("capture_repair_diag", False),
         n_capture_gens=cfg.get("n_capture_gens", 5),
+        # Omitted unless the caller sets it, so run_optimization_instance's own
+        # default (hv_patience=15, HV early stopping ON) still applies to every
+        # existing caller. Set it to n_generations + 1 to give every run in a grid
+        # the SAME generation budget, which is what makes runs comparable.
+        **({"hv_patience": cfg["hv_patience"]} if "hv_patience" in cfg else {}),
     )
 
 
@@ -120,6 +128,82 @@ def run_tag(task):
             summaries.append((run_label, False, time.perf_counter() - t0, str(e)))
 
     return summaries
+
+
+def run_custom_seed(task):
+    """Custom mode: run ONE seed of the single custom scenario in its own process.
+
+    SCENARIO_MODE == "custom" replicates one scenario across SEEDS, and those
+    replicates are fully independent - so they parallelise exactly like the grids.
+    The task is one seed rather than one tag (the condition tag is fixed in custom
+    mode), so each worker loads that tag's rasters for itself and the ~1.3M-pixel
+    initial_conditions never cross a process boundary.
+
+    Parameters
+    ----------
+    task : dict
+        Picklable work item with keys:
+          - 'tag'        : str   condition-scenario raster tag
+          - 'seed'       : int
+          - 'run_label'  : str   label for the pkl / registry entry
+          - 'cfg'        : dict  run settings shared across all tasks. An optional
+                                 'log_dir' key redirects this run's verbose output
+                                 to <log_dir>/<run_label>.log.
+
+    Returns
+    -------
+    tuple
+        A single ``(run_label, succeeded, elapsed_seconds, error_or_None)`` - NOT a
+        list, unlike run_tag/run_factorial_cell, since one task is one run.
+    """
+    tag = task["tag"]
+    seed = task["seed"]
+    run_label = task["run_label"]
+    cfg = task["cfg"]
+
+    t0 = time.perf_counter()
+    log_dir = cfg.get("log_dir")
+    log_path = os.path.join(log_dir, f"{run_label}.log") if log_dir else None
+    _old_out, _old_err = sys.stdout, sys.stderr
+    logf = None
+    if log_path:
+        os.makedirs(log_dir, exist_ok=True)
+        # buffering=1 (line-buffered) so a multi-hour run is observable WHILE it
+        # runs. With the default block buffer a run that prints only every 10
+        # generations can finish before its log ever reaches disk, and a killed
+        # run leaves a 0-byte file.
+        logf = open(log_path, "w", buffering=1, encoding="ascii", errors="replace")
+        sys.stdout = sys.stderr = logf
+
+    try:
+        try:
+            ic = load_initial_conditions(
+                ".",
+                objectives=cfg["objectives"],
+                region=cfg["region"],
+                ecosystem=cfg["ecosystem"],
+                sample_fraction=cfg["sample_fraction"],
+                sample_seed=cfg["sample_seed"],
+                aggregation_factor=cfg["aggregation_factor"],
+                condition_scenario=tag,
+            )
+        except Exception as e:  # noqa: BLE001
+            return (run_label, False, time.perf_counter() - t0,
+                    f"load failed for tag '{tag}': {e}")
+
+        try:
+            res = _invoke(
+                ic, cfg["scenario_params"], run_label,
+                {**cfg["run_config"], "condition_scenario": tag, "random_seed": seed},
+                seed, cfg,
+            )
+            return (run_label, res is not None, time.perf_counter() - t0, None)
+        except Exception as e:  # noqa: BLE001 - report, never crash the whole pool
+            return (run_label, False, time.perf_counter() - t0, str(e))
+    finally:
+        sys.stdout, sys.stderr = _old_out, _old_err
+        if logf is not None:
+            logf.close()
 
 
 def run_factorial_cell(task):
