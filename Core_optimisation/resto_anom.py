@@ -481,16 +481,9 @@ class RestorationProblem(ElementwiseProblem):
             'neighbor_effect_decay': float(scenario_params.get('neighbor_effect_decay', 0.2)),
         }
 
-        # restoration_potential objective formulation (Axis 2 - uncertainty in how
-        # the restoration target is operationalised):
-        #   'sum'       - total improvement: minimise summed baseline restoration_potential
-        #                 over selected pixels (selects the most degraded pixels).
-        #   'threshold' - area exceeding a target: maximise the count of selected pixels
-        #                 whose post-restoration condition crosses into 'good' state.
-        #   'shortfall' - shortfall closure: sum the reduction in the gap between
-        #                 condition and the reference level, crediting improvement only
-        #                 up to the reference and nothing beyond it (equivalently,
-        #                 sum-gain on condition clamped at the reference).
+        # restoration_potential formulation (Axis 2 - how the restoration target is
+        # operationalised): 'sum' / 'threshold' / 'shortfall'. rp_threshold is the
+        # target's cutoff/reference. See evaluate_raw_objectives below for what each does.
         self.rp_formulation = str(scenario_params.get('rp_formulation', 'sum')).lower()
         if self.rp_formulation not in ('sum', 'threshold', 'shortfall'):
             raise ValueError(
@@ -498,20 +491,8 @@ class RestorationProblem(ElementwiseProblem):
                 "Use 'sum', 'threshold' or 'shortfall'.")
         self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
 
-        # spatial_clustering objective metric:
-        #   'adjacency'            - count orthogonal shared edges between selected
-        #                            pixels (compactness; correlates strongly with
-        #                            cost in tests).
-        #   'components'           - count disconnected clusters (4-connectivity);
-        #                            minimised. Insensitive to cluster size/shape, so
-        #                            it measures pure fragmentation and may decouple
-        #                            from cost.
-        #   'inter_patch_adjacency'- like 'adjacency' but counts ONLY shared edges
-        #                            that cross a patch boundary (pixels in different
-        #                            patches), excluding the internal edges guaranteed
-        #                            inside each selected patch (4 for a 2x2 patch).
-        #                            Measures inter-patch contiguity; needs the patch
-        #                            approach.
+        # spatial_clustering metric: 'adjacency' / 'components' / 'inter_patch_adjacency'
+        # (needs the patch approach). See evaluate_raw_objectives below for what each measures.
         self.clustering_metric = str(scenario_params.get('clustering_metric', 'adjacency')).lower()
         # First-order per-pixel condition gain from restoration, applied to the combined
         # (abiotic + biotic) restoration_potential score used by the 'threshold' and
