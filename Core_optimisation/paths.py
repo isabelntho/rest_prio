@@ -1,13 +1,11 @@
 """
 Canonical output locations for the restoration optimisation pipeline.
 
-Single source of truth for where the pipeline writes results, logs, reports, and
-R-export inputs. Import the constants from here rather than hardcoding directory-name
-strings, so relocating the output tree is a one-line change in this file.
+Scripts in Core_optimisation import the constants from here rather than 
+hardcoding directory-name strings.
 
 All pipeline outputs live under OUTPUTS (currently <project_root>/outputs). The R
-analysis layer reads r_inputs/, results_files/, and figs/ from this same tree; if you
-move OUTPUTS, update the corresponding paths in Documentation/*.R and Documentation/*.qmd.
+analysis layer reads r_inputs/, results_files/, and figs/ from this same tree.
 """
 
 from pathlib import Path

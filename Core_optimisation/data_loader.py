@@ -124,9 +124,7 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
         try:
             from rasterio.warp import reproject, Resampling
             from rasterio.windows import from_bounds
-            
-            #print(f"🔄 Processing LULC to match reference data extent...")
-            
+
             with rio.open(original_path) as src:
                 # Check if we need to reproject
                 if target_crs and src.crs != target_crs:
@@ -200,7 +198,7 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
                 'bounds': target_bounds
             })
             
-            #print(f"✓ Processed LULC to match reference: {processed_data.shape}")
+            #print(f"OK Processed LULC to match reference: {processed_data.shape}")
             #print(f"  Processed unique values: {len(np.unique(processed_data[~np.isnan(processed_data)]))}")
             
             return processed_data, lulc_meta, original_path
@@ -211,7 +209,7 @@ def load_lulc_raster(workspace_dir=None, lulc_path=None, region='CH',
             return lulc_data, lulc_meta, original_path
     
     else:
-        #print(f"✓ Using original LULC extent (no target specified)")
+        #print(f"OK Using original LULC extent (no target specified)")
         return lulc_data, lulc_meta, original_path
 
 
@@ -242,7 +240,7 @@ def create_ecosystem_mask(lulc_data, ecosystem_type):
     else:
         raise ValueError(f"Unknown ecosystem type: {ecosystem_type}. Available: {list(ECOSYSTEM_TYPES.keys()) + ['all', 'fg']}")
     
-    #print(f"✓ Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
+    #print(f"OK Created {ecosystem_type} ecosystem mask: {np.sum(mask)}/{mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
     return mask
 
 # =============================================================================
@@ -333,7 +331,7 @@ def load_admin_regions(workspace_dir, region='Bern'):
                 logger.warning(f"No canton named 'Bern' found in {kanton_file}")
                 return None
             
-            #print(f"✓ Filtered to Bern canton")
+            #print(f"OK Filtered to Bern canton")
             
             # Load admin shapefile and crop/mask to Bern
             gdf = gpd.read_file(admin_file)
@@ -378,10 +376,10 @@ def load_planning_units(initial_conditions, mode='grid', unit_size_px=20,
         Standard initial_conditions dict (must be fully populated by
         ``load_initial_conditions``).
     mode : {'grid', 'admin'}
-        'grid'  – regular non-overlapping blocks of ``unit_size_px × unit_size_px`` pixels.
-        'admin' – one unit per non-empty administrative boundary polygon.
+        'grid'  - regular non-overlapping blocks of ``unit_size_px x unit_size_px`` pixels.
+        'admin' - one unit per non-empty administrative boundary polygon.
     unit_size_px : int
-        Side-length in pixels for grid mode (e.g. 20 → 20×20 px = 2 km at 100 m resolution).
+        Side-length in pixels for grid mode (e.g. 20 -> 20x20 px = 2 km at 100 m resolution).
         Ignored in admin mode.
     workspace_dir : str, optional
         Workspace directory; required for admin mode when ``admin_data`` is not
@@ -415,7 +413,7 @@ def load_planning_units(initial_conditions, mode='grid', unit_size_px=20,
     restoration_eligible_indices = initial_conditions['restoration_eligible_indices']
     conversion_eligible_indices  = initial_conditions['conversion_eligible_indices']
 
-    # Build fast lookup: global pixel index → position in eligible array
+    # Build fast lookup: global pixel index -> position in eligible array
     rest_global_to_elig = {int(g): e for e, g in enumerate(restoration_eligible_indices)}
     conv_global_to_elig = {int(g): e for e, g in enumerate(conversion_eligible_indices)}
 
@@ -425,7 +423,7 @@ def load_planning_units(initial_conditions, mode='grid', unit_size_px=20,
         )
         logger.info(
             f"Grid planning units: {unit_mappings['n_units']} units "
-            f"({unit_size_px}×{unit_size_px} px each)"
+            f"({unit_size_px}x{unit_size_px} px each)"
         )
 
     elif mode == 'admin':
@@ -621,43 +619,52 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     # every other region uses data/anomaly_scenarios/. The scenario tag selects
     # the file within that folder.
     anomaly_dir = 'CH_wide' if region == 'CH' else 'anomaly_scenarios'
+    # This dict is the canonical objective catalogue: the only valid OBJECTIVES
+    # names, and what each one means to the optimiser. A value of None means
+    # "computed", not "no data" - see the per-key notes below and
+    # RestorationProblem.evaluate_raw_objectives (resto_anom.py) for the formulas.
     all_objectives = {
+        # minimise abiotic condition anomaly over restoration-eligible pixels
         'abiotic': str(DATA_DIR / anomaly_dir / f'abiotic_{condition_scenario}.tif'),
+        # minimise biotic condition anomaly over restoration-eligible pixels
         'biotic':  str(DATA_DIR / anomaly_dir / f'biotic_{condition_scenario}.tif'),
+        # legacy: landscape anomaly via SN-density recalculation (conversion pixels)
         'landscape': str(DATA_DIR / 'sn_dens.tif'),
-        'connectivity': None,  # Computed in-memory from landscape LULC; no file required
-        # landscape_context / restoration_potential are ALWAYS computed in-memory from the
-        # scenario's abiotic/biotic rasters (None → computed below), never loaded from a
-        # pre-computed .tif.
-        #
-        # Previously 'global_all' loaded data/{landscape_context,restoration_potential}.tif
-        # while every other condition_scenario recomputed in-memory. That put the baseline
-        # cell on a different construction route than the LOO / q75 cells: if the saved
-        # rasters were not byte-identical to the in-memory computation, a file-vs-recompute
-        # discrepancy would be misattributed to the construction / scaling factors in the
-        # Block 3 factorial (the 'all' vs 'drop_*' and global vs q75 contrasts). Forcing
-        # in-memory for ALL scenarios guarantees the only thing differing between cells is
-        # the formulation under test.
+        # maximise precomputed per-pixel connectivity gain (conversion pixels);
+        # the default landscape-connectivity objective, replacing 'landscape'.
+        # Computed in-memory from landscape LULC; no file required.
+        'connectivity': None,
+        # minimise mean abiotic anomaly of eligible neighbours within 500m (rewards
+        # pixels embedded in already-good-condition surroundings). ALWAYS computed
+        # in-memory from the scenario's abiotic/biotic rasters, never from a
+        # pre-computed .tif - keeps every condition_scenario on the same construction
+        # route (a saved-raster mismatch would otherwise get misattributed to the
+        # scaling/construction factors under test in the factorial designs).
         'landscape_context': None,
+        # minimise mean per-pixel abiotic+biotic baseline anomaly (single combined
+        # condition score; formulation set by scenario_params['rp_formulation'] -
+        # see RestorationProblem.__init__). Same in-memory-only rule as above.
         'restoration_potential': None,
-        # restoration_benefit: spatially-explicit benefit. Unlike the static
-        # restoration_potential, it is the total abiotic+biotic anomaly improvement
-        # (incl. neighbour spillover) achieved by a plan, so it depends on WHICH pixels
-        # AND their arrangement. Computed at evaluation time in RestorationProblem from
-        # the abiotic/biotic anomaly rasters (auto-loaded as dependencies below).
+        # maximise restoration_benefit: spatially-explicit total abiotic+biotic anomaly
+        # improvement INCLUDING neighbour spillover, so unlike restoration_potential it
+        # depends on the plan's spatial arrangement, not just which pixels are chosen.
+        # Computed at evaluation time from the abiotic/biotic rasters (auto-loaded as
+        # dependencies below when not itself an objective).
         'restoration_benefit': None,
-        # spatial_clustering has no underlying raster: it is a configuration-dependent
-        # compactness metric computed from the selected-pixel geometry at evaluation time
-        # (see RestorationProblem.evaluate_raw_objectives). None → treated as a computed
-        # objective; only an enable flag is set in initial_conditions.
+        # maximise spatial compactness of the selected pixels (metric chosen by
+        # scenario_params['clustering_metric']; see RestorationProblem.__init__).
+        # No underlying raster - configuration-dependent, computed from selected-pixel
+        # geometry each evaluation (RestorationProblem.evaluate_raw_objectives).
         'spatial_clustering': None,
-        # Cost layer is region-specific: the whole-Switzerland run (region='CH')
-        # loads data/CH_wide/cost_combined.tif; every other region uses the
-        # corrected Bern layer at the data/ root.
+        # minimise implementation cost. Region-specific: 'CH' loads
+        # data/CH_wide/cost_combined.tif; every other region uses the corrected
+        # Bern layer at the data/ root.
         'cost': str(DATA_DIR / 'CH_wide' / 'cost_combined.tif') if region == 'CH'
                 else str(DATA_DIR / 'implementation_cost_corrected.tif'),
         'population_proximity': str(DATA_DIR / 'population_proximity.tif'),
+        # maximise total future ES performance of selected pixels (higher sum = greater gain)
         'es_future_val': 'robustness/blce-robustness-data-archive/Mean_sum_of_change_ES.tif',
+        # minimise total future ES instability of selected pixels (lower = more robust)
         'es_future_robustness': 'robustness/blce-robustness-data-archive/Undesirable_deviation_sum_of_change_ES.tif',
     }
     
@@ -674,7 +681,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         if obj in all_objectives:
             filename = all_objectives[obj]
             if filename is None:
-                # Computed objective — no file to load; handled after LULC is loaded
+                # Computed objective - no file to load; handled after LULC is loaded
                 computed_objectives.add(obj)
             elif obj == 'cost':
                 data_files['implementation_cost'] = os.path.join(workspace_dir, filename)
@@ -779,7 +786,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                     if data.shape != ref['shape'] or src.transform != ref['transform']:
                         logger.info(
                             f"{objective} has different specs "
-                            f"(shape {data.shape} vs {ref['shape']}) — will resample to match reference"
+                            f"(shape {data.shape} vs {ref['shape']}) - will resample to match reference"
                         )
             # Track NaN locations BEFORE replacement
             nan_mask = np.isnan(data)
@@ -1007,7 +1014,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                         52, 53, 54, 55, 56, 57, 58, 59, 60, 64, 65, 66, 67]
         # Additional LULC values that must never be included
         exclude_classes = np.concatenate([
-            np.arange(1, 22),          # 1–21
+            np.arange(1, 22),          # 1-21
             np.array([61, 62, 63])
         ])
 
@@ -1078,7 +1085,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         from rasterio.transform import Affine
         initial_conditions['transform'] = Affine(t.a * f, t.b, t.c, t.d, t.e * f, t.f)
 
-        logger.info(f"Applied {f}x spatial aggregation: {(h, w)} → {new_shape} "
+        logger.info(f"Applied {f}x spatial aggregation: {(h, w)} -> {new_shape} "
                     f"({new_shape[0]*new_shape[1]} pixels)")
 
         # Save aggregated objective rasters to data/ for inspection
@@ -1184,7 +1191,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     initial_conditions['n_conversion_pixels'] = len(conversion_eligible_indices)
 
     # Compute connectivity_gain if requested.
-    # Done here — after conversion_eligible_indices is finalised — so the 1D slice aligns correctly.
+    # Done here - after conversion_eligible_indices is finalised - so the 1D slice aligns correctly.
     if 'connectivity' in computed_objectives:
         if 'landscape_lulc_data' in initial_conditions:
             lulc_meta = initial_conditions['landscape_lulc_meta']
@@ -1195,7 +1202,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
                 'landscape_focal_classes',
                 FOCAL_CLASSES
             )
-            logger.info("Computing per-pixel connectivity gain (radius=100m) …")
+            logger.info("Computing per-pixel connectivity gain (radius=100m) ...")
             gain_2d = compute_connectivity_gain_array(
                 lulc_data, lulc_nodata, lulc_res, focal_classes_conn, radius_m=100
             )
@@ -1222,8 +1229,8 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     # Rationale: a pure condition context is near-collinear with restoration_potential (both
     # derive from the abiotic/biotic anomaly), which collapses the trade-off front. Anchoring
     # on the structural sn_dens layer keeps landscape_context an independent objective
-    # (prototype pixel-level r with restoration_potential ≈ 0.28 for sn_dens vs ≈ 0.52 for
-    # condition-only; w=0.25 ≈ 0.37), while still letting surrounding condition contribute.
+    # (prototype pixel-level r with restoration_potential ~= 0.28 for sn_dens vs ~= 0.52 for
+    # condition-only; w=0.25 ~= 0.37), while still letting surrounding condition contribute.
     # See DEVELOPMENT_TRACKER 2026-06-24.  Anomaly convention (restoration_effect): positive
     # = good, negative = degraded.  To change the structural/condition balance, edit
     # LC_CONDITION_WEIGHT below.
@@ -1236,7 +1243,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
             from scipy.ndimage import uniform_filter
             _w = min(max(float(LC_CONDITION_WEIGHT), 0.0), 1.0)
             _radius_px   = 5  # 500 m at 100 m resolution (condition focal window)
-            _kernel_size = 2 * _radius_px + 1  # 11 × 11 box approximation
+            _kernel_size = 2 * _radius_px + 1  # 11 x 11 box approximation
             _elig_2d     = initial_conditions['restoration_eligible_mask']
             _elig_float  = _elig_2d.astype(np.float64)
 
@@ -1306,8 +1313,8 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
 
     # Compute restoration_potential if requested.
     # For each restoration-eligible pixel: equal-weight mean of abiotic and biotic baseline
-    # anomaly values at that pixel (static — no neighbourhood, no restoration effect).
-    # Lower value → pixel more degraded on both dimensions → higher restoration potential.
+    # anomaly values at that pixel (static - no neighbourhood, no restoration effect).
+    # Lower value -> pixel more degraded on both dimensions -> higher restoration potential.
     # Minimised directly: sum over selected pixels; more negative = selecting more degraded pixels.
     if 'restoration_potential' in computed_objectives:
         _rp_has_abiotic = 'abiotic_anomaly' in initial_conditions
@@ -1374,7 +1381,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         )
 
     # spatial_clustering is computed from the selected-pixel geometry at evaluation
-    # time, so there is no per-pixel array to build here — only a flag telling
+    # time, so there is no per-pixel array to build here - only a flag telling
     # RestorationProblem to register it as an objective.
     if 'spatial_clustering' in computed_objectives:
         initial_conditions['spatial_clustering_enabled'] = True
@@ -1398,7 +1405,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     initial_conditions['_dependency_keys'] = _dependency_keys
     
     total_pixels = shape[0] * shape[1]
-    #print(f"✓ Eligibility masks created:")
+    #print(f"OK Eligibility masks created:")
     #print(f"  Restoration: {initial_conditions['n_restoration_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_restoration_pixels']/total_pixels:.1f}% of raster)")
     #print(f"  Conversion: {initial_conditions['n_conversion_pixels']}/{total_pixels} eligible pixels ({100*initial_conditions['n_conversion_pixels']/total_pixels:.1f}% of raster)")
     
