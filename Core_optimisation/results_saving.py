@@ -1054,9 +1054,9 @@ def save_scenario_results(results, output_dir=str(OUTPUT_DIR), verbose=True, inc
     # If r_export_parent is given (grid mode), write to r_export_parent/run_label/
     # with no timestamp — the parent already carries the grid-level timestamp.
     # Otherwise (single run) write to r_inputs/{timestamp}_{run_label}/.
+    _base = run_label_slug if run_label_slug else registry_entry["run_id"]
     try:
         from export_to_r import export_results as _export_to_r
-        _base = run_label_slug if run_label_slug else registry_entry["run_id"]
         if r_export_parent is not None:
             r_out_dir = os.path.join(r_export_parent, _base)
         else:
@@ -1064,10 +1064,16 @@ def save_scenario_results(results, output_dir=str(OUTPUT_DIR), verbose=True, inc
         _export_to_r(results_filename, output_dir=r_out_dir, nondom_pixels_only=True)
         generated_files["r_export_dir"] = r_out_dir
         if verbose:
-            print(f"✓ R export → {os.path.relpath(r_out_dir, output_dir)}/")
+            print(f"OK R export -> {os.path.relpath(r_out_dir, output_dir)}/")
     except Exception as e:
-        if verbose:
-            print(f"  Warning: R export failed: {e}")
+        # ALWAYS reported, never gated on `verbose`. A silent swallow here is how the
+        # 20260821 benchmark grid lost the export of all 240 runs: export_to_r printed a
+        # non-ASCII arrow after writing objectives.csv, that raised UnicodeEncodeError
+        # under the grid's redirected cp1252 stdout, and this handler hid it. The pkl is
+        # already on disk at this point, so a failure here is recoverable - but only if
+        # it is visible.
+        import traceback
+        print(f"  Warning: R export failed for {_base}: {e!r}\n{traceback.format_exc()}")
 
     return generated_files
 

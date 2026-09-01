@@ -4,12 +4,12 @@ export_to_r.py
 Export key optimization outputs to R-readable formats.
 
 Outputs (written to <output_dir>/):
-  objectives.csv            — all solutions: objective values + is_nondominated flag
-  objectives_normalized.csv — same, normalized objective space
-  hypervolume_evolution.csv — hypervolume per generation
-  population_stats.csv      — per-generation mean/std/min/max for each objective
-  pixel_selection.csv       — long-format: solution_id, action_type, pixel_row/x, pixel_col/y (non-dominated solutions only)
-  metadata.json             — run config, scenario params, problem info, algorithm scalars
+  objectives.csv            - all solutions: objective values + is_nondominated flag
+  objectives_normalized.csv - same, normalized objective space
+  hypervolume_evolution.csv - hypervolume per generation
+  population_stats.csv      - per-generation mean/std/min/max for each objective
+  pixel_selection.csv       - long-format: solution_id, action_type, pixel_row/x, pixel_col/y (non-dominated solutions only)
+  metadata.json             - run config, scenario params, problem info, algorithm scalars
 
 Usage:
     python export_to_r.py results_files/res_fg_20260415_1840_cost_corrected.pkl
@@ -35,13 +35,13 @@ def _find_evolution_json(pkl_path: Path) -> Path | None:
     """Try to locate the matching evolution JSON for a given pkl file."""
     stem = pkl_path.stem  # e.g. res_fg_20260415_1840_cost_corrected
 
-    # New-style filenames: res_fg_YYYYMMDD_HHMM_label.pkl  →  evo__fg_YYYYMMDD_HHMM_label.json
+    # New-style filenames: res_fg_YYYYMMDD_HHMM_label.pkl  ->  evo__fg_YYYYMMDD_HHMM_label.json
     evo_dir = pkl_path.parent.parent / "evolution_reports"
     candidate = evo_dir / f"evo__{stem[len('res_'):]}.json"
     if candidate.exists():
         return candidate
 
-    # Older-style: results_fg_1903_1.pkl  →  evolution_report_fg_1903_1.json
+    # Older-style: results_fg_1903_1.pkl  ->  evolution_report_fg_1903_1.json
     candidate2 = evo_dir / f"evolution_report_{stem[len('results_'):]}.json"
     if candidate2.exists():
         return candidate2
@@ -58,7 +58,7 @@ def _expand_patches_to_pixels(decisions_patches, patch_mappings, n_restoration_p
     selected by that solution.
     """
     restoration_pm = patch_mappings.get("restoration_patches", {})
-    patch_to_pixels = restoration_pm.get("patch_to_pixels")  # dict: patch_idx → list of px indices
+    patch_to_pixels = restoration_pm.get("patch_to_pixels")  # dict: patch_idx -> list of px indices
     if patch_to_pixels is None:
         return None
 
@@ -144,7 +144,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     obj_df["is_nondominated"] = is_nondominated.astype(int)
     obj_path = output_dir / "objectives.csv"
     obj_df.to_csv(obj_path, index=False)
-    print(f"  → {obj_path.name}  ({n_solutions} rows × {len(obj_names)} objectives)")
+    print(f"  -> {obj_path.name}  ({n_solutions} rows x {len(obj_names)} objectives)")
 
     # -------------------------------------------------------------------
     # 2. objectives_normalized.csv
@@ -155,7 +155,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         norm_df["is_nondominated"] = is_nondominated.astype(int)
         norm_path = output_dir / "objectives_normalized.csv"
         norm_df.to_csv(norm_path, index=False)
-        print(f"  → {norm_path.name}")
+        print(f"  -> {norm_path.name}")
 
     # -------------------------------------------------------------------
     # 3. Hypervolume evolution  (from algorithm_info or evolution JSON)
@@ -175,7 +175,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         hv_df = pd.DataFrame({"generation": np.arange(len(hv_history)), "hypervolume": hv_history})
         hv_path = output_dir / "hypervolume_evolution.csv"
         hv_df.to_csv(hv_path, index=False)
-        print(f"  → {hv_path.name}  ({len(hv_history)} generations)")
+        print(f"  -> {hv_path.name}  ({len(hv_history)} generations)")
 
     # -------------------------------------------------------------------
     # 4. Per-generation population statistics
@@ -215,7 +215,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         pop_df = pd.DataFrame(rows)
         pop_path = output_dir / "population_stats.csv"
         pop_df.to_csv(pop_path, index=False)
-        print(f"  → {pop_path.name}  ({n_gen} generations × {len(obj_names)} objectives)")
+        print(f"  -> {pop_path.name}  ({n_gen} generations x {len(obj_names)} objectives)")
 
     # -------------------------------------------------------------------
     # 5. Pixel selection (long format, non-dominated solutions by default)
@@ -231,7 +231,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
         n_conversion_pixels  = problem_info.get("n_conversion_pixels",
                                                 len(conversion_indices) if conversion_indices is not None else 0)
 
-        # Expand patch decisions → pixel decisions if needed
+        # Expand patch decisions -> pixel decisions if needed
         if is_patch_based and patch_mappings is not None:
             print("  Expanding patch decisions to pixel level ...")
             n_restoration_patches = problem_info.get("n_restoration_patches", decisions.shape[1])
@@ -258,7 +258,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
             mask = is_nondominated if nondom_pixels_only else np.ones(n_solutions, dtype=bool)
             sol_indices = np.where(mask)[0]
 
-            # Build affine transform for pixel → coordinate conversion.
+            # Build affine transform for pixel -> coordinate conversion.
             # ic["transform"] may be a rasterio Affine object or a flat list/tuple
             # of the 6 affine coefficients (a, b, c, d, e, f).
             transform_raw = ic.get("transform")
@@ -277,7 +277,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
                     print(f"  Warning: could not build affine transform ({_e}); "
                           "falling back to pixel row/col.")
 
-            # ── Export all eligible pixel coordinates ────────────────────────
+            # -- Export all eligible pixel coordinates ------------------------
             elig_rows_px, elig_cols_px = np.divmod(restoration_indices, shape[1])
             if affine_transform is not None:
                 import rasterio.transform as _rt
@@ -287,7 +287,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
                 elig_df = pd.DataFrame({"pixel_row": elig_rows_px, "pixel_col": elig_cols_px})
             elig_path = output_dir / "eligible_pixels.csv"
             elig_df.to_csv(elig_path, index=False)
-            print(f"  → {elig_path.name}  ({len(elig_df):,} eligible pixels)")
+            print(f"  -> {elig_path.name}  ({len(elig_df):,} eligible pixels)")
 
             def _pixels_to_rows(sol_i, flat_pixel_indices, action_type_label):
                 """Convert a flat array of global-grid indices to a tidy DataFrame block."""
@@ -330,7 +330,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
                 label = "non-dominated" if nondom_pixels_only else "all"
                 n_convert_rows = int((px_df["action_type"] == "convert").sum())
                 n_restore_rows = len(px_df) - n_convert_rows
-                print(f"  → {px_path.name}  ({len(sol_indices)} {label} solutions, "
+                print(f"  -> {px_path.name}  ({len(sol_indices)} {label} solutions, "
                       f"{len(px_df):,} pixel-solution rows "
                       f"[{n_restore_rows:,} restore, {n_convert_rows:,} convert], {coord_mode})")
 
@@ -379,7 +379,7 @@ def export_results(pkl_path: str, output_dir: str = None, nondom_pixels_only: bo
     meta_path = output_dir / "metadata.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
-    print(f"  → {meta_path.name}")
+    print(f"  -> {meta_path.name}")
 
     print(f"\nAll outputs written to: {output_dir}/")
     return str(output_dir)
@@ -401,9 +401,9 @@ if __name__ == "__main__":
 
 
 # File	Contents
-# objectives.csv	One row per solution — raw objective values + is_nondominated flag
+# objectives.csv	One row per solution - raw objective values + is_nondominated flag
 # objectives_normalized.csv	Same in normalized objective space
-# hypervolume_evolution.csv	generation, hypervolume — auto-sourced from evolution JSON if present
+# hypervolume_evolution.csv	generation, hypervolume - auto-sourced from evolution JSON if present
 # population_stats.csv	Per-generation mean/std/min/max for each objective
 # pixel_selection.csv	Long-format: solution_id, action_type ("restore"/"convert"), pixel_row/x, pixel_col/y (non-dominated solutions by default)
 # metadata.json	Run config, scenario params, algorithm settings, raster grid info (CRS, transform, shape)
