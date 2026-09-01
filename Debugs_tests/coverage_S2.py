@@ -59,7 +59,7 @@ def cmd_snapshot():
     res = run_optimization_instance(
         initial_conditions=ic, scenario_params=SCORED_S2_PARAMS,
         pop_size=POP_SIZE, n_generations=N_GENERATIONS, save_results=True,
-        verbose=True, n_jobs=12, random_seed=seed, use_repair=True,
+        verbose=True, random_seed=seed, use_repair=True,
         use_patch_approach=False, pixel_tolerance=0.05, algorithm_type="nsga2",
         run_label=run_label, save_snapshots=True,
     )
@@ -182,7 +182,7 @@ def _sweep_run():
             initial_conditions=ic,
             scenario_params={**SCORED_S2_PARAMS, "region_random_share": share},
             pop_size=POP_SIZE, n_generations=N_GENERATIONS, save_results=True,
-            verbose=True, n_jobs=12, random_seed=SWEEP_SEED, use_repair=True,
+            verbose=True, random_seed=SWEEP_SEED, use_repair=True,
             use_patch_approach=False, pixel_tolerance=0.05, algorithm_type="nsga2",
             run_label=label, save_snapshots=True,
         )

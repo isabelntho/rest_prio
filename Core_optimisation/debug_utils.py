@@ -15,11 +15,11 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         scenario_params: Dict with scenario parameters
         n_samples: Number of sample solutions to test
     """
-    from Core_optimisation.resto_anom import RestorationProblem
+    from .resto_anom import RestorationProblem
 
     logger.info("=== Quick problem diagnostics ===")
 
-    problem = RestorationProblem(initial_conditions, scenario_params, n_jobs=1)
+    problem = RestorationProblem(initial_conditions, scenario_params)
 
     x_none = np.zeros(problem.n_var, dtype=int)
     out_none = {}
@@ -51,10 +51,8 @@ def diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=1
         logger.warning(f"No feasible solutions found in {n_samples} samples! Check if max_action_pixels constraint is too restrictive")
 
     issues = []
-    if out_none['F'][0] == 0:
-        issues.append("   ✗ Baseline objective is zero - may indicate data loading issue")
     if np.any(np.isnan(out_none['F'])):
-        issues.append("   ✗ NaN detected in objectives - data contains unmasked NaN values")
+        issues.append("   [X] NaN detected in objectives - data contains unmasked NaN values")
 
     if not issues:
         logger.info("No obvious setup issues detected")

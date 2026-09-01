@@ -42,7 +42,6 @@ OBJECTIVES_3 = ["restoration_potential", "spatial_clustering", "cost"]
 # ===========================================================================
 SWEEP_N_GENERATIONS = 40          # equal budget per arm; fast first-pass signal
 SWEEP_N_PARTITIONS = 12
-SWEEP_N_JOBS = 12
 SWEEP_SEEDS = [101]               # add seeds later for stability
 SWEEP_PIXEL_TOLERANCE = 0.05
 
@@ -112,7 +111,7 @@ def cmd_sweep():
                 initial_conditions=ic, scenario_params=params,
                 pop_size=None, n_generations=SWEEP_N_GENERATIONS,
                 save_results=False, verbose=False, skip_diagnostics=True,
-                hv_patience=SWEEP_N_GENERATIONS + 1, n_jobs=SWEEP_N_JOBS, random_seed=seed,
+                hv_patience=SWEEP_N_GENERATIONS + 1, random_seed=seed,
                 use_repair=True, use_patch_approach=use_patch, patch_size=patch_size,
                 patch_constraint_type="pixel_count", pixel_tolerance=SWEEP_PIXEL_TOLERANCE,
                 save_snapshots=False, n_partitions=SWEEP_N_PARTITIONS, warm_seeding=True,
@@ -185,7 +184,6 @@ def cmd_sweep():
 # ===========================================================================
 INSTR_N_GENERATIONS = 18
 INSTR_N_PARTITIONS = 12
-INSTR_N_JOBS = 12
 INSTR_SEED = 101
 INSTR_N_COMP_SAMPLE = 24   # children sampled per generation for component counts
 
@@ -312,7 +310,7 @@ def cmd_instrument():
     res = run_optimization_instance(
         initial_conditions=ic, scenario_params=INSTR_PARAMS, pop_size=None,
         n_generations=INSTR_N_GENERATIONS, save_results=False, verbose=False,
-        skip_diagnostics=True, hv_patience=INSTR_N_GENERATIONS + 1, n_jobs=INSTR_N_JOBS,
+        skip_diagnostics=True, hv_patience=INSTR_N_GENERATIONS + 1,
         random_seed=INSTR_SEED, use_repair=True, use_patch_approach=False,
         pixel_tolerance=0.05, save_snapshots=False, n_partitions=INSTR_N_PARTITIONS,
         warm_seeding=False, run_label="instrument")
@@ -367,7 +365,6 @@ def cmd_instrument():
 # ===========================================================================
 FRONT_N_GENERATIONS = 50
 FRONT_N_PARTITIONS = 12
-FRONT_N_JOBS = 12
 FRONT_SEED = 101
 FRONT_PIXEL_TOLERANCE = 0.05
 
@@ -423,7 +420,7 @@ def cmd_front_check():
             initial_conditions=copy.copy(ic_base), scenario_params=params,
             pop_size=None, n_generations=FRONT_N_GENERATIONS, save_results=False,
             verbose=False, skip_diagnostics=True, hv_patience=FRONT_N_GENERATIONS + 1,
-            n_jobs=FRONT_N_JOBS, random_seed=FRONT_SEED, use_repair=True, use_patch_approach=False,
+            random_seed=FRONT_SEED, use_repair=True, use_patch_approach=False,
             pixel_tolerance=FRONT_PIXEL_TOLERANCE, save_snapshots=False,
             n_partitions=FRONT_N_PARTITIONS, warm_seeding=False, run_label=label)
         dt = time.perf_counter() - t0
@@ -486,7 +483,7 @@ def cmd_region_evolve(arg):
     res = run_optimization_instance(
         initial_conditions=ic, scenario_params=REGEV_PARAMS, pop_size=None,
         n_generations=n_gen, save_results=True, verbose=True, skip_diagnostics=True,
-        hv_patience=n_gen + 1, n_jobs=12, random_seed=REGEV_SEED, use_repair=True,
+        hv_patience=n_gen + 1, random_seed=REGEV_SEED, use_repair=True,
         use_patch_approach=False, pixel_tolerance=0.05, save_snapshots=False,
         n_partitions=12, warm_seeding=False, run_label=REGEV_LABEL)
     dt = time.perf_counter() - t0

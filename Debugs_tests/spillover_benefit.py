@@ -218,7 +218,7 @@ def _confirm_run_sweep(ic, pop_size, n_generations, seeds, smoke):
             run_optimization_instance(
                 initial_conditions=ic, scenario_params=CONFIRM_PARAMS,
                 pop_size=pop_size, n_generations=n_generations,
-                save_results=(not smoke), verbose=True, n_jobs=12,
+                save_results=(not smoke), verbose=True,
                 random_seed=seed, use_repair=True, use_patch_approach=False,
                 pixel_tolerance=0.05, algorithm_type="nsga2", run_label=run_label,
             )
@@ -312,7 +312,7 @@ def _bias_run_sweep(ic, pop_size, n_generations, seeds, smoke):
                 run_optimization_instance(
                     initial_conditions=ic, scenario_params={**BIAS_BASE_PARAMS, "region_growth_bias": bias},
                     pop_size=pop_size, n_generations=n_generations, save_results=(not smoke),
-                    verbose=True, n_jobs=12, random_seed=seed, use_repair=True,
+                    verbose=True, random_seed=seed, use_repair=True,
                     use_patch_approach=False, pixel_tolerance=0.05, algorithm_type="nsga2",
                     run_label=run_label,
                 )

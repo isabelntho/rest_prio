@@ -108,7 +108,7 @@ def cmd_smoke():
     res = run_optimization_instance(
         initial_conditions=ic, scenario_params=params,
         pop_size=12, n_generations=2, save_results=False, verbose=True,
-        n_jobs=1, random_seed=101, use_repair=True, use_patch_approach=False,
+        random_seed=101, use_repair=True, use_patch_approach=False,
         pixel_tolerance=0.05, algorithm_type="nsga2", run_label="smoke_min_patch",
     )
 

@@ -60,7 +60,7 @@ When pixel `i` is restored, its anomaly changes by
 | Reference directions / pop size | `n_partitions = 12` (run scripts) -> ~91 ref dirs / pop ~91 for 3 objectives (POP_SIZE is ignored; NSGA-III sets pop = n ref dirs). Ref-dir count scales with n_obj. The `_build_algorithm` default is 8, but runs pass 12. | Explore more of the objective space than the earlier 8-partition / 45-dir setting | medium |
 | Mutation rate | ~200 bit-flips per individual per generation (`prob_var = 200/n_var`) | Higher exploration; raised from ~1 flip (2026-04-16), later to 200 | medium |
 | Generations | 100 (with HV-based early stopping) | Practical run length; convergence checked via hypervolume | medium |
-| Parallel evaluation | ThreadPool (numpy/scipy release the GIL) | Correct for this workload; avoids Windows spawn/pickle overhead (2026-04-29) | medium |
+| Parallel evaluation | None - evaluation is sequential within a run; parallelism is run-by-run (one process per seed / grid cell, `grid_parallel.py`) | The 2026-04-29 assumption that a ThreadPool works here was wrong: `_evaluate` is Python- and `scipy.ndimage`-bound and holds the GIL. Measured 2026-08-10 at 6 threads: 15,600 CPU-sec over 11,200 sec wall = 1.31 cores. The `n_jobs` thread pool was removed 2026-09-01 | high |
 
 ## Data
 

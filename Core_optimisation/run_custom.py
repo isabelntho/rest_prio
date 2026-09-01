@@ -84,7 +84,6 @@ SAMPLE_FRACTION = None
 SAMPLE_SEED = 42
 POP_SIZE = 92 #previously 50?
 N_GENERATIONS = 150
-N_JOBS = 12
 RANDOM_SEED = 101 #42
 N_SAMPLES_PER_PARAM = 3
 N_PARTITIONS = 12#for 3 objectives 12 # for 4 objectives 6
@@ -238,7 +237,6 @@ run_config = {
     "sample_seed": SAMPLE_SEED,
     "pop_size": POP_SIZE,
     "n_generations": N_GENERATIONS,
-    "n_jobs": N_JOBS,
     "random_seed": RANDOM_SEED,
     "n_samples_per_param": N_SAMPLES_PER_PARAM,
     "use_patch_approach": USE_PATCH_APPROACH,
@@ -350,7 +348,6 @@ def _run():
                                 n_generations=N_GENERATIONS,
                                 save_results=True,
                                 verbose=True,
-                                n_jobs=N_JOBS,
                                 random_seed=_seed,
                                 use_repair=True,
                                 use_patch_approach=USE_PATCH_APPROACH,
@@ -446,7 +443,6 @@ def _run():
                                 n_generations=N_GENERATIONS,
                                 save_results=True,
                                 verbose=True,
-                                n_jobs=N_JOBS,
                                 random_seed=_seed,
                                 use_repair=True,
                                 use_patch_approach=USE_PATCH_APPROACH,
@@ -502,7 +498,6 @@ def _run():
                                 n_generations=N_GENERATIONS,
                                 save_results=True,
                                 verbose=True,
-                                n_jobs=N_JOBS,
                                 random_seed=_seed,
                                 use_repair=True,
                                 use_patch_approach=USE_PATCH_APPROACH,
@@ -621,7 +616,6 @@ def _run():
                                             n_generations=N_GENERATIONS,
                                             save_results=True,
                                             verbose=True,
-                                            n_jobs=N_JOBS,
                                             random_seed=_seed,
                                             use_repair=True,
                                             use_patch_approach=USE_PATCH_APPROACH,
@@ -678,7 +672,6 @@ def _run():
                     n_generations=N_GENERATIONS,
                     save_results=True,
                     verbose=True,
-                    n_jobs=N_JOBS,
                     random_seed=RANDOM_SEED,
                     use_repair=True,
                     use_patch_approach=USE_PATCH_APPROACH,

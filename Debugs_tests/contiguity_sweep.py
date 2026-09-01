@@ -119,7 +119,7 @@ def _run_one(task):
                 run_optimization_instance(
                     initial_conditions=_IC, scenario_params=params,
                     pop_size=RUN_POP_SIZE, n_generations=RUN_N_GENERATIONS,
-                    save_results=(not SMOKE), verbose=True, n_jobs=1,
+                    save_results=(not SMOKE), verbose=True,
                     random_seed=seed, use_repair=True, use_patch_approach=False,
                     pixel_tolerance=0.05, algorithm_type="nsga2", run_label=run_label,
                 )
@@ -595,7 +595,6 @@ def cmd_jaccard():
 # ===========================================================================
 SNAP_LEVEL = 5            # default min-patch level to snapshot (override: snapshot <S>)
 SNAP_SEED = 606
-SNAP_N_JOBS = 12
 SNAP_STEP = 1             # animate every STEP-th generation
 SNAP_FPS = 8
 SNAP_THRESH = 0.5
@@ -620,7 +619,7 @@ def cmd_snapshot(arg):
     res = run_optimization_instance(
         initial_conditions=ic, scenario_params=params,
         pop_size=RUN_POP_SIZE, n_generations=RUN_N_GENERATIONS, save_results=True,
-        verbose=True, n_jobs=SNAP_N_JOBS, random_seed=SNAP_SEED, use_repair=True,
+        verbose=True, random_seed=SNAP_SEED, use_repair=True,
         use_patch_approach=False, pixel_tolerance=0.05, algorithm_type="nsga2",
         run_label=run_label, save_snapshots=True,
     )

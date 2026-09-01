@@ -3,9 +3,10 @@ Process-parallel drivers for the independent-run grids.
 ========================================================
 
 The condition grid and the factorial design are both sets of fully independent
-optimisation runs. The pymoo solver is sequential across generations, and the
-within-generation ``n_jobs`` thread pool is GIL-bound (per-individual
-``_evaluate`` is mostly Python-level work), so a single run leaves most cores
+optimisation runs. The pymoo solver is sequential across generations and
+evaluation is sequential within a generation (per-individual ``_evaluate`` is
+mostly Python-level work and holds the GIL, so the thread pool this module used
+to disable bought ~1.3x and has been removed), so a single run leaves most cores
 idle. The runs themselves share nothing - so the real parallelism lives at the
 grid level and is best exploited with *processes*, which sidestep the GIL.
 
@@ -35,9 +36,8 @@ from .resto_anom import run_optimization_instance
 def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
     """Run one optimisation instance with the grid's shared settings.
 
-    Process-level parallelism IS the parallelism here, so the inner thread pool
-    is forced serial (``n_jobs=1``) - it is GIL-bound and ineffective, and using
-    it would only oversubscribe cores against the other workers.
+    Process-level parallelism IS the parallelism here; each run evaluates
+    sequentially, so workers never oversubscribe cores against each other.
     """
     return run_optimization_instance(
         initial_conditions=ic,
@@ -48,7 +48,6 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
         # Quiet by default: parallel workers interleave stdout. Echoed only when
         # the caller runs a single worker (GRID_WORKERS == 1) for debugging.
         verbose=cfg.get("verbose", False),
-        n_jobs=1,
         random_seed=seed,
         use_repair=True,
         use_patch_approach=cfg["use_patch_approach"],

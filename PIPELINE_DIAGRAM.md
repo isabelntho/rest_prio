@@ -123,7 +123,7 @@ flowchart TD
 
     MUT --> REP["Repair operator<br/>PIXEL — AdaptiveRepair<br/>  count actions; add/remove individual pixels by priority score<br/>  until n_actions == max_action_pixels exactly<br/>PATCH — PatchRepair  (pixel_count or patch_count mode)<br/>  add/remove whole patches by score-guided sampling<br/>  eval tolerance = pixel_tolerance × 1.5  (allows discretisation slack)"]
 
-    REP --> EVALO["Evaluate offspring<br/>_evaluate() per individual  (see Diagram 2)<br/>parallelised via Pool.starmap when n_jobs > 1<br/>→ F [n_obj], G [1]"]
+    REP --> EVALO["Evaluate offspring<br/>_evaluate() per individual, sequentially  (see Diagram 2)<br/>runs are parallelised run-by-run, not within a run<br/>→ F [n_obj], G [1]"]
 
     EVALO --> NSORT["NSGA-III survival selection<br/>merge parent + offspring  [2 × n_ref_dirs solutions]<br/>fast non-dominated sort → rank<br/>reference-direction niche preservation → prune to n_ref_dirs"]
 

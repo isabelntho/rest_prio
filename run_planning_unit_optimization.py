@@ -91,7 +91,6 @@ N_PARTITIONS  = 12      # NSGA-III reference directions; 4 obj + 6 partitions �
 POP_SIZE      = 92      # population size (must be ≥ n_partitions × 3 for NSGA-III)
 HV_PATIENCE   = 15     # early stopping patience
 HV_MIN_IMPROVEMENT = 1e-6
-N_JOBS        = 8      # parallel objective evaluations (None = all cores)
 WARM_SEEDING  = True
 
 # --- Seeds ---
@@ -178,7 +177,6 @@ def _run():
             "n_partitions"       : N_PARTITIONS,
             "pop_size"           : POP_SIZE,
             "hv_patience"        : HV_PATIENCE,
-            "n_jobs"             : N_JOBS,
             "warm_seeding"       : WARM_SEEDING,
             "random_seed"        : seed,
             "aggregation_factor" : AGGREGATION_FACTOR,
@@ -202,7 +200,6 @@ def _run():
                 pop_size=POP_SIZE,
                 hv_patience=HV_PATIENCE,
                 hv_min_improvement=HV_MIN_IMPROVEMENT,
-                n_jobs=N_JOBS,
                 random_seed=seed,
                 warm_seeding=WARM_SEEDING,
                 save_results=SAVE_RESULTS,

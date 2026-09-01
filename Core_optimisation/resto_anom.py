@@ -1,14 +1,5 @@
 """
-Restoration Optimization initial code
-======================================
-Objectives:
-1. Abiotic condition anomaly (minimize)
-2. Biotic condition anomaly (minimize)  
-3. Landscape condition anomaly (minimize) (not used/implementation not finished)
-4. Implementation cost (minimize)
-
-Decision variable: Binary (0/1) for not restore/restore
-Restoration effect: Triggers action in cell or neighboring cells
+Restoration Optimization central code for initialising problems
 """
 
 # --- Imports ---
@@ -16,10 +7,8 @@ import os
 import numpy as np
 from scipy import ndimage
 from datetime import datetime
-import threading
-from multiprocessing.pool import ThreadPool
 
-from pymoo.core.problem import ElementwiseProblem, StarmapParallelization
+from pymoo.core.problem import ElementwiseProblem
 from pymoo.optimize import minimize
 from pymoo.algorithms.moo.nsga3 import NSGA3
 from pymoo.termination import get_termination
@@ -103,7 +92,6 @@ def build_repair_scores(initial_conditions, scenario_params):
         sb = float(scenario_params.get("biotic_effect", 0.0)) * wb
         scores = scores + sb
 
-    # Optional: small cost penalty if cost exists in initial_conditions and scenario uses it
     if "implementation_cost" in initial_conditions:
         c = initial_conditions["implementation_cost"][elig].astype(np.float64)
         c = c / (np.nanmean(c) + 1e-12)
@@ -118,12 +106,7 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
     Returns a dict with keys 'abiotic', 'biotic', 'cost', and optionally
     'landscape_context'.  Each value is a 1-D float64 array over eligible
     pixels, normalized to [0, 1].  Higher score always means "prefer this
-    pixel for the corresponding objective":
-      - abiotic:           degradation weight (same as composite abiotic term)
-      - biotic:            degradation weight (same as composite biotic term)
-      - cost:              inverted, normalised cost  (lower cost → higher score)
-      - landscape_context: inverted context score (low neighbour anomaly → high
-                           score, i.e. neighbours already in good condition)
+    pixel for the corresponding objective"
     """
     elig = initial_conditions["eligible_mask"]
     n_elig = int(elig.sum())
@@ -181,14 +164,6 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
         else:
             scores["restoration_potential"] = np.full(len(rp), 0.5, dtype=np.float64)
 
-    # NOTE: spatial_clustering deliberately has NO per-pixel score. Clustering is a
-    # property of the whole selection, not of any single pixel, so there is no valid
-    # per-patch preference to seed or repair toward. A uniform placeholder is worse
-    # than nothing: argsort over a constant collapses to patch-index (raster scan)
-    # order, which warm-seeds a solid band along the north edge of the raster. The
-    # objective is left to emerge from evaluation + selection; the score machinery
-    # below subsets reference-direction weights to the objectives that DO have scores.
-
     return scores
 
 
@@ -232,53 +207,20 @@ def _map_objectives_to_pixel_scores(problem, initial_conditions, scenario_params
 def initialize_patch_approach(initial_conditions, patch_size=100):
     """
     Add patch mappings to initial_conditions for patch-based optimization.
-    
-    This function creates patch definitions for both restoration and conversion
-    eligible areas, enabling patch-level decision making while maintaining
-    pixel-level objective calculations.
-    
-    Args:
-        initial_conditions: Dict with shape, masks, and indices
-        patch_size: Size of each patch in pixels (default: 100x100)
-    
-    Returns:
-        Updated initial_conditions dict with patch mappings added
+
+    Defines patches over both restoration- and conversion-eligible areas, so
+    decisions are made per patch while objectives stay pixel-level.
     """
     print(f"\nInitializing patch-based approach (patch size: {patch_size}x{patch_size} pixels)...")
-    
-    # Create patch mappings for restoration and conversion areas
-    patch_mappings = create_patch_mappings(
-        initial_conditions, 
-        patch_size=patch_size
-    )
-    
-    # Add patch mappings to initial_conditions
+
+    patch_mappings = create_patch_mappings(initial_conditions, patch_size=patch_size)
+
     initial_conditions['patch_mappings'] = patch_mappings
     initial_conditions['patch_approach_enabled'] = True
     initial_conditions['patch_size'] = patch_size
-    
-    # Store patch counts for easy access
     initial_conditions['n_restoration_patches'] = patch_mappings['restoration_patches']['n_patches']
     initial_conditions['n_conversion_patches'] = patch_mappings['conversion_patches']['n_patches']
-    
-    #print(f"  Restoration patches: {initial_conditions['n_restoration_patches']}")
-    #print(f"  Conversion patches: {initial_conditions['n_conversion_patches']}")
-    
-    # Calculate average pixels per patch for information
-    if initial_conditions['n_restoration_patches'] > 0:
-        avg_pixels_per_restoration_patch = (
-            initial_conditions['n_restoration_pixels'] / 
-            initial_conditions['n_restoration_patches']
-        )
-        #print(f"  Avg pixels per restoration patch: {avg_pixels_per_restoration_patch:.1f}")
-    
-    if initial_conditions['n_conversion_patches'] > 0:
-        avg_pixels_per_conversion_patch = (
-            initial_conditions['n_conversion_pixels'] / 
-            initial_conditions['n_conversion_patches']
-        )
-        #print(f"  Avg pixels per conversion patch: {avg_pixels_per_conversion_patch:.1f}")
-    
+
     return initial_conditions
 
 # --- Restoration Effect Functions ---
@@ -404,15 +346,11 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     
     # Process only objectives that are available in initial_conditions AND are
     # actual optimisation objectives. Keys loaded purely as data dependencies for
-    # computed objectives (e.g. abiotic/biotic anomaly used to build the precomputed
-    # restoration_potential_1d / landscape_context_1d arrays) are listed in
-    # _dependency_keys; their updated anomalies are never read by evaluate_raw_objectives,
-    # so skipping them here avoids full-raster copies + dilation every evaluation.
+    # computed objectives  are listed in _dependency_keys.
     _dep_only = initial_conditions.get('_dependency_keys', set())
     # restoration_benefit reads the UPDATED abiotic/biotic anomalies (incl. spillover)
     # at evaluation time, so those two must be processed even when they are loaded as
-    # data-only dependencies (kept out of objective_names). Without this they would be
-    # skipped as _dependency_keys and the benefit branch would have no updated values.
+    # data-only dependencies.
     _benefit_deps = ({'abiotic_anomaly', 'biotic_anomaly'}
                      if initial_conditions.get('restoration_benefit_enabled', False) else set())
     available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']
@@ -519,20 +457,18 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
 
 # --- Optimization Problems ---
 
-
 class RestorationProblem(ElementwiseProblem):
     """
     Multi-objective restoration optimization problem.
     """
     
-    def __init__(self, initial_conditions, scenario_params, n_jobs=None):
+    def __init__(self, initial_conditions, scenario_params):
         """
         Initialize the optimization problem.
-        
+
         Args:
             initial_conditions: Dict with initial objective states
             scenario_params: Dict with scenario parameters (e.g., max_restoration_fraction, effect_params)
-            n_jobs: Number of parallel jobs to use (None for automatic, 1 for serial, -1 for all cores)
         """
         self.initial_conditions = initial_conditions
         self.scenario_params = scenario_params
@@ -544,23 +480,26 @@ class RestorationProblem(ElementwiseProblem):
             'abiotic_effect': abiotic_effect,
             'biotic_effect': biotic_effect,
             # Neighbour spillover: restoration improves un-restored eligible neighbours
-            # within neighbor_radius, decayed by neighbor_effect_decay. Defaults preserve
-            # the previous fixed values; overridable for sensitivity / disabling (radius 0).
+            # within neighbor_radius, decayed by neighbor_effect_decay.
             'neighbor_radius': int(scenario_params.get('neighbor_radius', 3)),
             'neighbor_effect_decay': float(scenario_params.get('neighbor_effect_decay', 0.2)),
         }
 
-        # restoration_potential objective formulation (Axis 2 — uncertainty in how
+        # restoration_potential objective formulation (Axis 2 - uncertainty in how
         # the restoration target is operationalised):
-        #   'sum'       – total improvement: minimise summed baseline restoration_potential
+        #   'sum'       - total improvement: minimise summed baseline restoration_potential
         #                 over selected pixels (selects the most degraded pixels).
-        #   'threshold' – area exceeding a target: maximise the count of selected pixels
-        #                 whose post-restoration condition crosses into 'good' state
-        #                 (restoration_potential + improvement > rp_threshold).
-        # The two formulations represent alternative restoration targets over the same
-        # ecological objective; switching between them isolates the effect of objective
-        # construction on spatial priorities.
+        #   'threshold' - area exceeding a target: maximise the count of selected pixels
+        #                 whose post-restoration condition crosses into 'good' state.
+        #   'shortfall' - shortfall closure: sum the reduction in the gap between
+        #                 condition and the reference level, crediting improvement only
+        #                 up to the reference and nothing beyond it (equivalently,
+        #                 sum-gain on condition clamped at the reference).
         self.rp_formulation = str(scenario_params.get('rp_formulation', 'sum')).lower()
+        if self.rp_formulation not in ('sum', 'threshold', 'shortfall'):
+            raise ValueError(
+                f"Unknown rp_formulation: {self.rp_formulation!r}. "
+                "Use 'sum', 'threshold' or 'shortfall'.")
         self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
 
         # spatial_clustering objective metric:
@@ -579,35 +518,37 @@ class RestorationProblem(ElementwiseProblem):
         #                            approach.
         self.clustering_metric = str(scenario_params.get('clustering_metric', 'adjacency')).lower()
         # First-order per-pixel condition gain from restoration, applied to the combined
-        # (abiotic + biotic) restoration_potential score used by the threshold formulation.
+        # (abiotic + biotic) restoration_potential score used by the 'threshold' and
+        # 'shortfall' formulations. This is the NOMINAL gain: the engine's actual
+        # per-pixel improvement in restoration_effect is scaled by
+        # anomaly_improvement_weight, but both formulations use this constant.
         self.rp_improvement = 0.5 * (abiotic_effect + biotic_effect)
 
-        # Determine which objectives are available
-        self.objective_names = []
-        _dep_only = set(initial_conditions.get('_dependency_keys', set()))
-        if 'abiotic_anomaly' in initial_conditions and 'abiotic_anomaly' not in _dep_only:
-            self.objective_names.append('abiotic_anomaly')
-        if 'biotic_anomaly' in initial_conditions and 'biotic_anomaly' not in _dep_only:
-            self.objective_names.append('biotic_anomaly')
-        if 'landscape_anomaly' in initial_conditions:
-            self.objective_names.append('landscape_anomaly')
-        if 'connectivity_gain_1d' in initial_conditions:
-            self.objective_names.append('connectivity_gain')
-        if 'landscape_context_1d' in initial_conditions:
-            self.objective_names.append('landscape_context')
-        if 'restoration_potential_1d' in initial_conditions:
-            self.objective_names.append('restoration_potential')
-        if initial_conditions.get('restoration_benefit_enabled', False):
-            self.objective_names.append('restoration_benefit')
-        if initial_conditions.get('spatial_clustering_enabled', False):
-            self.objective_names.append('spatial_clustering')
-        if 'implementation_cost' in initial_conditions:
-            self.objective_names.append('implementation_cost')
-        if 'es_future_val_1d' in initial_conditions:
-            self.objective_names.append('es_future_val')
-        if 'es_future_robustness_1d' in initial_conditions:
-            self.objective_names.append('es_future_robustness')
-        
+        # Determine which objectives are available. Order here IS the objective
+        # order. A '*_enabled' key is a flag; any other key must be present in
+        # initial_conditions and not loaded data-only (see _dependency_keys).
+        _candidates = [
+            ('abiotic_anomaly',       'abiotic_anomaly'),
+            ('biotic_anomaly',        'biotic_anomaly'),
+            ('landscape_anomaly',     'landscape_anomaly'),
+            ('connectivity_gain',     'connectivity_gain_1d'),
+            ('landscape_context',     'landscape_context_1d'),
+            ('restoration_potential', 'restoration_potential_1d'),
+            ('restoration_benefit',   'restoration_benefit_enabled'),
+            ('spatial_clustering',    'spatial_clustering_enabled'),
+            ('implementation_cost',   'implementation_cost'),
+            ('es_future_val',         'es_future_val_1d'),
+            ('es_future_robustness',  'es_future_robustness_1d'),
+        ]
+        _dep_only = set(initial_conditions.get('_dependency_keys', ()))
+
+        def _available(key):
+            if key.endswith('_enabled'):
+                return bool(initial_conditions.get(key, False))
+            return key in initial_conditions and key not in _dep_only
+
+        self.objective_names = [name for name, key in _candidates if _available(key)]
+
         n_objectives = len(self.objective_names)
         if n_objectives == 0:
             raise ValueError("No objectives found in initial_conditions")
@@ -657,31 +598,14 @@ class RestorationProblem(ElementwiseProblem):
         # Next n_conversion_pixels elements = conversion decisions
         total_decision_vars = n_restoration_pixels + n_conversion_pixels
 
-        # Thread safety for shared mutable state written inside _evaluate()
-        self._eval_lock = threading.Lock()
         self.constraint_log = []
 
-        # Setup parallelization
-        elementwise_runner = None
-        if n_jobs is None or n_jobs != 1:
-            try:
-                pool = ThreadPool() if n_jobs in (None, -1) else ThreadPool(processes=n_jobs)
-                elementwise_runner = StarmapParallelization(pool.starmap)
-                print(f"Parallelization enabled with {pool._processes if hasattr(pool, '_processes') else 'auto'} threads")
-            except Exception as e:
-                print(f"Warning: Could not setup parallelization: {e}")
-                print("Falling back to sequential evaluation")
-                elementwise_runner = None
-
         # Initialize the problem
-        kwargs = dict(
+        super().__init__(
             n_var=total_decision_vars, n_obj=n_objectives,
             n_constr=(2 if self.min_patch_size > 1 else 1),
             xl=0, xu=1, type_var=int, elementwise=True,
         )
-        if elementwise_runner is not None:
-            kwargs['elementwise_runner'] = elementwise_runner
-        super().__init__(**kwargs)
 
     def _compute_normalization_denominators(self):
         """Build per-objective positive scales for objective normalization."""
@@ -857,13 +781,9 @@ class RestorationProblem(ElementwiseProblem):
                     obj_value = float(n_comp)
                 elif self.clustering_metric == 'inter_patch_adjacency':
                     # Inter-patch adjacency: orthogonal shared edges between selected
-                    # pixels that lie in DIFFERENT patches. Excludes the internal
-                    # edges guaranteed inside each fully-selected patch (4 for a 2x2
-                    # patch), so it measures how much selected patches touch each
-                    # other rather than trivial within-patch compactness. Negated so
-                    # the minimiser maximises inter-patch contact. Requires the patch
-                    # approach; without it every pixel is its own patch, so all
-                    # adjacencies are inter-patch and this reduces to full adjacency.
+                    # pixels that lie in different patches. Excludes the internal
+                    # edges guaranteed inside each fully-selected patch. Negated so
+                    # the minimiser maximises inter-patch contact. Requires the patch approach.
                     pm = self.initial_conditions.get('patch_mappings')
                     patch_grid = (pm['restoration_patches']['patch_grid']
                                   if pm is not None else None)
@@ -871,8 +791,7 @@ class RestorationProblem(ElementwiseProblem):
                         horiz = np.count_nonzero(sel_mask[:, :-1] & sel_mask[:, 1:])
                         vert = np.count_nonzero(sel_mask[:-1, :] & sel_mask[1:, :])
                     else:
-                        # Bitwise & binds tighter than !=, so parenthesise the
-                        # patch-id comparison.
+                        # Bitwise & binds tighter than !=, so parenthesise the patch-id comparison.
                         horiz = np.count_nonzero(
                             sel_mask[:, :-1] & sel_mask[:, 1:]
                             & (patch_grid[:, :-1] != patch_grid[:, 1:])
@@ -884,16 +803,13 @@ class RestorationProblem(ElementwiseProblem):
                     obj_value = -float(horiz + vert)
                 else:
                     # 'adjacency' (default): orthogonal like-adjacencies -- pairs of
-                    # selected pixels sharing an edge. More shared edges = more
-                    # compact. Negated so the pymoo minimiser maximises it. Cheap:
-                    # two boolean shift-AND reductions, no neighbourhood convolution.
+                    # selected pixels sharing an edge. Negated so the pymoo minimiser maximises it.
                     horiz = np.count_nonzero(sel_mask[:, :-1] & sel_mask[:, 1:])
                     vert = np.count_nonzero(sel_mask[:-1, :] & sel_mask[1:, :])
                     obj_value = -float(horiz + vert)
             elif obj_name == 'es_future_val':
                 # Sum of per-pixel ES performance over selected restoration pixels.
                 # Higher = greater total future ES gain → maximise (negate for pymoo minimisation).
-                # Sum (not mean) is consistent with other objectives and avoids concentration artefacts.
                 esv = self.initial_conditions['es_future_val_1d']
                 obj_value = -float(np.sum(esv[x_restore == 1]))
             elif obj_name == 'es_future_robustness':
@@ -951,16 +867,15 @@ class RestorationProblem(ElementwiseProblem):
         if self.min_patch_size > 1:
             out["G"].append(self._min_patch_size_violation(x_restore))
 
-        # Log constraint violations (thread-safe: constraint_log is shared state)
+        # Log constraint violations
         _ctypes = ['budget', 'min_patch_size']
         for i, g_val in enumerate(out["G"]):
             if g_val > 0:
-                with self._eval_lock:
-                    self.constraint_log.append({
-                        'generation': getattr(self, 'current_gen', 0),
-                        'violation_value': g_val,
-                        'constraint_type': _ctypes[i] if i < len(_ctypes) else f'constraint_{i}'
-                    })
+                self.constraint_log.append({
+                    'generation': getattr(self, 'current_gen', 0),
+                    'violation_value': g_val,
+                    'constraint_type': _ctypes[i] if i < len(_ctypes) else f'constraint_{i}'
+                })
 
     def _min_patch_size_violation(self, x_restore):
         """max(0, min_patch_size - smallest 4-connected component of the selection)."""
@@ -995,15 +910,14 @@ class PatchRestorationProblem(RestorationProblem):
     - 'pixel_count': Fixed number of pixels (variable patch count) - RECOMMENDED
     """
     
-    def __init__(self, initial_conditions, scenario_params, n_jobs=None,
+    def __init__(self, initial_conditions, scenario_params,
                  patch_constraint_type='pixel_count', pixel_tolerance=0.05):
         """
         Initialize the patch-based optimization problem.
-        
+
         Args:
             initial_conditions: Dict with initial conditions including patch_mappings
             scenario_params: Dict with scenario parameters
-            n_jobs: Number of parallel jobs to use
             patch_constraint_type: 'patch_count' or 'pixel_count'
             pixel_tolerance: Tolerance for pixel_count constraint (default 0.05 = ±5%)
         """
@@ -1024,7 +938,7 @@ class PatchRestorationProblem(RestorationProblem):
         # Initialize parent class with pixel-level information
         # This sets up all the objective functions and constraints
         # We'll override n_var after parent initialization
-        super().__init__(initial_conditions, scenario_params, n_jobs=n_jobs)
+        super().__init__(initial_conditions, scenario_params)
         
         # Override decision variable dimensions to use patches instead of pixels
         # Decision vector structure: [restoration_patches, conversion_patches]
@@ -1113,14 +1027,13 @@ class PatchRestorationProblem(RestorationProblem):
             min_pixels = int(self.target_constraint_value * (1 - evaluation_tolerance))
             max_pixels = int(self.target_constraint_value * (1 + evaluation_tolerance))
             
-            # DEBUG: Print constraint check details (thread-safe counter)
+            # DEBUG: Print constraint check details
             if not hasattr(self, '_constraint_debug_count'):
                 self._constraint_debug_count = 0
             if self._constraint_debug_count < 5:
                 #print(f"  DEBUG CONSTRAINT: target={self.target_constraint_value}, tolerance={evaluation_tolerance:.3f}, range=[{min_pixels}, {max_pixels}]")
                 #print(f"                    restore={n_restore_pixels}, convert={n_convert_pixels}, total={n_pixels_used}")
-                with self._eval_lock:
-                    self._constraint_debug_count += 1
+                self._constraint_debug_count += 1
             
             if min_pixels <= n_pixels_used <= max_pixels:
                 constraint_value = 0  # Accept as feasible
@@ -1163,7 +1076,7 @@ class PatchRestorationProblem(RestorationProblem):
 
 # --- Execution Utilities ---
 
-def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42, verbose=False, n_jobs=1):
+def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42, verbose=False):
     """
     Build a fixed hypervolume reference point using a warm up sample of solutions.
     """
@@ -1177,23 +1090,13 @@ def build_fixed_ref_point(problem, sampling, n_samples=200, margin=0.05, seed=42
         problem._evaluate(x, out)
         return out["F"]
 
-    if n_jobs != 1:
-        # scipy.ndimage.convolve releases the GIL, so threads genuinely run in
-        # parallel without pickling overhead. n_jobs=-1/None => use all cores.
-        from concurrent.futures import ThreadPoolExecutor
-        n_workers = None if n_jobs in (-1, None) else n_jobs
-        if verbose:
-            print(f"  Warm-up ref point: evaluating {X.shape[0]} samples with {n_workers or 'all'} threads...")
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            F_list = list(executor.map(_eval_one, [X[k] for k in range(X.shape[0])]))
-    else:
-        if verbose:
-            print(f"  Warm-up ref point: evaluating {X.shape[0]} samples sequentially...")
-        F_list = []
-        for k in range(X.shape[0]):
-            F_list.append(_eval_one(X[k]))
-            if verbose and (k + 1) % 10 == 0:
-                print(f"    {k + 1}/{X.shape[0]} done")
+    if verbose:
+        print(f"  Warm-up ref point: evaluating {X.shape[0]} samples sequentially...")
+    F_list = []
+    for k in range(X.shape[0]):
+        F_list.append(_eval_one(X[k]))
+        if verbose and (k + 1) % 10 == 0:
+            print(f"    {k + 1}/{X.shape[0]} done")
 
     Fw = np.asarray(F_list, dtype=float)
 
@@ -1341,12 +1244,8 @@ class HVCallback:
 
 class ProgressCallback:
     """
-    Progress reporting callback for NSGA-II optimization.
-
     Reports generation progress and delegates hypervolume tracking to
-    HVCallback.  Constructed with explicit parameters rather than relying
-    on closed-over variables so it can be instantiated cleanly outside
-    the optimization runner.
+    HVCallback.
     """
 
     def __init__(self, verbose=True, n_generations=100,
@@ -1432,9 +1331,7 @@ def _filter_initial_conditions_for_return(initial_conditions):
 
     return initial_conditions_filtered
 
-
 # --- Optimization Run Helpers ---
-
 
 class SingleObjectiveView(ElementwiseProblem):
     """Expose ONE objective of a multi-objective RestorationProblem as n_obj=1.
@@ -1640,11 +1537,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
         # vectors, so cost-axis individuals get repaired toward cheap patches,
         # abiotic-axis individuals toward high-abiotic patches, etc.
         # Map internal objective names -> per-pixel score keys (shared helper).
-        # Objectives WITHOUT a meaningful per-patch score (e.g. spatial_clustering,
-        # which is configuration-level) are intentionally absent. They get no
-        # warm-seed and are excluded from direction-aware repair blending via
-        # _score_obj_indices - never given a placeholder score, which would
-        # otherwise collapse argsort-based seeding to raster scan order.
+        # Objectives WITHOUT a meaningful per-patch score (e.g. spatial_clustering) 
+        # are intentionally absent - no warm-seed or direction-aware repair possible.
         per_obj_pixel_scores, _score_keys, _score_obj_indices = _map_objectives_to_pixel_scores(
             problem, initial_conditions, scenario_params)
         per_obj_patch_scores = np.stack([
@@ -1712,7 +1606,7 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
 
         if sampling_strategy in ('region_grow', 'region_evolve'):
             # Region operators build contiguous, arbitrary-shape regions so the search
-            # can reach clustered (non-scattered) plans where cost and spatial_clustering
+            # can reach clustered plans where cost and spatial_clustering
             # actually vary. region_evolve additionally makes the SEARCH explore the
             # landscape (relocate/spawn/swap whole regions) instead of collapsing onto
             # one basin. See [[hv-stagnation-flat-objectives]].
@@ -1835,17 +1729,11 @@ def _build_algorithm(problem, sampling, repair, n_generations, n_partitions=8,
     Construct the multi-objective algorithm and generation-based termination.
 
     algorithm_type:
-      "nsga3" (default) - NSGA-III with structured reference directions
-                          (Das-Dennis simplex lattice) instead of crowding
-                          distance. Restores selection pressure in 3-objective
-                          space where NSGA-II degenerates because nearly all
-                          solutions end up on rank 0. Population size equals the
-                          number of reference directions (n_partitions=12, 3 obj
-                          -> 45 ref dirs -> pop 45).
+      "nsga3" (default) - NSGA-III - best for 3-objective space. Population size 
+                          equals the number of reference directions (n_partitions=12, 
+                          3 obj -> 45 ref dirs -> pop 45).
       "nsga2"           - classic NSGA-II with explicit pop_size and crowding
-                          distance. Appropriate for 2-objective problems where
-                          the Pareto front is a curve and crowding distance
-                          preserves diversity well. Uses pop_size directly.
+                          distance. Appropriate for 2-objective problems.
 
     Returns
     -------
@@ -2094,8 +1982,8 @@ def _print_failure_diagnostics(result, problem, initial_conditions):
 
 def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      n_generations=100, save_results=True, verbose=True,
-                                     skip_diagnostics=False, hv_patience=25,
-                                     hv_min_improvement=1e-6, n_jobs=None, use_repair=True,
+                                     skip_diagnostics=False, hv_patience=15,
+                                     hv_min_improvement=1e-6, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
                                      output_dir=str(OUTPUT_DIR), save_snapshots=False,
@@ -2118,7 +2006,6 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         skip_diagnostics: Skip optimization setup diagnostics
         hv_patience: Generations to wait for hypervolume improvement before stopping
         hv_min_improvement: Minimum hypervolume improvement to reset patience counter
-        n_jobs: Number of parallel jobs (None = use all cores)
         use_repair: Whether to use repair operator for constraints
         random_seed: Random seed for reproducibility
         use_patch_approach: Use patch-based optimization instead of pixel-based
@@ -2178,7 +2065,6 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         problem = PatchRestorationProblem(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
-            n_jobs=n_jobs,
             patch_constraint_type=patch_constraint_type,
             pixel_tolerance=pixel_tolerance,
         )
@@ -2186,7 +2072,6 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         problem = RestorationProblem(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
-            n_jobs=n_jobs,
         )
 
     # --- 4. Print problem details ---
@@ -2200,14 +2085,12 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                 val = np.sum(initial_conditions[obj_name])
                 sample_obj_str += f"{obj_name}={val:.2e}, "
         print(sample_obj_str.rstrip(", "))
-        if problem.max_action_pixels == 0:
-            print("  WARNING: max_action_pixels is 0! No actions possible.")
         if not skip_diagnostics:
-            from debug_utils import diagnose_optimization_setup
+            from .debug_utils import diagnose_optimization_setup
             from .logger_setup import setup_logger
             setup_logger()  # no-op if already configured by the entry-point script
             diagnose_optimization_setup(initial_conditions, scenario_params, n_samples=10)
-            print("✓ Optimisation setup verified.")
+            print("[OK] Optimisation setup verified.")
 
     # --- 5. Build operators ---
     # Each run captures into its own subfolder so pixel/patch runs (different
@@ -2252,7 +2135,6 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     fixed_ref = build_fixed_ref_point(
         problem=problem, sampling=sampling,
         n_samples=hv_warmup_samples, margin=0.05, seed=42, verbose=verbose,
-        n_jobs=n_jobs,
     )
 
     # --- 7. Build algorithm ---
@@ -2325,7 +2207,6 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         if verbose:
             print(f"✗ Error during optimization: {e}")
         return None
-
 
 # --- Main ---
 

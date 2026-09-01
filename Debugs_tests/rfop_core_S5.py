@@ -175,7 +175,7 @@ def _initsens_run_sweep(ic, pop_size, n_generations, shares, seeds, smoke):
                 run_optimization_instance(
                     initial_conditions=ic, scenario_params=params,
                     pop_size=pop_size, n_generations=n_generations,
-                    save_results=(not smoke), verbose=True, n_jobs=12,
+                    save_results=(not smoke), verbose=True,
                     random_seed=seed, use_repair=True, use_patch_approach=False,
                     pixel_tolerance=0.05, algorithm_type="nsga2", run_label=run_label,
                 )
@@ -270,7 +270,7 @@ def _neut_run_sweep(ic, pop_size, n_generations, seeds, smoke):
                 run_optimization_instance(
                     initial_conditions=ic, scenario_params=params,
                     pop_size=pop_size, n_generations=n_generations,
-                    save_results=(not smoke), verbose=True, n_jobs=12,
+                    save_results=(not smoke), verbose=True,
                     random_seed=seed, use_repair=True, use_patch_approach=False,
                     pixel_tolerance=0.05, algorithm_type="nsga2", run_label=run_label,
                 )
