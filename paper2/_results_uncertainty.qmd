@@ -1,0 +1,563 @@
+
+<!--
+  Robustness of the restoration plans to the choice of condition indicators.
+
+  EVERY number and figure in this section comes from Core_optimisation/uncertainty_analysis.py.
+  Nothing is recomputed here: the stages write their headline numbers to
+  outputs/uncertainty/report.json (one key per stage) and this document reads them.
+  To refresh the section after new runs:
+
+    pixi run python -m Core_optimisation.uncertainty_analysis all
+    rm -r paper2/_freeze/index     # freeze keys on the .qmd, never on the data it reads
+    quarto render paper2
+
+  The freeze folder is named after the rendered document (index.qmd), not after this
+  include. Deleting it re-executes the WHOLE manuscript, including the python chunks of
+  _restmoo_methods.qmd, which need the reticulate R package installed.
+
+  Individual stages can be re-run on the cached archive (noise, cross, classify, maps);
+  only `extract` re-reads the raw pkls. SET THE PATHS IN THE config-unc CHUNK, which
+  lives with the rest of the uncertainty machinery in the methods section
+  (_methods.qmd, "Uncertainty analysis") because the design paragraph there quotes the
+  same numbers.
+-->
+
+```{r}
+#| label: setup-unc
+#| include: false
+
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(tidyr); library(readr)
+  library(jsonlite); library(knitr); library(terra); library(patchwork)
+  library(ggforce)   # geom_sina, for the regret panel of fig-unc-noise
+})
+# Matches the theme set in Documentation/_plot_functions.R, which the baseline
+# section sources; not sourced here because only the theme and BE are needed.
+theme_set(theme_minimal(base_size = 11))
+
+# UNC_DIR, .p/.u, RPT, CFG, the .g/.gn accessors, the .n/.pc/.f formatters, .need_stages
+# and the N_* counts are defined in the uncertainty section of _methods.qmd, which
+# index.qmd includes before this file.
+if (!exists("RPT"))
+  stop("RPT not found - the setup-unc-shared chunk of _methods.qmd must run first.")
+.need_stages("noise", "cross", "discrim", "interact", "classify", "maps")
+
+# Re-assert the formatters defined in _methods.qmd. `_results_baseline.qmd` is included
+# between that file and this one and defines its own `.pc` at top level inside the
+# tbl-front-curvature chunk (`function(x) sprintf("%.1f", x)`); knitr chunks share one
+# environment, so that definition shadows the one this section needs. Without this block
+# every `.pc()` here silently loses the x100 and the "%" - 0.273 renders as "0.3" instead
+# of "27.3%" - and any two-argument call errors out. Fixing it here rather than renaming
+# in the baseline section keeps that section's own numbers untouched.
+.n   <- function(v, d = 0) unname(format(round(v, d), big.mark = ",", trim = TRUE))
+.pc  <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+.f   <- function(v, d = 3) sprintf(paste0("%.", d, "f"), v)
+
+.pmath <- function(p) {
+  if (!is.finite(p) || p <= 0) return("$p < 10^{-300}$")
+  e <- floor(log10(p))
+  if (e >= -3) sprintf("$p = %.3g$", p)
+  else sprintf("$p = %.1f \\times 10^{%d}$", p / 10^e, e)
+}
+# Condition tag -> indicator code. Tags follow the "{scaling}_{construction}" grammar of
+# data/ec_anomalies.r, where the construction is either a leave-one-out ("drop_smd") or a
+# weighting vertex ("w_smd"); "global_all" and "upper_q75_all" carry no indicator. Also
+# accepts a bare construction level ("drop_smd"), which is how interaction.csv stores it.
+.ind  <- function(tag) sub("^(drop|w)_", "",
+                           sub("^(global|upper_q[0-9]+)_", "", tag))
+# The perturbation a tag applies to that indicator, for tables that mix the two families.
+.pert <- function(tag) ifelse(grepl("_drop_|^drop_", tag), "dropped",
+                       ifelse(grepl("_w_|^w_", tag), "up-weighted", "none"))
+# The benchmark scaling level a tag was built at.
+.scal <- function(tag) ifelse(grepl("^upper_q[0-9]+_", tag),
+                              sub("^(upper_q[0-9]+)_.*$", "\\1", tag),
+                              sub("^([^_]+)_.*$", "\\1", tag))
+.lab  <- function(tag) unname(ifelse(is.na(IND_LABELS[.ind(tag)]), .ind(tag),
+                                     IND_LABELS[.ind(tag)]))
+.comp <- function(tag) unname(IND_COMPONENT[.ind(tag)])
+# Which axis a tag departs the reference on, as classify recorded it.
+.axlab <- function(a) unname(ifelse(is.na(AXIS_LABELS[a]), a, AXIS_LABELS[a]))
+# A run grid, named by the axes it varies (CFG$campaigns is the python module's own
+# grouping). Nothing in this section shows a grid name: a grid is only ever a set of
+# axes, so it is written as one.
+.gridlab <- function(cn) vapply(cn, function(k)
+  paste(.axlab(unlist(CFG$campaigns[[k]]$axes)), collapse = " x "), character(1))
+
+# The classify stage's block, bound here rather than at its first table: the prose above
+# tbl-unc-robust quotes it inline, and inline code runs before the chunk that follows it.
+CL <- RPT$classify
+# "median [q25-q75]" for one of classify's cost blocks, which are written as
+# {median, q25, q75}. Used for both cost distributions of tbl-unc-robust.
+.iqr <- function(key, d = 0) {
+  b <- .g(CL, key)
+  sprintf("%s [%s-%s]", .n(b$median, d), .n(b$q25, d), .n(b$q75, d))
+}
+
+NOISE_AX  <- readr::read_csv(.u("noise_by_axis.csv"), show_col_types = FALSE)
+NOISE_REG <- readr::read_csv(.u("noise_regret.csv"), show_col_types = FALSE)
+NOISE_JAC <- readr::read_csv(.u("noise_jaccard.csv"), show_col_types = FALSE)
+DISCRIM   <- readr::read_csv(.u("discriminability.csv"), show_col_types = FALSE)
+INTERACT  <- readr::read_csv(.u("interaction.csv"), show_col_types = FALSE)
+PLANS     <- readr::read_csv(.u("plan_summary.csv"), show_col_types = FALSE)
+
+# One colour per axis, with the two seed floors deliberately grey: they are the
+# yardstick, not a finding. Order is the reading order of the tables below.
+AX_ORDER <- c("seed", "seed_pooled_halves", "construction", "scaling", "weighting")
+AX_COLS  <- c(seed = "grey45", seed_pooled_halves = "grey25",
+              construction = "#E05C2A", scaling = "#2A6FE0", weighting = "#1F9E5A")
+.axfac <- function(a) factor(.axlab(a), levels = .axlab(AX_ORDER))
+# The regret panel has no pooled-halves row (regret is measured per plan, not per core).
+REG_ORDER <- setdiff(AX_ORDER, "seed_pooled_halves")
+# The Jaccard panel drops the single-run seed row: it is not on the same footing as the
+# axis rows, which pool five seeds per variant. `seed_pooled_halves` is its matched floor.
+JAC_ORDER <- setdiff(AX_ORDER, "seed")
+```
+
+#### Deviation by formulation axis
+
+Caveat to the below figures: the weighting axis has a higher number of variations, so a larger difference is to be expected to an extent. Comparison to baseline & search stochasticity still valid.
+
+```{r}
+#| label: fig-unc-noise
+#| fig-cap: "(a) Cost-matched benefit regret by formulation axis, bar represents the median. (b) Core-selection Jaccard by formulation axis, five seeds pooled per variant."
+#| fig-width: 8.4
+#| fig-height: 3.4
+
+p_reg <- NOISE_REG |>
+  filter(axis %in% REG_ORDER) |>
+  mutate(ax = .axfac(axis)) |>
+  ggplot(aes(ax, regret, colour = ax)) +
+  geom_sina(scale = "width", maxwidth = 0.8, size = 0.15, alpha = 0.12, stroke = 0) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.45, linewidth = 0.3,
+               colour = "black") +
+  scale_colour_manual(values = setNames(unname(AX_COLS), .axlab(names(AX_COLS))),
+                      guide = "none", drop = TRUE) +
+  scale_x_discrete(labels = function(z) sub(" \\(", "\n(", z)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Cost-matched benefit regret") +
+  expand_limits(y = 0) +
+  theme(axis.text.x = element_text(size = 7))
+
+p_jac <- NOISE_JAC |>
+  filter(comparison %in% JAC_ORDER) |>
+  mutate(ax = .axfac(comparison)) |>
+  ggplot(aes(ax, jaccard, fill = ax)) +
+  geom_boxplot(width = 0.55, outlier.size = 0.6, outlier.alpha = 0.4) +
+  scale_fill_manual(values = setNames(unname(AX_COLS), .axlab(names(AX_COLS))),
+                    guide = "none", drop = TRUE) +
+  scale_x_discrete(labels = function(z) sub(" \\(", "\n(", z)) +
+  labs(x = NULL, y = "Spatial similarity (Jaccard index)") +
+  expand_limits(y = c(0, 1)) +
+  theme(axis.text.x = element_text(size = 7))
+
+p_reg + p_jac + plot_layout(widths = c(1.35, 1)) +
+  plot_annotation(tag_levels = "a")
+```
+
+```{r}
+#| label: tbl-unc-axis-binding
+#| tbl-cap: "The same worst cases grouped by the axis the binding variant departs the reference on. Every departure classify ranked against gets a row, so an axis that was searched and never bound reads as zero rather than going missing."
+
+AXW <- .g(CL, "worst_axis_counts")
+# Share denominator: the archive classify ranked.
+N_PLANS <- .gn(CL, "n_plans")
+# `worst_axis_counts` holds only the axes that actually won a row-wise max, so an axis
+# searched and never binding would drop out of the table entirely and read as untested -
+# which is the opposite of what it means. The row set therefore comes from
+# `regret_by_variant`, one entry per variant classify ranked against, i.e. every departure
+# that COULD have bound; the counts are joined onto it, zero where the axis never won.
+AX_ALL <- unique(vapply(.g(CL, "regret_by_variant"), `[[`, "", "axes"))
+# `[[` on a name absent from AXW errors when the JSON object simplified to a named atomic
+# vector and returns NULL when it stayed a list; guard on names() instead, which is the
+# same for both.
+.axn <- function(a) if (a %in% names(AXW)) as.numeric(AXW[[a]]) else 0
+# A variant may depart on more than one axis at once ("scaling+construction"), which
+# `_axes_departed` writes as a "+"-joined key; label each part so the composite rows read
+# like the single-axis ones.
+.axlab_key <- function(k) vapply(strsplit(k, "+", fixed = TRUE),
+                                 function(p) paste(.axlab(p), collapse = " + "), "")
+tibble::tibble(Axis = union(AX_ALL, names(AXW))) |>
+  mutate(n = vapply(Axis, .axn, 0),
+         Share = .pc(n / N_PLANS),
+         Axis = .axlab_key(Axis)) |>
+  arrange(desc(n), Axis) |>
+  select(Axis, Plans = n, Share) |>
+  kable(align = "lrr")
+```
+
+## Robustness
+
+Ranking the archive by worst-case regret and keeping the bottom
+`r .pc(.gn(CL, "robust_quantile"), 0)` gives `r .n(.gn(CL, "n_robust"))` robust plans, at a
+regret cutoff of `r .pc(.gn(CL, "cutoff"))`.
+
+```{r}
+#| label: tbl-unc-robust
+#| tbl-cap: "Details of full archive and robust subset."
+
+tibble::tibble(
+  Quantity = c("Plans", "Cost: median [IQR]", "Plan size (cells): median",
+               "Cells ever selected",
+               sprintf("Core cells (freq >= %s)", .pc(CFG$core_freq, 0))),
+  `Full archive` = c(.n(.gn(CL, "n_plans")), .iqr("cost_full"),
+                     .n(.gn(CL, "n_cells_full_median")),
+                     .n(.gn(RPT, "maps", "cells_selected_full")),
+                     .n(.gn(RPT, "maps", "core_full"))),
+  `Robust subset` = c(.n(.gn(CL, "n_robust")), .iqr("cost_robust"),
+                      .n(.gn(CL, "n_cells_robust_median")),
+                      .n(.gn(RPT, "maps", "cells_selected_robust")),
+                      .n(.gn(RPT, "maps", "core_robust")))) |>
+  kable(align = "lrr")
+```
+
+```{r}
+#| label: tbl-unc-composition
+#| tbl-cap: "Share of the pooled archive and of the robust subset contributed by the runs of each set of axes, and by the individual levels of the two crossed axes."
+
+COMP <- .g(CL, "composition")
+# Written by the same `classify` stage as `composition`: {campaign: {axis: {levels:
+# {level: shares}}}}, with the campaign's OTHER axes held at their reference.
+if (is.null(CL$composition_by_axis))
+  stop("report.json has no classify$composition_by_axis - it predates the per-axis ",
+       "composition block. Re-run:\n",
+       "  pixi run python -m Core_optimisation.uncertainty_analysis classify")
+CAXIS <- .g(CL, "composition_by_axis")
+
+# Construction levels are indicator codes ("drop_smd"); every other axis's levels are
+# already the names used elsewhere in this section and are left as written on disk.
+.levlab <- function(axis, lvl) {
+  if (axis != "construction") return(lvl)
+  ifelse(lvl == "all", "none (all indicators)", .lab(lvl))
+}
+.comp_row <- function(runs, level, n, sf, sr)
+  tibble::tibble(Runs = runs, Level = level, `Plans in archive` = .n(n),
+                 `Share of archive` = .pc(sf), `Share of robust` = .pc(sr))
+
+GRID_ROWS <- bind_rows(lapply(names(COMP), function(k)
+  .comp_row(.gridlab(k), "all levels", .gn(COMP, k, "n_full"),
+            .gn(COMP, k, "share_full"), .gn(COMP, k, "share_robust"))))
+
+# Only campaigns varying more than one axis get level rows. With a single axis there is
+# no other axis to hold, so the "levels" block is just that campaign's own levels split
+# out - 26 rows for the weighting family, and none of them a conditional statement.
+AXIS_ROWS <- bind_rows(lapply(names(CAXIS), function(k) {
+  camp <- CFG$campaigns[[k]]
+  if (length(unlist(camp$axes)) < 2) return(NULL)
+  # The campaign's own axis order, not report.json's (it is written sort_keys=True).
+  bind_rows(lapply(intersect(as.character(unlist(camp$axes)), names(CAXIS[[k]])),
+                   function(a) {
+    blk  <- CAXIS[[k]][[a]]
+    lv   <- blk$levels
+    # Configured level order (levels are listed in reference-first, indicator order),
+    # with anything the archive carries but `expect` does not appended rather than lost.
+    ord  <- as.character(unlist(camp$levels[[a]]))
+    ord  <- c(intersect(ord, names(lv)), setdiff(names(lv), ord))
+    held <- blk$held_at
+    rows <- bind_rows(lapply(ord, function(l)
+      .comp_row("", .levlab(a, l), .gn(lv, l, "n_full"),
+                .gn(lv, l, "share_full"), .gn(lv, l, "share_robust"))))
+    # The conditioning is stated once, on the block's first row.
+    rows$Runs[1] <- sprintf("%s (%s)", .axlab(a),
+                            paste(sprintf("%s = %s", .axlab(names(held)),
+                                          unlist(held)), collapse = ", "))
+    rows
+  }))
+}))
+
+bind_rows(GRID_ROWS, AXIS_ROWS) |>
+  kable(align = "llrrr")
+```
+
+```{r}
+#| label: fig-unc-maps
+#| fig-cap: "Selection frequency across the pooled archive (a) and across the robustness-filtered subset (b), with their difference (c)."
+#| fig-width: 10
+#| fig-height: 4.6
+
+if (!exists("BE")) BE <- readRDS(.p("Documentation/BE_bern.rds"))
+
+# maps writes one GeoTIFF per layer on the run's own grid (EPSG:2056, 100 m), NaN
+# outside the eligible footprint; trim() crops the all-NA margin off that footprint.
+R_FREQ <- c(terra::rast(.u("freq_full.tif")), terra::rast(.u("freq_robust.tif")),
+            terra::rast(.u("delta_frequency.tif")))
+names(R_FREQ) <- c("full", "robust", "delta")
+MAP_DF <- as.data.frame(terra::trim(R_FREQ), xy = TRUE, na.rm = TRUE)
+
+# The legend theme is set per panel rather than with patchwork's `&`, which does not
+# dispatch against ggplot2 4.x S7 theme objects.
+.base <- function(p) p +
+  geom_sf(data = BE, fill = NA, colour = "black", linewidth = 0.2, inherit.aes = FALSE) +
+  coord_sf(datum = NA) +
+  theme_void(base_size = 10) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        legend.position = "bottom", legend.box = "horizontal",
+        legend.key.height = unit(2.6, "mm"), legend.key.width = unit(20, "mm"),
+        legend.title = element_text(size = 9), legend.text = element_text(size = 8))
+
+# Panels a and b carry an identical fill scale, so patchwork's guide collection below
+# merges them into one key; c keeps its own diverging bar.
+.bar <- guide_colourbar(title.position = "top", title.hjust = 0.5, order = 1)
+vmax <- max(MAP_DF$full, MAP_DF$robust)
+dmax <- max(abs(MAP_DF$delta))
+.freq_panel <- function(col, title) .base(
+  ggplot(MAP_DF, aes(x, y, fill = .data[[col]])) + geom_raster() +
+    scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, vmax),
+                         labels = scales::percent, name = "Selection frequency",
+                         guide = .bar) +
+    ggtitle(title))
+
+p_a <- .freq_panel("full", sprintf("Full archive (n = %s)", .n(.gn(CL, "n_plans"))))
+p_b <- .freq_panel("robust", sprintf("Robust subset (n = %s)", .n(.gn(CL, "n_robust"))))
+p_c <- .base(
+  ggplot(MAP_DF, aes(x, y, fill = delta)) + geom_raster() +
+    scale_fill_gradient2(low = "#2A5BE0", mid = "grey95", high = "#B02A2A",
+                         midpoint = 0, limits = c(-dmax, dmax),
+                         labels = scales::percent, name = "Change in frequency",
+                         guide = guide_colourbar(title.position = "top",
+                                                 title.hjust = 0.5, order = 2)) +
+    ggtitle("Difference (robust - full)"))
+
+# guides = "collect" merges a's and b's identical frequency bar into one key; the
+# collected guide box is positioned by the patchwork's own theme, set here (rather
+# than with `&`, which ggplot2 4.x S7 themes do not dispatch on).
+p_a + p_b + p_c + plot_layout(nrow = 1, guides = "collect") +
+  plot_annotation(tag_levels = "a",
+                  theme = theme(legend.position = "bottom",
+                                legend.box = "horizontal",
+                                legend.justification = "center"))
+```
+
+```{r}
+#| label: unc-characteristics
+#| include: false
+
+# MAP_DF is built by fig-unc-maps above: one row per eligible cell (non-NaN in
+# freq_full.tif, i.e. the union of the per-variant eligible masks), with that cell's
+# selection frequency over the full archive and over the robust subset.
+if (!exists("MAP_DF"))
+  stop("MAP_DF not found - the fig-unc-maps chunk must run before this one.")
+
+# reclass_lulc() lives in the plotting library the baseline section sources. This
+# section is otherwise independent of that one, so it is pulled in only if absent.
+if (!exists("reclass_lulc")) source(.p("Documentation/_plot_functions.R"))
+
+# The panels below read the REFERENCE variant's layers
+UNC_REF     <- .g(CFG, "campaigns", "benchmark_x_construction", "reference")
+UNC_REF_TAG <- paste(UNC_REF$scaling, UNC_REF$construction, sep = "_")
+UNC_LAYERS  <- c(
+  `Abiotic anomaly`     = file.path("data/anomaly_scenarios",
+                                    paste0("abiotic_", UNC_REF_TAG, ".tif")),
+  `Biotic anomaly`      = file.path("data/anomaly_scenarios",
+                                    paste0("biotic_", UNC_REF_TAG, ".tif")),
+  `Implementation cost` = "data/implementation_cost_corrected.tif")
+UNC_LULC_RASTER <- "data/ecosystem_lulc_masked.tif"
+
+.miss <- c(UNC_LAYERS, UNC_LULC_RASTER)[!file.exists(.p(c(UNC_LAYERS, UNC_LULC_RASTER)))]
+if (length(.miss))
+  stop("Missing raster(s) for the characteristics figures: ",
+       paste(.miss, collapse = ", "))
+
+UNC_N_SAMPLE <- 1.5e5   # cap on cells carried into the density figure
+
+.freq_breaks <- function(f) {
+  s <- f[f > 0]
+  if (!length(s))
+    stop("No cell is ever selected on this frequency surface.")
+  brk <- unique(unname(stats::quantile(s, c(0, 0.25, 0.5, 0.75, 1), type = 1)))
+  if (length(brk) < 2L)
+    stop("Every selected cell has the same selection frequency; no quartiles exist.")
+  if (length(brk) < 5L)
+    warning("Selection-frequency ties collapse the quartile breaks: ",
+            length(brk) - 1L, " groups instead of 4.")
+  brk
+}
+.freq_class <- function(f, brk) {
+  out <- factor(rep(NA_character_, length(f)),
+                levels = paste0("Q", seq_len(length(brk) - 1L)))
+  sel <- f > 0
+  out[sel] <- paste0("Q", as.integer(cut(f[sel], breaks = brk, include.lowest = TRUE)))
+  out
+}
+
+UNC_FREQ  <- c(`Full archive` = "full", `Robust subset` = "robust")
+UNC_BRK   <- lapply(UNC_FREQ, function(col) .freq_breaks(MAP_DF[[col]]))
+UNC_CELLS <- bind_cols(
+  MAP_DF[, c("x", "y")],
+  as.data.frame(lapply(names(UNC_FREQ), function(nm)
+    .freq_class(MAP_DF[[UNC_FREQ[[nm]]]], UNC_BRK[[nm]])),
+    col.names = names(UNC_FREQ), check.names = FALSE))
+
+# Quartile colours are the baseline section's ramp, so "darker = selected more often"
+# means the same thing in @fig-distributions and here.
+UNC_SETS <- c("Eligible",
+              paste0("Q", seq_len(max(vapply(UNC_BRK, length, 0L)) - 1L)))
+UNC_PAL  <- c(Eligible = "grey55",
+              setNames(colorRampPalette(c("#FEB24C", "#FD8D3C", "#E31A1C",
+                                          "#800026"))(length(UNC_SETS) - 1L),
+                       UNC_SETS[-1]))
+
+# -- Layer values at every eligible cell -------------------------------------
+UNC_XY  <- as.matrix(UNC_CELLS[, c("x", "y")])
+UNC_LYR <- tibble::as_tibble(lapply(UNC_LAYERS, function(path)
+  terra::extract(terra::rast(.p(path)), UNC_XY)[, 1]))
+
+UNC_VALS <- local({
+  set.seed(1)
+  i <- if (nrow(UNC_CELLS) > UNC_N_SAMPLE)
+    sort(sample.int(nrow(UNC_CELLS), UNC_N_SAMPLE)) else seq_len(nrow(UNC_CELLS))
+  lyr <- UNC_LYR[i, ]
+  bind_rows(lapply(names(UNC_FREQ), function(nm) {
+    q <- UNC_CELLS[[nm]][i]
+    # The eligible footprint is the same in both rows of the figure; it is repeated
+    # per row so each surface is read against it without crossing panels.
+    bind_rows(mutate(lyr, Archive = nm, Set = "Eligible"),
+              mutate(lyr[!is.na(q), ], Archive = nm,
+                     Set = as.character(q[!is.na(q)])))
+  })) |>
+    tidyr::pivot_longer(all_of(names(UNC_LAYERS)),
+                        names_to = "Layer", values_to = "value") |>
+    filter(is.finite(value)) |>
+    mutate(Layer   = factor(Layer, levels = names(UNC_LAYERS)),
+           Archive = factor(Archive, levels = names(UNC_FREQ)),
+           Set     = factor(Set, levels = UNC_SETS))
+})
+
+# Shares are counts, so they run on every eligible cell rather than on the sample.
+UNC_LULC <- local({
+  cls <- reclass_lulc(terra::extract(terra::rast(.p(UNC_LULC_RASTER)), UNC_XY)[, 1])
+  cls <- factor(ifelse(is.na(cls), "Unclassified", as.character(cls)),
+                levels = c(levels(cls), "Unclassified"))
+  bind_rows(lapply(names(UNC_FREQ), function(nm) {
+    q <- UNC_CELLS[[nm]]
+    bind_rows(tibble::tibble(Archive = nm, Set = "Eligible", Class = cls),
+              tibble::tibble(Archive = nm, Set = as.character(q[!is.na(q)]),
+                             Class = cls[!is.na(q)]))
+  })) |>
+    mutate(Archive = factor(Archive, levels = names(UNC_FREQ)),
+           Set     = factor(Set, levels = UNC_SETS)) |>
+    count(Archive, Set, Class, .drop = FALSE) |>
+    group_by(Archive, Set) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    # An empty "Unclassified" bar is noise; every other class stays even at 0.
+    filter(Class != "Unclassified" | any(n[Class == "Unclassified"] > 0))
+})
+```
+
+```{r}
+#| label: fig-unc-characteristics
+#| fig-cap: "Distributions of the two condition layers and of cost over the eligible footprint and over the selected cells."
+#| fig-width: 8.4
+#| fig-height: 5.2
+
+# Each curve is scaled to its own peak rather than drawn as a probability density.
+# The panels are here to be compared by SHAPE, and a density integrates to 1 over x:
+# cost is normalised to 0-0.93 while the anomalies span roughly -2.5 to 5, so the same
+# mass makes the cost curves ~6x taller and the rows unreadable against each other.
+# The cost of the rescaling is that height no longer carries mass - a Q4 curve peaking
+# at 1 does not mean Q4 is as numerous as the eligible footprint - so the panels say
+# where a set sits on each layer, not how much of it there is.
+ggplot(UNC_VALS, aes(value, after_stat(scaled), colour = Set)) +
+  geom_density(data = ~ filter(.x, Set == "Eligible"), aes(fill = Set),
+               alpha = 0.35, linewidth = 0.3) +
+  geom_density(data = ~ filter(.x, Set != "Eligible"), fill = NA, linewidth = 0.6) +
+  # y is now common to every panel (0-1 by construction), so only x is freed.
+  facet_wrap(vars(Layer, Archive), scales = "free_x", ncol = 2) +
+  scale_fill_manual(values = UNC_PAL, guide = "none") +
+  scale_colour_manual(values = UNC_PAL, drop = FALSE, name = "Selection\nfrequency") +
+  labs(x = NULL, y = "Density (scaled to peak)")
+```
+
+```{r}
+#| label: fig-unc-lulc
+#| fig-cap: "Land-use composition of the eligible footprint and of the selected cells of each frequency surface, by quartile of that surface's own selection frequency. ."
+#| fig-width: 9
+#| fig-height: 4.2
+
+# Same ecosystem-type colours as @fig-lulc-selected and the land-use maps of this
+# project (Documentation/produce_figures.R, Documentation/map_bern_landuse.R).
+UNC_LULC_PAL <- c(`Forest`                = "#1B7837",
+                  `Pastures & grasslands` = "#A6D96A",
+                  `Agricultural land`     = "#E9C46A",
+                  `Unclassified`          = "grey70")
+
+ggplot(UNC_LULC, aes(Set, pct, fill = Class)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.74) +
+  facet_wrap(~Archive, ncol=1) +
+  scale_fill_manual(values = UNC_LULC_PAL, name = "Ecosystem type") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Selection frequency quartile", y = "Share of cells (%)")
+```
+
+## Robustness to LULC scenarios
+
+Using the scenarios run for Bern Landscape Change Explorer and investigating the persistence of LULC class in areas selected for restoration. No plans 'survive' completely (i.e. all plans have at least one cell that changes class)
+
+```{r}
+#| label: setup-unc-scenario
+#| include: false
+
+# Written by Debugs_tests/scenario_eligibility.py, which is downstream of this module's
+# `maps` stage: it takes the plans out of outputs/uncertainty/archive.npz and asks how
+# many of each plan's selected cells still carry their 2018 land-cover class under the
+# Kanton Bern LULC projections (Y:/.../05_Web_platform/raster_data) out to 2060.
+# Eligibility here is STRICT - lulc_t == lulc_2018, the baseline being the same
+# LULC_2018_agg.tif that defines restoration_eligible_mask in the optimisation itself.
+# The scan covers the full scenario cross-product: 3 climate x 5 economic x
+# 3 demographic x 5 land-use = 225 combinations at 9 time steps.
+.scen_csv <- .u("scenario_eligibility.csv")
+if (!file.exists(.scen_csv))
+  stop("scenario_eligibility.csv not found - run:\n",
+       "  pixi run python Debugs_tests/scenario_eligibility.py")
+
+SCEN <- readr::read_csv(.scen_csv, show_col_types = FALSE)
+
+# Existence is not enough: a CSV written before the per-plan loss distribution was
+# added to scenario_eligibility.py carries only the two *_mean columns, and the
+# missing lost_p* only surfaces as an opaque "object 'lost_p50' not found" inside
+# the dplyr call further down. Name the real problem here instead.
+local({
+  need <- c("landuse", "climate", "economic", "demographic", "year", "group",
+            "strict_mean", "classset_mean", "lost_p10", "lost_p50", "lost_p90")
+  miss <- setdiff(need, names(SCEN))
+  if (length(miss))
+    stop("scenario_eligibility.csv is missing: ", paste(miss, collapse = ", "),
+         "\nIt predates the current Debugs_tests/scenario_eligibility.py; re-scan:\n",
+         "  pixi run python Debugs_tests/scenario_eligibility.py")
+})
+
+# The land-use scenario codes are the projections' own (field 6 of the raster filename
+# grammar); only "bau" has an unambiguous expansion in the source readme, so the codes
+# are left as they are written on disk rather than glossed here.
+SCEN_PAL <- c(bau    = "grey30",   ei_cul = "#E05C2A", ei_nat = "#1F9E5A",
+              ei_soc = "#2A6FE0",  gr_ex  = "#8E44AD")
+
+SCEN_LOST <- SCEN |>
+  filter(group %in% c("robust", "nonrobust"), !is.na(lost_p50)) |>
+  group_by(landuse, group, year) |>
+  summarise(across(c(lost_p10, lost_p50, lost_p90), mean), .groups = "drop") |>
+  mutate(group = factor(group, levels = c("robust", "nonrobust")))
+```
+
+```{r}
+#| label: fig-unc-scenario
+#| fig-cap: "Share of an individual plan that is no longer eligible under land-use projections (3 climate x 5 economic x 3 demographic x 5 land-use = 225 combinations). Lines are the median across plans, bands the 10th-90th percentile across the robust plans."
+#| fig-width: 5.5
+#| fig-height: 3.8
+
+ggplot(SCEN_LOST, aes(year, 100 * lost_p50, colour = landuse)) +
+  geom_ribbon(data = ~ filter(.x, group == "robust"),
+              aes(ymin = 100 * lost_p10, ymax = 100 * lost_p90, fill = landuse),
+              colour = NA, alpha = 0.18, show.legend = FALSE) +
+  geom_line(aes(linetype = group), linewidth = 0.7) +
+  scale_colour_manual(values = SCEN_PAL, name = "Land-use\nscenario") +
+  scale_fill_manual(values = SCEN_PAL, guide = "none") +
+  scale_linetype_manual(values = c(robust = "solid", nonrobust = "22"),
+                        labels = c(robust = "robust", nonrobust = "non-robust"),
+                        name = NULL) +
+  scale_y_continuous(labels = function(z) paste0(z, "%")) +
+  labs(x = NULL, y = "Share of a plan no longer eligible") +
+  theme(legend.text = element_text(size = 7), legend.title = element_text(size = 8),
+        legend.key.width = unit(9, "mm"))
+```
+

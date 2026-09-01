@@ -1,0 +1,75 @@
+### For reference in this document: 
+The reported baseline is the configuration in `r pv("P['run_script']")`: `r pv("P['algorithm']")` over `r pv("P['n_obj']")` objectives (`r pv("_fmt_objlist(P['objectives'])")`), with the minimum-patch-size constraint at `r pv("P['min_patch_size']")` pixels. The ecosystem run mode is `r pv("P['eco_mode']")`. Configuration tag is `r sub("_seed[0-9]+$", "", FOCUS$meta$run_label %||% BASELINE_SCEN)`, condition scenario tag is `r BASELINE_SCEN`.
+
+
+## Operator details {#sec-operator-details}
+
+Generic pixel-level operators were identified as unsuitable for maintaining spatial contiguity of selected areas. HUX crossover swaps individual pixels between parents and bit-flip mutation toggles them independently, so the contiguous regions built by the sampler became scattered within a few generations. We therefore replaced sampling, mutation and crossover with variation that treats a connected region, rather than a pixel, as the unit of change. All of the operators below share a precomputed 4-neighbour lookup table over eligible pixels. 
+
+#### Initial population
+
+Initial selection is deliberately spread to encourage full search of the spatial domain. The eligible extent is divided into a `r pv("P['region_seed_grid']")`x`r pv("P['region_seed_grid']")` lattice of cells. Each individual draws a seed count uniformly from $[$`r pv("P['region_seeds_min']")`, `r pv("P['region_seeds']")`$]$, samples that many distinct lattice cells without replacement, and places one seed at a random eligible pixel inside each. All seeds then grow outward simultaneously, competing for a shared budget, until the target pixel count is reached. The initial population of selected units therefore varies in both the number of regions and their placement across the landscape.
+
+*NOTE* The engine can add one "extreme" solution per objective, greedily built for that single objective. It is **`r pv("P['warm_seeding']")`** in the reported runs, so the population starts from spatially spread random regions only and the front is not anchored by extremes.
+
+#### Crossover: whole-region recombination
+
+We build each child from a random subset of one parent's connected components together with a random subset of the other's, then trim or grow the result back to the budget. @fig-operators shows an example of this.
+
+```{python}
+#| label: fig-operators
+#| echo: false
+#| fig-cap: "Crossover"
+import pathlib
+import sys
+
+import matplotlib.pyplot as plt
+
+# Resolve whether Quarto renders from paper2/ or the project root.
+for _cand in (pathlib.Path("."), pathlib.Path("paper2")):
+    if (_cand / "operator_demo.py").exists():
+        sys.path.insert(0, str(_cand.resolve()))
+        break
+
+import operator_demo as _od
+
+# Reused by the mutation figure below, so the moves start from the same run.
+_stages = _od.run_stages()
+_od.figure_operators(_stages)
+plt.show()
+```
+#### Mutation
+
+Each mutated individual receives exactly one region-level move, drawn from a fixed distribution:
+
+- **Relocate** - deletes a whole component and regrows one of the same size from a new randomly chosen anchor elsewhere. This is the move that lets the search traverse the landscape rather than refining whichever basin it first descended into.
+- **Spawn** - grows an additional small region (5% of the budget) from a random unselected anchor, increasing the number of regions.
+- **Delete** - removes a whole component. Freed pixels are regrown outward from the surviving regions.
+- **Grow** / **shrink** - expands a randomly chosen component by `region_mutation_edits` (`r pv("P['region_mutation_edits']")`) pixels along its frontier, or peels the same number from its boundary.
+
+@fig-mutation-moves shows how each move applies to an initial starting plan.
+
+```{python}
+#| label: fig-mutation-moves
+#| echo: false
+#| fig-cap: "The five region-level moves possible during mutation."
+_od.figure_mutation_moves(_stages)
+plt.show()
+```
+
+#### Repair: budget and minimum patch size
+
+Repair runs once on the initial population, and then once after every crossover and mutation step.
+
+* Budget: When a plan is over budget, whole smallest components are dropped first, which leaves the remaining regions intact; only if a single large component still overshoots are pixels peeled from its boundary, lowest-scoring first. When a plan is under budget, the deficit is regrown contiguously outward from the existing selection rather than scattered across the map.
+* Minimum patch size: Components smaller than $S$ (@sec-contiguity) are deleted and the freed budget is regrown onto the surviving components. This repeats until no component remains below the floor, capped at `r pv("P['min_patch_iters']")` iterations.
+
+#### Stochastic score ordering {#sec-score-temperature}
+
+The score guiding growth and trimming favours pixels that are simultaneously degraded and cheap: the standardised restoration-potential score minus the standardised per-pixel implementation cost. To avoid overly-deterministic selection of individuals, candidates are taken in descending order of a temperature-perturbed score,
+
+$$\tilde{s}_i = \frac{s_i}{T} + g_i, \qquad g_i = -\log\bigl(-\log u_i\bigr), \quad u_i \sim \mathcal{U}(0,1)$$
+
+the Gumbel-top-$k$ construction, which samples an ordering with probability proportional to $\exp(s_i / T)$. High-scoring pixels remain strongly preferred, but individuals resolve ties differently; $T \to 0$ recovers the deterministic ordering and larger $T$ approaches unbiased random growth. It is applied consistently across the mutation, crossover and repair operators.
+
+The temperature (`region_score_temperature` = `r pv("P['region_score_temperature']")` in the reported runs) changes how the decision space is explored, so it is reported with the solver settings rather than treated as a source of formulation uncertainty.

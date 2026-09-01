@@ -1,0 +1,36 @@
+### Limitations and additional assumptions of the model
+
+* Restoration effects are modelled as being linear-additive per action, have a spillover effect that decays with distance from the restored pixel, and are capped at a small fixed magnitude. These are modelling choices made to represent the process but the exact values are not known.
+* Assuming directionality of indicators - whilst it is based on an assessment of literature on the links between ecosystem condition and ecosystem services, for certain ecosystem services this may be contested or be conflictual.
+* Anomalies are z-scored against a reference population
+
+### Notes
+
+*Objective form*: How the restoration target itself is operationalised, given the same
+condition layers. 
+
+Where the three axes included in the uncertainty analysis currently change what "condition" means, this changes
+what counts as a successful plan, and it is a distinct source of formulation uncertainty:
+the same ecological aim can be written as accumulating improvement, as bringing area into
+good condition, or as closing a gap. Three forms are implemented (`rp_formulation` in
+`resto_anom.py`), all measured on the combined per-pixel condition score and all against
+the same reference level `rp_threshold`, which is zero by default and so is the benchmark
+condition itself:
+
+- `sum` - **total improvement.** The plan is scored by the summed condition gain over the
+  pixels it selects, with no ceiling. Improvement counts wherever it happens, so the form
+  rewards selecting the most degraded pixels.
+- `threshold` - **area reaching good condition.** The plan is scored by the number of
+  selected pixels whose post-restoration condition crosses the reference level. Gain that
+  does not carry a pixel over the line is worth nothing, and gain beyond it is worth no
+  more, so the form rewards selecting pixels that are already close to the target.
+- `shortfall` - **gap closure.** The plan is scored by the reduction in the distance
+  between condition and the reference level, credited only up to it:
+  $\min(r_i + \delta,\, \tau) - \min(r_i,\, \tau)$ for pixel condition $r_i$, nominal gain
+  $\delta$ and reference $\tau$. Pixels already at or above the reference contribute
+  nothing and pixels far below it contribute their full improvement, so the form sits
+  between the other two.
+
+Threshold and shortfall scoring were tested and found to collapse to near-constant values across all feasible plans, because the restoration effect per pixel (roughly 1–2% of a typical degradation gap) is too small relative to any defensible reference level for these formulations to distinguish between plans. 
+
+Fixing this would require either an arbitrary reference level chosen specifically to avoid the problem, or a larger effect size — both of which would substitute a parameter chosen to produce a result for a genuine formulation choice.

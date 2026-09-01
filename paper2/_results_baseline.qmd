@@ -1,0 +1,686 @@
+
+<!--
+  Establishes that the optimiser behaves reproducibly across seeds, and the
+  descriptive characteristics of the baseline case, before any scenario
+  comparison. Inputs are the per-run export folders written by export_to_r.py;
+  loading and plotting come from Documentation/_plot_functions.R.
+  SET THE PATHS IN THE config CHUNK BELOW.
+-->
+
+```{r}
+#| label: config
+#| echo: false
+
+# BASELINE_ROOT is either a single export folder (one containing metadata.json)
+# or a parent holding the per-seed export folders. When it is a parent,
+# BASELINE_PATTERN selects which of its sub-folders belong to this document:
+# it is a regex on the folder name, so it also matches through the timestamp
+# prefix that export_to_r.py puts in front of the run label.
+BASELINE_ROOT    <- "outputs/r_inputs"                        # <- SET ME
+BASELINE_PATTERN <- "region_evolve_T1p0_seed[0-9]+$"          # <- SET ME
+FOCUS_SEED       <- NULL                          # seed carrying the front + map; NULL = first
+
+# Condition scenario the run consumed (metadata.json: run_config$condition_scenario).
+# Names the anomaly rasters below; independent of the folder names.
+BASELINE_SCEN  <- "global_all"
+
+# Same rasters the baseline run consumed.
+COST_RASTER    <- "data/implementation_cost_corrected.tif"
+LULC_RASTER    <- "data/ecosystem_lulc_masked.tif"   # class codes behind the eligible pool
+ABIOTIC_RASTER <- file.path("data/anomaly_scenarios", paste0("abiotic_", BASELINE_SCEN, ".tif"))
+BIOTIC_RASTER  <- file.path("data/anomaly_scenarios", paste0("biotic_",  BASELINE_SCEN, ".tif"))
+
+N_SAMPLE       <- 2e5   # cap on eligible pixels sampled for the distributions
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(jsonlite); library(stringr)
+  library(purrr); library(tibble); library(knitr); library(terra); library(patchwork)
+})
+theme_set(theme_minimal(base_size = 11))
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+PROJ <- if (dir.exists("Core_optimisation")) "." else ".."
+.p <- function(rel) file.path(PROJ, rel)
+
+source(.p("Documentation/_plot_functions.R"))
+.OBJ_LABELS["restoration_benefit"] <- "Restoration benefit"
+
+# make_sel_freq_plot() and load_run_data() reach for `BE` and `.BE_MASK` in the
+# calling environment; the cache is written by Documentation/produce_figures.R.
+BE <- readRDS(.p("Documentation/BE_bern.rds"))
+.BE_MASK <- terra::rasterize(
+  terra::vect(BE),
+  terra::rast(terra::ext(terra::vect(BE)), res = 100, crs = "EPSG:2056"),
+  field = 1L)
+
+.seed_of <- function(d) str_extract(basename(d), "(?<=seed)[0-9]+$")
+
+RUN_DIRS <- local({
+  root <- .p(BASELINE_ROOT)
+  if (file.exists(file.path(root, "metadata.json"))) return(root)
+  ds  <- list.dirs(root, full.names = TRUE, recursive = FALSE)
+  ds  <- ds[file.exists(file.path(ds, "metadata.json"))]
+  if (!length(ds))
+    stop("No exports found under BASELINE_ROOT = ", root)
+  hit <- ds[grepl(BASELINE_PATTERN, basename(ds))]
+  # Never fall back to "all sub-folders": on a parent such as outputs/r_inputs
+  # that silently loads hundreds of runs (gigabytes of pixel_selection.csv)
+  # instead of the handful of seeds this document is about.
+  if (!length(hit))
+    stop("BASELINE_PATTERN = '", BASELINE_PATTERN, "' matches no sub-folder of ",
+         root, ". Available prefixes: ",
+         paste(unique(sub("_seed[0-9]+$", "", basename(ds))), collapse = ", "))
+  hit
+})
+RUN_DIRS <- RUN_DIRS[order(.seed_of(RUN_DIRS))]
+
+# load_run_data() sign-flips the maximised objectives, so everything downstream
+# is already in "larger = better" units.
+RUNS  <- lapply(RUN_DIRS, function(d) load_run_data(d, basename(d)))
+SEEDS <- vapply(RUN_DIRS, function(d) .seed_of(d) %||% basename(d), character(1))
+FOCUS <- RUNS[[if (is.null(FOCUS_SEED)) 1L else match(as.character(FOCUS_SEED), SEEDS)]]
+
+OBJ  <- FOCUS$obj_names
+XOBJ <- if (any(grepl("cost", OBJ))) grep("cost", OBJ, value = TRUE)[1] else OBJ[2]
+YOBJ <- setdiff(OBJ, XOBJ)[1]
+
+# Normalised objectives, pulled back to the same convention as df_obj.
+# objectives_normalized.csv suffixes every objective with "_norm", which defeats
+# the name match in load_run_data(), so df_norm arrives WITHOUT the sign flip the
+# maximised objectives get in df_obj. Strip the suffix and apply the flip here so
+# normalised and raw frames read in the same "larger = better" units.
+# Regex mirrors the invert_cols pattern in Documentation/_plot_functions.R.
+.MAXIMISED_RE <- paste0("anomaly|connectivity_gain|restoration_potential|",
+                        "restoration_benefit|landscape_context")
+.norm_obj <- function(r) {
+  if (is.null(r$df_norm))
+    stop("No objectives_normalized.csv in ", r$dir)
+  nm <- paste0(r$obj_names, "_norm")
+  if (!all(nm %in% names(r$df_norm)))
+    stop("Missing normalised columns in ", r$dir, ": ",
+         paste(setdiff(nm, names(r$df_norm)), collapse = ", "))
+  d <- r$df_norm[, c("solution_id", "is_nondominated", nm)]
+  names(d) <- c("solution_id", "is_nondominated", r$obj_names)
+  flip <- grep(.MAXIMISED_RE, r$obj_names, value = TRUE)
+  if (length(flip)) d[, flip] <- -d[, flip]
+  d
+}
+
+# Normalisation scales are per-run; overlaying seeds is only meaningful when
+# they agree, so check rather than assume.
+.NORM_SCALES_AGREE <- length(unique(lapply(
+  RUNS, function(r) unlist(r$meta$algorithm$objective_normalization$scales)))) == 1L
+
+# -- Pooled front ------------------------------------------------------------
+# The seeds are replicates of one problem, so the front of interest is the
+# non-dominated set of their union: a solution that a single seed calls
+# non-dominated can still be beaten by another seed's. Everything downstream
+# (front figure, RFOP map, selected-pixel distributions) uses this pooled set.
+all_obj  <- map2_dfr(RUNS, SEEDS, function(r, s) mutate(r$df_obj, seed = s))
+all_norm <- map2_dfr(RUNS, SEEDS, function(r, s) mutate(.norm_obj(r), seed = s))
+
+# M holds the objectives in minimisation orientation; a row is non-dominated
+# when no other row is at least as good on every objective and strictly better
+# on one. Identical rows do not dominate each other, so ties are all kept.
+.nondominated_mask <- function(M) {
+  vapply(seq_len(nrow(M)), function(i) {
+    o  <- M[-i, , drop = FALSE]
+    le <- rowSums(o <= rep(M[i, ], each = nrow(o))) == ncol(M)
+    lt <- rowSums(o <  rep(M[i, ], each = nrow(o))) >= 1L
+    !any(le & lt)
+  }, logical(1))
+}
+
+# Domination is settled on the RAW objectives: those are comparable across
+# seeds by construction, whereas objectives_normalized.csv is scaled per run.
+all_obj$pooled_nd <- local({
+  M <- as.matrix(all_obj[, OBJ])
+  flip <- grep(.MAXIMISED_RE, OBJ)
+  if (length(flip)) M[, flip] <- -M[, flip]
+  .nondominated_mask(M)
+})
+all_norm <- left_join(all_norm, all_obj[, c("seed", "solution_id", "pooled_nd")],
+                      by = c("seed", "solution_id"))
+POOLED_ND <- filter(all_obj, pooled_nd)
+
+# objectives_normalized.csv only divides by a fixed per-run scale, so its values
+# sit at whatever magnitude that implies (~1e-4 on benefit here) rather than on
+# [0, 1]. Rescale each axis across the pooled cloud so 0 and 1 are the worst and
+# best value any seed reached on that objective, on the convention the rest of
+# the project normalises to (Documentation/_plot_functions.R): 1 = best on EVERY
+# axis, which for a minimised objective such as cost means 1 = cheapest. So the
+# ideal point is the top-right corner and the front runs top-left to
+# bottom-right. A constant objective has no range to stretch and would divide by
+# zero, so it is pinned mid-axis instead.
+.rescale01 <- function(x, maximised) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(rep(0.5, length(x)))
+  # x arrives from .norm_obj() already in "larger = better" units for the
+  # maximised objectives, so only the minimised ones need reversing.
+  if (maximised) (x - rng[1]) / diff(rng) else (rng[2] - x) / diff(rng)
+}
+.MAXIMISED_OBJ <- grep(.MAXIMISED_RE, OBJ, value = TRUE)
+all_norm <- mutate(all_norm, across(all_of(OBJ),
+                                    ~ .rescale01(.x, cur_column() %in% .MAXIMISED_OBJ)))
+
+# pixel_selection.csv carries only each run's own non-dominated solutions, and
+# solution_id restarts at 0 in every run, so the key is (seed, solution_id).
+# Count distinct solutions per pixel, not rows: a pixel can carry both a
+# restore and a convert row within one solution.
+POOLED_PSEL <- map2_dfr(RUNS, SEEDS, function(r, s)
+    mutate(distinct(r$df_psel, solution_id, x, y), seed = s)) |>
+  semi_join(POOLED_ND[, c("seed", "solution_id")], by = c("seed", "solution_id")) |>
+  mutate(solution_id = paste(seed, solution_id, sep = "_"))
+
+# A pooled solution with no pixel rows would quietly deflate every RFOP value,
+# so require the two sides to describe the same set of solutions.
+if (!setequal(unique(POOLED_PSEL$solution_id),
+              paste(POOLED_ND$seed, POOLED_ND$solution_id, sep = "_")))
+  stop("Pooled non-dominated solutions missing from pixel_selection.csv: ",
+       paste(setdiff(paste(POOLED_ND$seed, POOLED_ND$solution_id, sep = "_"),
+                     unique(POOLED_PSEL$solution_id)), collapse = ", "))
+
+N_POOLED_ND <- n_distinct(POOLED_PSEL$solution_id)
+RFOP <- POOLED_PSEL |>
+  count(x, y, name = "n_sel") |>
+  mutate(rfop_pct = 100 * n_sel / N_POOLED_ND)
+
+# -- Selection-frequency quartiles -------------------------------------------
+# The characteristics figures below split the selected pool by how often a pixel
+# is chosen rather than treating "selected at least once" as a single class: a
+# pixel picked by one plan in fifty and a pixel picked by all of them say very
+# different things about the priority, and pooling them hides whatever gradient
+# the optimiser is following.
+#
+# RFOP takes only N_POOLED_ND + 1 distinct values, so equal-count quartiles need
+# not exist. Breaks are taken with type = 1 (observed values) and de-duplicated,
+# so pixels sharing an RFOP value always land in the same group and a tie
+# collapses the split into fewer, larger groups instead of cutting through it.
+.rfop_quartile <- function(p) {
+  brk <- unique(unname(stats::quantile(p, c(0, 0.25, 0.5, 0.75, 1), type = 1)))
+  if (length(brk) < 2L)
+    stop("Every selected pixel has the same selection frequency (",
+         sprintf("%.1f%%", p[1]), "); there are no quartiles to split.")
+  if (length(brk) < 5L)
+    warning("Selection-frequency ties collapse the quartile breaks: ",
+            length(brk) - 1L, " groups instead of 4.")
+  rng  <- sprintf("%.1f-%.1f%%", brk[-length(brk)], brk[-1])
+  labs <- if (length(brk) == 5L) paste0("Q", 1:4, " (", rng, ")") else rng
+  cut(p, breaks = brk, labels = labs, include.lowest = TRUE)
+}
+
+RFOP    <- mutate(RFOP, rfop_q = .rfop_quartile(rfop_pct))
+Q_LEVELS <- levels(RFOP$rfop_q)
+
+# Quartile colours are read off the same YlOrRd ramp as fig-rfop, so "darker =
+# selected more often" carries over from the map to these figures.
+SET_PAL <- c(
+  Eligible = "grey55",
+  setNames(colorRampPalette(c("#FEB24C", "#FD8D3C", "#E31A1C", "#800026"))(
+    length(Q_LEVELS)), Q_LEVELS))
+SET_LEVELS <- names(SET_PAL)
+
+# One (x, y) table per class, shared by both characteristics figures: the whole
+# eligible pool as the reference, then the selected pixels split by quartile.
+.rfop_sets <- function(elig_xy)
+  c(list(Eligible = elig_xy),
+    lapply(split(RFOP[, c("x", "y")], RFOP$rfop_q), as.data.frame))
+
+# Group sizes for the figure subtitles. The RFOP range already sits in the
+# legend key, so only the "Qk" part of the label is repeated here.
+Q_SIZES <- count(RFOP, rfop_q, name = "n_px")
+Q_SIZE_LAB <- paste(sprintf("%s %s", sub(" .*", "", Q_SIZES$rfop_q),
+                            format(Q_SIZES$n_px, big.mark = ",", trim = TRUE)),
+                    collapse = "; ")
+
+# make_sel_freq_plot() reads df_psel / n_nondom / df_elig off a run object, so
+# the pooled set is passed as one. The eligible pixels are a property of the
+# problem, not of a seed; tbl-hv-seeds reports the per-seed counts as a check.
+POOLED_RUN <- list(label = "pooled", df_psel = POOLED_PSEL,
+                   df_elig = FOCUS$df_elig, n_nondom = N_POOLED_ND)
+
+# One raster read per layer-set, shared by the distribution table and figure.
+LAYER_VALS <- local({
+  elig <- FOCUS$df_elig
+  if (nrow(elig) > N_SAMPLE) elig <- elig[sample.int(nrow(elig), N_SAMPLE), ]
+  sets <- .rfop_sets(elig[, c("x", "y")])
+  layers <- list(`Abiotic anomaly` = ABIOTIC_RASTER, `Biotic anomaly` = BIOTIC_RASTER,
+                 `Implementation cost` = COST_RASTER)
+  imap_dfr(layers, function(path, nm) imap_dfr(sets, function(xy, set) {
+    v <- terra::extract(terra::rast(.p(path)), as.matrix(xy))[, 1]
+    tibble(Layer = nm, Set = set, value = v[is.finite(v)])
+  })) |>
+    mutate(Set = factor(Set, levels = SET_LEVELS))
+})
+```
+
+### Convergence
+
+Hypervolume is computed on normalised objectives against a fixed reference
+point built once per run.
+
+```{r}
+#| label: fig-hv-seeds
+#| fig-cap: "Mean hypervolume against generation across replicate seeds, with a +/-1 SD band. Thin grey lines are the individual seeds."
+#| fig-width: 7
+#| fig-height: 4.2
+hv_df <- map2_dfr(RUNS, SEEDS, function(r, s) mutate(r$df_hv, seed = s))
+
+# A seed that triggered the plateau criterion stops early, so past its last
+# generation it contributes no row. Averaging only over the seeds still running
+# would make the mean jump at every stop; carry each stopped run forward at its
+# final hypervolume instead, which is what "converged and stopped" means.
+hv_mean <- local({
+  gens <- seq(min(hv_df$generation), max(hv_df$generation))
+  hv_df |>
+    group_by(seed) |>
+    group_modify(~ tibble(
+      generation = gens,
+      hypervolume = approx(.x$generation, .x$hypervolume, xout = gens,
+                           method = "constant", rule = 2)$y)) |>
+    ungroup() |>
+    group_by(generation) |>
+    summarise(mean_hv = mean(hypervolume), sd_hv = stats::sd(hypervolume),
+              .groups = "drop")
+})
+
+ggplot(hv_mean, aes(generation, mean_hv)) +
+  geom_line(data = hv_df, aes(generation, hypervolume, group = seed),
+            colour = "grey70", linewidth = 0.3, alpha = 0.8) +
+  geom_ribbon(aes(ymin = mean_hv - sd_hv, ymax = mean_hv + sd_hv),
+              fill = "#E05C2A", alpha = 0.25) +
+  geom_line(colour = "#E05C2A", linewidth = 0.8) +
+  labs(x = "Generation", y = "Hypervolume",
+       subtitle = sprintf("Mean +/- 1 SD across %d seeds", length(RUNS)))
+```
+
+```{r}
+#| label: tbl-hv-seeds
+# Convergence and plan size in one per-seed row. Pixel counts come from each
+# seed's own export, so the eligible column doubles as a check that the seeds
+# really did share a decision space.
+hv_tab <- map2_dfr(RUNS, SEEDS, function(r, s) {
+  a       <- r$meta$algorithm
+  n_elig  <- nrow(r$df_elig)
+  frac    <- as.numeric(r$meta$scenario_params$max_restoration_fraction %||% NA)
+  per_sol <- count(r$df_psel, solution_id, name = "n_px")
+  n_dist  <- nrow(distinct(r$df_psel, x, y))
+  .n      <- function(v) format(round(v), big.mark = ",")
+  tibble(Seed = s,
+         `Non-dominated` = r$n_nondom,
+         `Target ha per plan (% eligible)` =
+           sprintf("%s (%.1f%%)", .n(frac * n_elig), 100 * frac),
+         `Realised ha per plan (mean +/- SD)` =
+           sprintf("%s +/- %s", .n(mean(per_sol$n_px)), .n(stats::sd(per_sol$n_px))),
+         `Distinct px selected (% eligible)` =
+           sprintf("%s (%.1f%%)", .n(n_dist), 100 * n_dist / n_elig))
+})
+kable(hv_tab, digits = 4, caption = "Per-seed convergence and plan size.")
+```
+
+### Baseline Pareto front
+
+```{r}
+#| label: fig-pareto-seeds
+#| fig-cap: "Pooled solutions across 5 random seeds"
+#| fig-width: 6.2
+#| fig-height: 4.6
+
+if (!.NORM_SCALES_AGREE)
+  warning("Normalisation scales differ across seeds; ", "fig-pareto-seeds ",
+          "plots solutions that are not on a common scale.")
+
+ggplot(all_norm, aes(.data[[YOBJ]], .data[[XOBJ]])) +
+  geom_point(data = filter(all_norm, !pooled_nd),
+             colour = "grey80", size = 0.8, alpha = 0.5, stroke = 0) +
+  geom_point(data = filter(all_norm, pooled_nd), aes(colour = seed),
+             size = 1.6, alpha = 0.9) +
+  scale_colour_viridis_d(option = "D", end = 0.9) +
+  guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = paste0(.obj_labels(YOBJ), " (normalised)"),
+       y = paste0(.obj_labels(XOBJ), " (normalised)"), colour = "Seed",
+       subtitle = sprintf("%d pooled non-dominated solutions of %d solutions",
+                          nrow(POOLED_ND), nrow(all_obj), length(RUNS)))
+```
+
+```{r}
+#| label: obj-corr
+#| include: false
+
+# Spearman rank correlation between the two objectives in their raw units, over
+# all solutions (the front alone is selected for non-domination, so its
+# correlation is negative by construction and says nothing about conflict).
+# Cost is minimised and benefit maximised, so a POSITIVE rho is the trade-off:
+# more benefit costs more.
+.rho <- suppressWarnings(stats::cor.test(all_obj[[XOBJ]], all_obj[[YOBJ]],
+                                         method = "spearman", exact = FALSE))
+RHO   <- unname(.rho$estimate)
+RHO_P <- if (.rho$p.value < 1e-4) "p < 1e-4" else sprintf("p = %.3g", .rho$p.value)
+```
+
+Across all `r format(nrow(all_obj), big.mark = ",")` solutions, `r .obj_labels(YOBJ)` and `r .obj_labels(XOBJ)` are correlated at Spearman rho = `r sprintf("%.2f", RHO)` (`r RHO_P`).
+
+```{r}
+#| label: front-curvature
+#| include: false
+#| 
+if (nrow(POOLED_ND) < 6)
+  stop("Only ", nrow(POOLED_ND), " pooled non-dominated solutions; three cost ",
+       "terciles cannot be read off a front that short.")
+
+CURV <- local({
+  d   <- POOLED_ND[order(POOLED_ND[[XOBJ]]), ]
+  cst <- d[[XOBJ]]
+  # Non-domination on two objectives already makes benefit increase with cost;
+  # cummax only guards against ties and duplicated solutions.
+  ben <- cummax(d[[YOBJ]])
+
+  brk <- unname(stats::quantile(cst, c(0, 1/3, 2/3, 1)))
+  if (any(diff(brk) <= 0))
+    stop("Front cost terciles are degenerate (", paste(signif(brk, 4), collapse = ", "),
+         "): too many solutions share a cost for a per-cost return to mean anything.")
+  b_at <- stats::approx(cst, ben, xout = brk, rule = 2)$y
+
+  d_cost <- diff(brk)
+  d_ben  <- diff(b_at)
+  tibble(
+    tercile   = c("Cheapest third", "Middle third", "Costliest third"),
+    cost_lo   = brk[-4], cost_hi = brk[-1],
+    cost_pct  = 100 * d_cost / sum(d_cost),
+    ben_pct   = 100 * d_ben  / sum(d_ben),
+    slope     = d_ben / d_cost) |>
+    mutate(ret = ben_pct / cost_pct, ret_rel = slope / slope[1])
+})
+
+# Headline: how much the marginal return has decayed from the cheap end of the
+# front to the expensive end.
+CURV_DECAY <- CURV$ret_rel[3]
+```
+
+```{r}
+#| label: tbl-front-curvature
+.pc <- function(x) sprintf("%.1f", x)
+kable(
+  transmute(CURV,
+            Tercile = tercile,
+            `Cost range` = sprintf("%.3g - %.3g", cost_lo, cost_hi),
+            `Share of front cost span (%)` = .pc(cost_pct),
+            `Share of front benefit span (%)` = .pc(ben_pct),
+            `Benefit per unit cost` = sprintf("%.3g", slope),
+            `Relative to cheapest third` = sprintf("%.2f", ret_rel)),
+  align = "lrrrrr",
+  caption = sprintf(paste(
+    "Marginal return along the pooled non-dominated front"))
+)
+```
+
+### Selection map and RFOP
+
+Relative frequency of occurence in the pareto front (RFOP) is the share of the pooled
+non-dominated plans in which a pixel is selected. 
+
+```{r}
+#| label: fig-rfop
+#| fig-cap: "Selection frequency across the pooled non-dominated set."
+#| fig-width: 7.5
+#| fig-height: 6.5
+make_sel_freq_plot(POOLED_RUN)
+```
+
+### Characteristics of selected areas
+
+```{r}
+#| label: fig-distributions
+#| fig-cap: "Distributions of the two condition layers and cost over the eligible pool and over the selected pixels, split by quartile of selection frequency"
+#| fig-width: 8
+#| fig-height: 3.2
+ggplot(LAYER_VALS, aes(value, colour = Set)) +
+  # Eligible is the backdrop the quartiles are read against, so it is the only
+  # filled curve; five filled densities per panel would be unreadable.
+  geom_density(data = ~ filter(.x, Set == "Eligible"), aes(fill = Set),
+               alpha = 0.35, linewidth = 0.3) +
+  geom_density(data = ~ filter(.x, Set != "Eligible"), fill = NA, linewidth = 0.6) +
+  facet_wrap(~Layer, scales = "free") +
+  scale_fill_manual(values = SET_PAL, guide = "none") +
+  scale_colour_manual(values = SET_PAL, drop = FALSE,
+                      name = "Selection frequency") +
+  labs(x = NULL, y = "Density")
+```
+
+```{r}
+#| label: fig-lulc-selected
+#| fig-cap: "Land-use composition of the eligible pool and of the selected area, by quartile of selection frequency. Shares are within each group, so each group of bars sums to 100%."
+#| fig-width: 8
+#| fig-height: 4.2
+
+# reclass_lulc() (Documentation/_plot_functions.R) maps the raw class codes to
+# the named classes of the eligible pool: 12/13 forest, 15 agricultural land,
+# 16/17 pastures & grasslands. Anything else - a pixel a plan reached outside
+# the pool, or a raster gap - comes back NA and is kept as its own bar rather
+# than dropped, so the shares always sum to 100%.
+LULC_SHARE <- local({
+  lulc <- terra::rast(.p(LULC_RASTER))
+  sets <- .rfop_sets(FOCUS$df_elig[, c("x", "y")])
+  imap_dfr(sets, function(xy, set) {
+    cls <- reclass_lulc(terra::extract(lulc, as.matrix(xy))[, 1])
+    cls <- factor(ifelse(is.na(cls), "Unclassified", as.character(cls)),
+                  levels = c(levels(cls), "Unclassified"))
+    tibble(Set = set, Class = cls)
+  }) |>
+    mutate(Set = factor(Set, levels = SET_LEVELS)) |>
+    count(Set, Class, .drop = FALSE) |>
+    group_by(Set) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    # An empty "Unclassified" bar is noise; every other class stays even at 0.
+    filter(Class != "Unclassified" | any(n[Class == "Unclassified"] > 0))
+})
+
+# Ecosystem-type colours are the ones the land-use maps of this project already use
+# (Documentation/produce_figures.R, Documentation/map_bern_landuse.R), so a class
+# keeps its colour wherever it appears. "Unclassified" only ever survives the filter
+# above when a plan reached a pixel outside the pool, so it gets a neutral grey.
+LULC_PAL <- c(`Forest`                = "#1B7837",
+              `Pastures & grasslands` = "#A6D96A",
+              `Agricultural land`     = "#E9C46A",
+              `Unclassified`          = "grey70")
+
+ggplot(LULC_SHARE, aes(Set, pct, fill = Class)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.74) +
+  scale_fill_manual(values = LULC_PAL, name = "Ecosystem type") +
+  scale_x_discrete(labels = function(z) sub(" \\(", "\n(", z)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Selection frequency", y = "Share of pixels (%)")
+```
+
+### Spatial contiguity constraint
+
+A minimum-patch-size floor S requires every 4-connected component of a plan to
+cover at least S pixels (1 ha each). The sweep below repeats the
+baseline problem at S = 1, 2, 5, 10 and 25 across three seeds.
+
+```{r}
+#| label: contig-setup
+#| include: false
+
+# Written by `python Debugs_tests/contiguity_sweep.py summary`, which derives the
+# patch geometry from the decision vectors in the run pickles. Doing it there rather
+# than here keeps R off the 15 pixel_selection.csv files and out of the business of
+# re-deriving connected components.
+CONTIG_DIR <- "outputs/r_inputs/contiguity_summary"
+.contig_file <- function(f) {
+  p <- .p(file.path(CONTIG_DIR, f))
+  if (!file.exists(p))
+    stop("Missing ", p, ". Run: python Debugs_tests/contiguity_sweep.py summary")
+  p
+}
+CONTIG_SOL <- read.csv(.contig_file("contiguity_solutions.csv"))
+CONTIG_RUN <- read.csv(.contig_file("contiguity_runs.csv"))
+
+.S_LEVELS <- sort(unique(CONTIG_SOL$min_patch_size))
+.S_LAB    <- function(s) factor(s, levels = .S_LEVELS, labels = paste0("S = ", .S_LEVELS))
+CONTIG_SOL$S <- .S_LAB(CONTIG_SOL$min_patch_size)
+CONTIG_RUN$S <- .S_LAB(CONTIG_RUN$min_patch_size)
+
+# Each row is non-dominated within its own run. Across the three seeds of one level
+# that is no longer true, so re-derive the pooled front per level the same way the
+# baseline front does (.nondominated_mask, minimisation orientation: benefit is
+# "larger = better" in the CSV, so it is negated here).
+CONTIG_SOL <- CONTIG_SOL |>
+  group_by(min_patch_size) |>
+  mutate(pooled_nd = .nondominated_mask(
+    cbind(-restoration_benefit, implementation_cost))) |>
+  ungroup()
+
+# Panel (a) of fig-contig-front is read against fig-pareto-seeds, so it uses the
+# same convention: each axis min-max rescaled with .rescale01() so 1 = best,
+# which for the minimised cost means 1 = cheapest and puts the ideal point in
+# the top-right corner. The raw CSV columns are already in one common unit
+# across the sweep (unlike objectives_normalized.csv, which is scaled per run),
+# and .rescale01() is linear, so rescaling the raw values here gives the same
+# [0, 1] positions the baseline figure would.
+#
+# The scale is taken ONCE over the whole sweep - every level, every seed,
+# dominated solutions included - rather than per level. A per-level scale would
+# stretch each front onto the same two corners and erase exactly the difference
+# between levels the panel exists to show.
+CONTIG_SOL <- mutate(CONTIG_SOL,
+  benefit_norm = .rescale01(restoration_benefit, maximised = TRUE),
+  cost_norm    = .rescale01(implementation_cost,  maximised = FALSE))
+
+CONTIG_ND <- filter(CONTIG_SOL, pooled_nd)
+
+# -- Benefit forgone at matched cost ----------------------------------------
+# The headline "price": at a given budget, how much benefit does a plan give up by
+# honouring the floor? Each level's front is turned into an upper envelope
+# benefit(cost) and read on a shared cost grid. rule = 1 returns NA outside a level's
+# own cost range, so a level is only ever compared where it actually has solutions.
+.front_envelope <- function(d, grid) {
+  d <- d[order(d$implementation_cost), ]
+  approx(d$implementation_cost, cummax(d$restoration_benefit),
+         xout = grid, rule = 1)$y
+}
+
+# Benefit forgone relative to the S = 1 front of the SAME set of runs.
+.price_curve <- function(d, grid) {
+  ref <- .front_envelope(filter(d, min_patch_size == min(.S_LEVELS)), grid)
+  bind_rows(lapply(.S_LEVELS, function(s) {
+    tibble(min_patch_size = s, cost = grid,
+           forgone_pct = 100 *
+             (ref - .front_envelope(filter(d, min_patch_size == s), grid)) / ref)
+  })) |>
+    filter(is.finite(forgone_pct)) |>
+    mutate(S = .S_LAB(min_patch_size))
+}
+
+.COST_GRID <- local({
+  rngs <- CONTIG_ND |>
+    group_by(min_patch_size) |>
+    summarise(lo = min(implementation_cost), hi = max(implementation_cost),
+              .groups = "drop")
+  lo <- max(rngs$lo); hi <- min(rngs$hi)
+  # Levels whose fronts sit in disjoint parts of cost space share no budget at which
+  # they can be compared; say so rather than extrapolating a price out of nothing.
+  if (!is.finite(lo) || !is.finite(hi) || lo >= hi) NULL else seq(lo, hi, length.out = 200)
+})
+
+CONTIG_PRICE <- if (is.null(.COST_GRID)) NULL else .price_curve(CONTIG_ND, .COST_GRID)
+
+# The same curve computed within each seed separately, each against its OWN S = 1
+# front. Three seeds is far too few to put an interval on the pooled curve, but
+# overlaying the per-seed curves shows directly whether the gaps between levels are
+# bigger than the gaps between replicates of one level - which is the only thing that
+# makes a "price" real. CONTIG_SOL rows are already non-dominated within their run.
+CONTIG_PRICE_SEED <- if (is.null(.COST_GRID)) NULL else {
+  CONTIG_SOL |>
+    group_by(seed) |>
+    group_modify(~ .price_curve(.x, .COST_GRID)) |>
+    ungroup()
+}
+
+.S_PAL <- setNames(viridisLite::viridis(length(.S_LEVELS), option = "D", end = 0.92),
+                   levels(CONTIG_SOL$S))
+```
+
+```{r}
+#| label: fig-contig-front
+#| fig-cap: "Pooled benefit-vs-cost fronts by minimum patch size. (a) each level's non-dominated set across three seeds. (b) benefit forgone relative to the unconstrained S = 1 front, read at matched cost over the range of budgets all levels reach."
+#| fig-width: 9
+#| fig-height: 4
+#| warning: false
+
+p_front <- ggplot(CONTIG_SOL, aes(benefit_norm, cost_norm)) +
+  geom_point(data = filter(CONTIG_SOL, !pooled_nd),
+             colour = "grey85", size = 0.7, alpha = 0.6, stroke = 0) +
+  geom_line(data = CONTIG_ND, aes(colour = S), linewidth = 0.5, alpha = 0.8) +
+  geom_point(data = CONTIG_ND, aes(colour = S), size = 1.5, alpha = 0.9) +
+  scale_colour_manual(values = .S_PAL, name = "Min patch") +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = paste0(.obj_labels("restoration_benefit"), " (normalised)"),
+       y = paste0(.obj_labels("implementation_cost"), " (normalised)"))
+
+p_price <- if (is.null(CONTIG_PRICE)) {
+  ggplot() + annotate("text", 0, 0, size = 3.2, colour = "grey35",
+                      label = "Fronts share no common cost range") +
+    theme_void()
+} else {
+  ggplot(CONTIG_PRICE, aes(cost, forgone_pct, colour = S)) +
+    geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3) +
+    geom_line(data = CONTIG_PRICE_SEED, aes(group = interaction(seed, S)),
+              linewidth = 0.3, alpha = 0.35) +
+    geom_line(linewidth = 0.9) +
+    scale_colour_manual(values = .S_PAL, guide = "none") +
+    labs(x = "Implementation cost", y = "Benefit forgone vs S = 1 (%)")
+}
+
+p_front + p_price + plot_layout(widths = c(1.25, 1), guides = "collect") +
+  plot_annotation(tag_levels = "a")
+```
+
+```{r}
+#| label: tbl-contig
+#| include: false
+# One row per level. Generations are reported because early stopping is ON in this
+# sweep, so levels need not have had the same search budget - a level with a short
+# front may simply have converged sooner.
+.rng <- function(x) sprintf("%.3g - %.3g", min(x), max(x))
+contig_tab <- left_join(
+  CONTIG_ND |>
+    group_by(min_patch_size) |>
+    summarise(`Pooled non-dominated` = n(),
+              `Benefit range` = .rng(restoration_benefit),
+              `Cost range` = .rng(implementation_cost),
+              `Patches per plan` = round(mean(n_components)),
+              `Mean patch (ha)` = round(mean(mean_patch)),
+              `Smallest patch (ha)` = round(min(min_patch)),
+              `Adjacent pairs` = round(mean(adjacency)),
+              .groups = "drop"),
+  CONTIG_RUN |>
+    group_by(min_patch_size) |>
+    summarise(Seeds = n(),
+              `Gens run` = paste(unique(range(generations)), collapse = " - "),
+              # Hypervolume here is ~5e-6; kable(digits = 4) would render every row
+              # as 0, so format it explicitly rather than leaving the column blank.
+              `Final HV` = sprintf("%.2e", mean(final_hypervolume)), .groups = "drop"),
+  by = "min_patch_size") |>
+  transmute(`Min patch S (ha)` = min_patch_size, Seeds, `Gens run`, `Final HV`,
+            `Pooled non-dominated`, `Benefit range`, `Cost range`,
+            `Patches per plan`, `Mean patch (ha)`, `Smallest patch (ha)`,
+            `Adjacent pairs`)
+
+kable(contig_tab, digits = 4, caption = paste(
+  "Price of contiguity by minimum patch size. Patch statistics are means over the",
+  "pooled non-dominated plans of each level; adjacent pairs counts 4-connected",
+  "selected-pixel pairs"))
+```
+
+It's unclear from Figures 8a & b how much restoration benefit is forgone when tightening the contiguity floor (increasing the number of required connected pixels) at matched implementation cost. Signal does not clearly exceed seed-to-seed noise across most of the cost range.
+--> set value of S at 2 for runs in next section.

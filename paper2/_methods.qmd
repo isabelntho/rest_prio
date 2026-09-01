@@ -1,0 +1,679 @@
+```{python}
+#| echo: false
+# Values quoted as parameters in the prose are extracted from the codebase at render time
+# (static AST parse, no code executed), so the text stays in sync with the scripts. Sources:
+#   run_custom_nsga2.py   : the run configuration of the reported baseline
+#                           (OBJECTIVES, custom_scenario_params, POLICY_VARIANTS,
+#                            top-level consts, condition-grid tag list)
+#   resto_anom.py         : effect-model constants (effect_params dict; scale/gamma in
+#                           anomaly_improvement_weight) and operator defaults applied
+#                           when a run script leaves a knob unset
+#   spatial_operations.py : region-operator internals that are not run-configurable
+#                           (region-level move probabilities, repair iteration cap)
+import ast
+import pathlib
+
+RUN_SCRIPT = "run_custom_nsga2.py"   # the reported baseline run configuration
+
+
+def _load_source(*relparts):
+    cands = [pathlib.Path(*(("..",) + relparts)), pathlib.Path(*relparts)]
+    p = next((c for c in cands if c.exists()), None)
+    if p is None:
+        raise FileNotFoundError("/".join(relparts))
+    return p.read_text(encoding="utf-8")
+
+
+def _parse_config(*relparts):
+    # Static AST parse of a run-config script: pull OBJECTIVES,
+    # custom_scenario_params, POLICY_VARIANTS, any top-level scalar consts, and
+    # the condition-grid tag list (which is a local inside _run_condition_grid).
+    tree = ast.parse(_load_source(*relparts))
+    consts, cparams, policy, objectives, tags = {}, {}, {}, [], []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for t in node.targets:
+            if not isinstance(t, ast.Name):
+                continue
+            if t.id == "OBJECTIVES":
+                objectives = ast.literal_eval(node.value)
+            elif t.id == "custom_scenario_params":
+                cparams = ast.literal_eval(node.value)
+            elif t.id == "POLICY_VARIANTS":
+                policy = ast.literal_eval(node.value)
+            else:
+                try:
+                    consts[t.id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "_condition_tags":
+                    try:
+                        tags = ast.literal_eval(node.value)
+                    except Exception:
+                        pass
+    # HV_PATIENCE is written as `N_GENERATIONS + 1` (a BinOp), so literal_eval
+    # skips it above; resolve it against the scalars already collected.
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "HV_PATIENCE" for t in node.targets):
+            v = node.value
+            if isinstance(v, ast.BinOp) and isinstance(v.op, ast.Add) \
+                    and isinstance(v.left, ast.Name) and isinstance(v.right, ast.Constant):
+                base = consts.get(v.left.id)
+                if base is not None:
+                    consts["HV_PATIENCE"] = base + v.right.value
+    return objectives, cparams, policy, consts, tags
+
+
+_obj, _cp, _pol, _c, _tags = _parse_config("Core_optimisation", RUN_SCRIPT)
+
+# --- Effect-model constants and operator defaults from the engine ------------
+_ra = ast.parse(_load_source("Core_optimisation", "resto_anom.py"))
+_effect, _weight_scale, _gamma = {}, 1.0, 3.0
+for _node in ast.walk(_ra):
+    if isinstance(_node, ast.Assign):
+        for _t in _node.targets:
+            if (isinstance(_t, ast.Attribute) and _t.attr == "effect_params"
+                    and isinstance(_node.value, ast.Dict)):
+                for _k, _v in zip(_node.value.keys, _node.value.values):
+                    try:
+                        _effect[ast.literal_eval(_k)] = ast.literal_eval(_v)
+                    except Exception:
+                        # Values wrapped in int()/float() calls: take the default
+                        # of the .get() call inside.
+                        for _sub in ast.walk(_v):
+                            if isinstance(_sub, ast.Call) and getattr(
+                                    _sub.func, "attr", None) == "get" and len(_sub.args) == 2:
+                                try:
+                                    _effect[ast.literal_eval(_k)] = ast.literal_eval(_sub.args[1])
+                                except Exception:
+                                    pass
+    if isinstance(_node, ast.FunctionDef) and _node.name == "anomaly_improvement_weight":
+        _dn = _node.args.defaults
+        if _dn:
+            _an = [a.arg for a in _node.args.args]
+            _mp = dict(zip(_an[-len(_dn):], [ast.literal_eval(d) for d in _dn]))
+            _weight_scale = _mp.get("scale", _weight_scale)
+        for _s in ast.walk(_node):
+            if isinstance(_s, ast.Assign):
+                for _t in _s.targets:
+                    if isinstance(_t, ast.Name) and _t.id == "gamma":
+                        try:
+                            _gamma = ast.literal_eval(_s.value)
+                        except Exception:
+                            pass
+
+# The region-level move probabilities and the min-patch repair iteration cap are
+# not run-configurable: they are written into the operator signatures in
+# spatial_operations.py. Pull those literals so the prose tracks the operator.
+_MOVE_DEFAULTS = {"relocate": 0.40, "spawn": 0.20, "delete": 0.10,
+                  "grow": 0.15, "shrink": 0.15}
+_moves, _min_patch_iters = {}, 8
+try:
+    _so = ast.parse(_load_source("Core_optimisation", "spatial_operations.py"))
+    for _node in ast.walk(_so):
+        if isinstance(_node, ast.Assign) and isinstance(_node.value, ast.BoolOp):
+            for _t in _node.targets:
+                if isinstance(_t, ast.Attribute) and _t.attr == "move_probs":
+                    for _v in _node.value.values:
+                        if isinstance(_v, ast.Dict):
+                            _moves = ast.literal_eval(_v)
+        if isinstance(_node, ast.ClassDef) and _node.name == "MinPatchSizeRepair":
+            for _f in _node.body:
+                if isinstance(_f, ast.FunctionDef) and _f.name == "__init__":
+                    _an = [a.arg for a in _f.args.args]
+                    _dn = _f.args.defaults
+                    if _dn:
+                        _kw = dict(zip(_an[-len(_dn):],
+                                       [ast.literal_eval(d) for d in _dn]))
+                        _min_patch_iters = _kw.get("max_iters", _min_patch_iters)
+except Exception:
+    pass
+_moves = _moves or _MOVE_DEFAULTS
+
+
+def _pct(x):
+    return f"{x * 100:g}%"
+
+
+# LULC classes entering the eligible pool, from the ecosystem run mode.
+_ECO_CLASSES = {"forest": [12, 13], "agricultural": [15], "grassland": [16, 17]}
+_eco_mode = str(_c.get("ECOSYSTEM_TO_RUN", "combined")).lower()
+_loader_eco = {"combined": "all"}.get(_eco_mode, _eco_mode)
+if _loader_eco == "all":
+    _eco_names = ["forest", "agricultural", "grassland"]
+elif _loader_eco == "fg":
+    _eco_names = ["forest", "grassland"]
+else:
+    _eco_names = [_loader_eco]
+_eco_codes = sorted(c for n in _eco_names for c in _ECO_CLASSES[n])
+
+_base_frac = _cp.get("max_restoration_fraction", 0.05)
+_sweep = sorted({_base_frac} | {v["max_restoration_fraction"]
+                                for v in _pol.values()
+                                if "max_restoration_fraction" in v})
+_n_gen = _c.get("N_GENERATIONS", 150)
+_hv_pat = _c.get("HV_PATIENCE", 15)
+
+P = {
+    # --- run configuration ---
+    "run_script": RUN_SCRIPT,
+    "algorithm": {"nsga2": "NSGA-II"}.get(str(_c.get("ALGORITHM", "nsga3")).lower(),
+                                          "NSGA-III"),
+    "objectives": _obj,
+    "n_obj": len(_obj),
+    "pop_size": _c.get("POP_SIZE", 100),
+    "n_generations": _n_gen,
+    "early_stopping": "disabled" if (_hv_pat is not None and _hv_pat > _n_gen)
+                      else f"hypervolume patience {_hv_pat} generations",
+    "seeds": _c.get("SEEDS") or [_c.get("RANDOM_SEED", 101)],
+    "n_seeds": len(_c.get("SEEDS") or [1]),
+    "condition_scenario": _c.get("CONDITION_SCENARIO", "global_all"),
+    "n_condition_tags": len(_tags),
+    "warm_seeding": "enabled" if bool(_c.get("WARM_SEEDING", False)) else "disabled",
+    "eco_mode": _eco_mode,
+    "eco_names": ", ".join(_eco_names),
+    "eco_codes": ", ".join(str(c) for c in _eco_codes),
+    # --- problem definition ---
+    "frac": _base_frac,
+    "frac_pct": _pct(_base_frac),
+    "budget_sweep": ", ".join(_pct(x) for x in _sweep),
+    "tol": _c.get("PIXEL_TOLERANCE", 0.05),
+    "tol_pct": _pct(_c.get("PIXEL_TOLERANCE", 0.05)),
+    "use_patch_approach": bool(_c.get("USE_PATCH_APPROACH", False)),
+    "min_patch_size": _cp.get("min_patch_size", 1),
+    "burden_sharing": _cp.get("burden_sharing", "no"),
+    "normalize": _cp.get("normalize_objectives", True),
+    # --- effect model ---
+    "abiotic_effect": _cp.get("abiotic_effect", 0.01),
+    "biotic_effect": _cp.get("biotic_effect", 0.01),
+    "weight_scale": _weight_scale,
+    "gamma": _gamma,
+    "neighbor_radius": _effect.get("neighbor_radius", 3),
+    "neighbor_decay": _effect.get("neighbor_effect_decay", 0.2),
+    # --- region operators ---
+    "sampling_strategy": _cp.get("sampling_strategy", "region_evolve"),
+    "region_seeds": _cp.get("region_seeds", 25),
+    "region_seeds_min": _cp.get("region_seeds_min", 5),
+    "region_seed_grid": _cp.get("region_seed_grid", 16),
+    "region_growth_bias": _cp.get("region_growth_bias", "scored"),
+    "region_mutation_edits": _cp.get("region_mutation_edits", 100),
+    "region_score_temperature": _cp.get("region_score_temperature", 1.0),
+    "min_patch_iters": _min_patch_iters,
+    "move_probs": _moves,
+}
+
+
+def _fmt_objlist(objs):
+    return ", ".join(f"`{o}`" for o in objs)
+
+
+def _mv(name):
+    # Move probability by name, formatted for inline prose.
+    return f"{P['move_probs'].get(name, 0):g}"
+```
+
+```{r}
+#| echo: false
+# This document renders under the knitr engine (it also contains R chunks), and
+# knitr only evaluates `r ...` inline code. Quarto's inline python-expression
+# syntax (backtick, brace-python-brace, expr, backtick) is jupyter-engine only;
+# under knitr it is passed through and shows up verbatim in the output.
+# pv() bridges the gap: it evaluates a Python expression in the same __main__
+# namespace as the chunk above and returns str() of the result, so inline
+# values in the prose stay written as Python.
+pv <- function(expr) reticulate::py_eval(paste0("str(", expr, ")"))
+```
+
+## Problem formulation 
+
+We formulate the identification of priority areas for restoration as a multi-objective optimisation problem: given a limited budget, where in an eligible landscape should restoration be allocated so as to best trade off improvement in ecosystem condition against cost? Two objectives are optimised:
+
+- Maximise the restoration benefit of the restoration strategy
+- Minimise the implementation cost of the restoration strategy
+
+### Study area and eligibility
+
+The analysis is run for Kanton Bern, Switzerland, at 100 m raster resolution in the Swiss LV95 projection (EPSG:2056). The pool of pixels eligible for restoration is those belonging to LULC classes Open Forest, Closed Forest, Grasslands, Pastures, Agricultural land.
+
+```{python}
+#| label: fig-landuse
+#| echo: false
+#| fig-cap: "Land use in Kanton Bern."
+#| out-width: "65%"
+import pathlib
+import numpy as np
+import rasterio as rio
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator
+
+def _find_raster(relpath):
+    # Resolve whether Quarto renders from paper2/ or the project root.
+    for cand in (pathlib.Path("..") / relpath, pathlib.Path(relpath)):
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(relpath)
+
+def _load_raster(relpath):
+    with rio.open(_find_raster(relpath)) as src:
+        arr = src.read(1).astype(float)
+        if src.nodata is not None and not np.isnan(src.nodata):
+            arr[arr == src.nodata] = np.nan
+        b = src.bounds
+        # Extent in km for readable axis ticks.
+        extent = (b.left / 1e3, b.right / 1e3, b.bottom / 1e3, b.top / 1e3)
+    return arr, extent
+
+_lulc, _extent = _load_raster("data/ecosystem_lulc_masked.tif")
+_cat = np.full(_lulc.shape, np.nan)
+_cat[np.isin(_lulc, [12, 13])] = 0  # forest
+_cat[np.isin(_lulc, [16, 17])] = 1  # grassland
+_cat[_lulc == 15] = 2               # agricultural
+
+_cols = ["#1b7837", "#7fbf7b", "#d9b382"]
+_cmap = ListedColormap(_cols)
+_cmap.set_bad("#f0f0f0")
+_norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], _cmap.N)
+
+_fig, _ax = plt.subplots(figsize=(6.2, 5.8))
+_ax.imshow(_cat, extent=_extent, cmap=_cmap, norm=_norm, interpolation="nearest")
+_ax.legend(
+    handles=[
+        Patch(facecolor=_cols[0], label="Forest (12, 13)"),
+        Patch(facecolor=_cols[1], label="Grassland (16, 17)"),
+        Patch(facecolor=_cols[2], label="Agricultural (15)"),
+    ],
+    loc="upper right", fontsize=8, framealpha=0.9,
+)
+_fig.tight_layout()
+plt.show()
+```
+
+### Decision variable
+
+A restoration plan is the allocation of restoration actions across the landscape within a fixed budget. A restoration action is a binary decision, taken at the level of an individual eligible pixel:
+
+$$x_i^{R} \in \{0,1\}$$
+
+where $x_i^{R} = 1$ selects pixel $i$ for restoration. 
+
+### Objective functions {#sec-objectives}
+
+Both objectives are expressed as minimisations. Before being passed to the solver each objective is normalised, with the raw values retained for reporting.
+
+**1. Restoration benefit**
+
+This objective scores the ecological improvement a plan  delivers. Each restored pixel is passed through the restoration effect model, which improves both its abiotic and biotic condition and, through a spillover effect, also improves not-selected eligible cells within an effect radius. 
+
+When pixel $i$ is restored, its anomaly changes by an amount that depends on the magnitude of its degradation:
+
+$$a_i^{1} = a_i^{0} + \alpha \, w(a_i^{0})$$
+
+where $\alpha$ is the effect magnitude (`abiotic_effect` = `r pv("P['abiotic_effect']")` and `biotic_effect` = `r pv("P['biotic_effect']")`) and $w$ is a saturating, degradation-weighting function. Positive or neutral anomalies receive no improvement, i.e. $w(a) = 0$ for $a \ge 0$. For degraded pixels:
+
+$$w(a) = \left(1 - e^{-\frac{|a|}{s}}\right)^{\gamma}$$
+
+with scale $s$ (set at `r pv("P['weight_scale']")`) and exponent $\gamma$ (set at `r pv("P['gamma']")` in the code). The weight is small for anomalies near zero and increases toward 1 as the anomaly becomes more negative, so that improvement is concentrated on the most degraded pixels.
+
+Restoration effect spills over to neighbouring pixels within a fixed radius of `r pv("P['neighbor_radius']")` pixels, at a reduced magnitude set by a decay factor of `r pv("P['neighbor_decay']")`:
+
+$$a_k^{1} = a_k^{0} + \alpha \, \lambda \, w(a_k^{0})$$
+
+where $\lambda$ = `r pv("P['neighbor_decay']")` and the same anomaly-dependent weight $w$ is applied per neighbour. The biotic anomaly is updated identically with its own effect magnitude.
+
+The objective sums the resulting change in the abiotic and biotic condition anomalies change over all eligible pixels:
+
+$$f_{\text{RB}}(x) = -\sum_{i \in \Omega_{\text{elig}}} \left[\left(a_i^{1}-a_i^{0}\right)+\left(b_i^{1}-b_i^{0}\right)\right]$$
+
+where $a_i^{0}, b_i^{0}$ are the baseline abiotic and biotic anomalies and $a_i^{1}, b_i^{1}$ their post-restoration values under the effect model.
+
+**Implementation cost**
+
+Total implementation cost is the sum of per-pixel cost over all selected pixels:
+
+$$f_{\text{cost}}(x) = \sum_{k \in \Omega_{R}} y^{R}_{k}(x)\, c_{k}$$
+
+### Constraints {#sec-constraints}
+
+#### Budget constraint
+
+The budget is set at `r pv("P['frac']")` of eligible pixels.
+
+The problem reports the budget constraint as the absolute deviation of the realised pixel count from the target, so it is satisfied exactly at zero. To avoid over-constraining the problem, feasibility of a solution is controled by a repair operator which returns each individual to a tolerance window of `r pv("P['tol_pct']")` of the budget. 
+
+#### Minimum-patch-size contiguity constraint {#sec-contiguity}
+
+Spatial coherence is imposed as an epsilon constraint. Every 4-connected component of the selected area must exceed a minimum size, and that minimum is swept across levels. This enters the problem as a second inequality constraint,
+
+$$g_2(x) = \max\bigl(0,\; S - \min_{c \in \mathcal{C}(x)} |c| \bigr)$$
+
+over the connected components $\mathcal{C}(x)$ of the selection. The constraint is zero when the plan is feasible.
+
+## Data
+
+#### Restoration potential
+
+Calculated as the combined mean anomaly of abiotic and biotic condition variables.
+
+Condition anomalies quantify how far each pixel departs from a reference condition, with negative values indicating degradation. Indicators were selected following the principles described in Czúcz et al. 2021, and on the basis of data availability. Indicators were z-score normalised to allow comparison, and transformed to represent positive directionality (higher values being more desirable). 
+
+| ECT class | State characteristics | LULC class | Indicator(s) | Year |
+|---|---|---|---|---|
+| Abiotic | Physical state characteristics | Agricultural land, Grasslands, Alpine Pastures, Forests | Soil moisture deficit | 2018 |
+| | | | Soil bulk density | 1970-2017 |
+| | Chemical state characteristics | Agricultural land, Grasslands, Alpine Pastures, Forests | Soil organic carbon content | nd |
+| Biotic | Compositional state characteristics | Agricultural land, Grasslands, Alpine Pastures | Habitat suitability for UZL species | 2020 |
+| | | Forests | Tree species diversity | 2018 |
+| | Structural state characteristics | Agricultural land, Grasslands, Alpine Pastures | Small woody features (Trees: number of individual trees per pixel; Hedges: % hedgerow coverage per pixel) | 2025 |
+| | | Forests | Canopy height | 2025 |
+| | Functional state characteristics | Agricultural land, Grasslands, Alpine Pastures | Mean annual NDVI | 2018 |
+| | | Forests | Mean annual LAI | 2021 |
+| | Landscape characteristics | Agricultural land, Grasslands, Alpine Pastures | Density of semi-natural areas | 2025 |
+| | | Forests | Density of forest areas | 2025 |
+: Overview of indicators used for construction of Ecosystem Condition index. {#tbl-ect}
+
+#### Implementation cost
+
+Add detail on how implementation cost was derived
+
+```{python}
+#| label: fig-inputdata-be
+#| echo: false
+#| fig-cap: "Input objective layers over the Kanton Bern eligible pool. Top: spatial distribution of the restoration-potential score and implementation cost. Bottom: their frequency distributions across eligible pixels. Colour limits are clipped at the 98th percentile of magnitude for legibility."
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+
+def _restoration_potential(anom_dir):
+    # Equal-weight mean of abiotic and biotic baseline anomaly, matching the
+    # in-memory computation in Core_optimisation/data_loader.py.
+    _ab, _ext = _load_raster(f"{anom_dir}/abiotic_global_all.tif")
+    _bi, _ = _load_raster(f"{anom_dir}/biotic_global_all.tif")
+    return (_ab + _bi) / 2.0, _ext
+
+
+def _plot_input_layers(rp, cost, ext_rp, ext_cost, pixel_label):
+    fig, axs = plt.subplots(2, 2, figsize=(10, 9))
+
+    lim = np.nanpercentile(np.abs(rp), 98)
+    im0 = axs[0, 0].imshow(rp, extent=ext_rp, cmap="RdBu",
+                           norm=TwoSlopeNorm(0, -lim, lim), interpolation="nearest")
+    axs[0, 0].set_title("Restoration potential")
+    fig.colorbar(im0, ax=axs[0, 0], shrink=0.75)
+
+    cmax = np.nanpercentile(cost, 98)
+    im1 = axs[0, 1].imshow(cost, extent=ext_cost, cmap="magma_r",
+                           vmin=0, vmax=cmax, interpolation="nearest")
+    axs[0, 1].set_title("Implementation cost")
+    fig.colorbar(im1, ax=axs[0, 1], shrink=0.82, label="normalised cost")
+
+    axs[1, 0].hist(rp[np.isfinite(rp)], bins=60, color="#4575b4")
+    axs[1, 0].axvline(0, color="k", lw=0.8, ls="--")
+    axs[1, 0].set_title("Restoration potential distribution")
+    axs[1, 0].set_xlabel("score")
+    axs[1, 0].set_ylabel(pixel_label)
+
+    axs[1, 1].hist(cost[np.isfinite(cost)], bins=60, color="#b2182b")
+    axs[1, 1].set_title("Implementation cost distribution")
+    axs[1, 1].set_xlabel("normalised cost")
+    axs[1, 1].set_ylabel(pixel_label)
+
+    fig.tight_layout()
+    plt.show()
+
+
+def _morans_i(a):
+    # Global Moran's I under rook (4-neighbour) contiguity, over valid-data
+    # pixels only. Adjacent pairs are counted once (right + down neighbours);
+    # the symmetric double-count cancels in the ratio, giving
+    #   I = N * sum_edges(z_i z_j) / (n_edges * sum(z^2)).
+    x = a.astype(float)
+    v = np.isfinite(x)
+    n = int(v.sum())
+    z = np.where(v, x - x[v].mean(), 0.0)
+    denom = float(np.sum(z * z))
+    vr = v[:, :-1] & v[:, 1:]
+    vd = v[:-1, :] & v[1:, :]
+    s = float((z[:, :-1] * z[:, 1:])[vr].sum() + (z[:-1, :] * z[1:, :])[vd].sum())
+    n_edges = int(vr.sum() + vd.sum())
+    return n * s / (n_edges * denom)
+
+
+_elig, _extent = _load_raster("data/eligible_pixels_fg.tif")
+_emask = _elig > 0
+_rp, _ = _restoration_potential("data/anomaly_scenarios")
+_cost, _ = _load_raster("data/implementation_cost_corrected.tif")
+_rp_e = np.where(_emask, _rp, np.nan)
+_cost_e = np.where(_emask, _cost, np.nan)
+
+_plot_input_layers(_rp_e, _cost_e, _extent, _extent, "eligible pixels")
+```
+
+```{python}
+#| echo: false
+#| results: asis
+print(
+    f"Spatial autocorrelation (Global Moran's I): "
+    f"restoration potential {_morans_i(_rp_e):.2f}, "
+    f"implementation cost {_morans_i(_cost_e):.2f}."
+)
+```
+
+
+## Generation of alternatives {#sec-algorithm}
+
+To generate alternative spatial restoration plans, we used the genetic algorithm `r pv("P['algorithm']")` [@deb_fast_2002] run in python with the package 'pymoo' (version 0.6.1.5) [@blank_pymoo_2020]. The algorithm was run for an initial population of `r pv("P['pop_size']")` individuals and run for a maximum of `r pv("P['n_generations']")` generations. Each configuration was repeated over `r pv("P['n_seeds']")` random seeds to characterise stochastic variability of the solver.
+
+*NOTE* the methods used for sampling, crossover, mutation and repair, which define how the algorithm produces, adapts and ensures feasibility of solutions within constraints, are explained in @sec-operator-details, as it's a bit long...
+
+## Uncertainty analysis {#sec-uncertainty-methods}
+
+<!--
+  Every number quoted here and in the uncertainty results section comes from
+  Core_optimisation/uncertainty_analysis.py; See the header of _results_uncertainty.qmd for how to refresh the numbers after new runs, and set UNC_DIR in the config chunk below.
+-->
+
+```{r}
+#| label: config-unc-methods
+#| echo: false
+
+# Output tree of Core_optimisation/uncertainty_analysis.py (see OUT_DIR in that module).
+UNC_DIR <- "outputs/uncertainty"
+
+# Readable names for the indicators. Codes and the abiotic/biotic split are those of
+# data/ec_anomalies.r (ECT_CATEGORIES); labels are display-only and safe to reword.
+# All 11 are present in the 20260821 benchmark x construction grid; tsd/can/lai are
+# forest-only and were absent from the earlier 8-indicator campaign.
+# TODO(confirm): "cdi" has no definition in data/ec_anomalies.r or
+# data/EC_indicator_processing.r - it is an agricultural, biotic, positive-direction
+# indicator absent from the CH stack. Replace the placeholder below.
+IND_LABELS <- c(
+  smd   = "Soil moisture deficit",
+  sbd   = "Soil bulk density",
+  soc   = "Soil organic carbon",
+  uzl   = "Habitat suitability",
+  cdi   = "Crop diversity",
+  swf_h = "Small woody features: hedges",
+  swf_t = "Small woody features: trees",
+  ndvi  = "NDVI",
+  tsd   = "Tree species diversity",
+  can   = "Canopy cover",
+  lai   = "Leaf area index"
+)
+IND_COMPONENT <- c(smd = "Abiotic", sbd = "Abiotic", soc = "Abiotic",
+                   uzl = "Biotic", cdi = "Biotic", swf_h = "Biotic",
+                   swf_t = "Biotic", ndvi = "Biotic",
+                   tsd = "Biotic", can = "Biotic", lai = "Biotic")
+
+# Readable names for the formulation axes searched (CAMPAIGNS in
+# Core_optimisation/uncertainty_analysis.py).
+AXIS_LABELS <- c(
+  seed               = "Search stochasticity",
+  seed_pooled_halves = "Baseline",
+  construction       = "Indicators",
+  scaling            = "Scaling",
+  weighting          = "Weighting"
+)
+
+# Reader-facing names for the run sets. The keys are the internal names in CAMPAIGNS
+# (Core_optimisation/uncertainty_analysis.py); the labels are what the prose and tables
+# show, so the internal vocabulary never reaches the page. A set with no entry here falls
+# back to its internal name, which is the signal to add one.
+SET_LABELS <- c(
+  weighting                = "Weighting",
+  benchmark_x_construction = "Benchmark x indicators"
+)
+.setlab <- function(k) unname(ifelse(is.na(SET_LABELS[k]), k, SET_LABELS[k]))
+```
+
+```{r}
+#| label: setup-unc-shared
+#| include: false
+
+# Loader shared with _results_uncertainty.qmd: report.json, the run manifest, and the
+# accessors and formatters that keep literal numbers out of the prose.
+# dplyr/knitr are needed by the design table below. This file is included BEFORE
+# _results_baseline.qmd and _results_uncertainty.qmd, which is where they are otherwise
+# first attached, so they have to be loaded here rather than relied on.
+suppressPackageStartupMessages({
+  library(jsonlite); library(dplyr); library(knitr)
+})
+
+PROJ <- if (dir.exists("Core_optimisation")) "." else ".."
+.p <- function(rel) file.path(PROJ, rel)
+.u <- function(name) .p(file.path(UNC_DIR, name))
+
+if (!file.exists(.u("report.json")))
+  stop("outputs/uncertainty/report.json not found - run ",
+       "`pixi run python -m Core_optimisation.uncertainty_analysis all` first.")
+RPT <- jsonlite::read_json(.u("report.json"), simplifyVector = TRUE)
+
+# report.json is written key-by-key: each stage refreshes only its own block. Name
+# the missing stage rather than failing later on a NULL interpolation.
+.need_stages <- function(...) {
+  miss <- setdiff(c(...), names(RPT))
+  if (length(miss))
+    stop("report.json has no block for stage(s): ", paste(miss, collapse = ", "),
+         ". Re-run those stages of Core_optimisation/uncertainty_analysis.py.")
+}
+.need_stages("config", "extract", "layers", "cross", "noise")
+
+# Accessors: read_json(simplifyVector = TRUE) leaves nested objects as either named
+# lists or named atomic vectors depending on their contents, and `[[` works on both.
+.g  <- function(x, ...) Reduce(function(a, k) a[[k]], list(...), x)
+.gn <- function(x, ...) as.numeric(.g(x, ...))
+
+# Formatting helpers, so the prose never carries a literal number.
+.n   <- function(v, d = 0) unname(format(round(v, d), big.mark = ",", trim = TRUE))
+.pc  <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+.f   <- function(v, d = 3) sprintf(paste0("%.", d, "f"), v)
+
+CFG <- RPT$config
+N_SEEDS <- length(CFG$seeds)
+# Run count comes from the extract stage's own manifest, so the `extract` block of
+# report.json is not required to render this section.
+N_RUNS     <- length(jsonlite::read_json(.u("selected_runs.json")))
+N_VARIANTS <- length(.g(RPT, "layers", "variant_tags"))
+
+# One row per formulation axis actually searched, from the config block, so adding an
+# axis to CAMPAIGNS in the python module carries through to the prose here.
+AXES <- do.call(rbind, lapply(names(CFG$campaigns), function(cn) {
+  cc <- CFG$campaigns[[cn]]
+  data.frame(campaign = cn, axis = unlist(cc$axes),
+             n_levels = vapply(unlist(cc$axes),
+                               function(a) length(cc$levels[[a]]), integer(1)),
+             reference = vapply(unlist(cc$axes),
+                                function(a) as.character(cc$reference[[a]]), character(1)),
+             construction = cc$objective_construction,
+             stringsAsFactors = FALSE)
+}))
+AXES$label <- unname(ifelse(is.na(AXIS_LABELS[AXES$axis]), AXES$axis,
+                            AXIS_LABELS[AXES$axis]))
+```
+
+### Set up
+
+Three choices made when building the condition objective were searched, each replicated
+over `r N_SEEDS` seeds (@tbl-unc-design). The benchmark and leave-one-out axes are fully
+crossed, so their interaction is identified as well as their main effects.
+
+The three searched axes each perturb a different step of the pipeline that turns the
+`r length(IND_LABELS)` raw indicators into the abiotic and biotic anomaly layers the
+benefit objective reads. A fourth choice, the form of the ecological objective applied to those layers, 
+is also implemented but not currently included in the results (see @sec-notes).
+
+```{r}
+#| label: tbl-unc-design
+#| tbl-cap: "Configurations run."
+#| echo: false
+
+DESIGN <- .g(RPT, "extract", "design")
+
+AXES |>
+  mutate(Levels = vapply(seq_len(n()),
+                         function(i) paste(CFG$campaigns[[campaign[i]]]$levels[[axis[i]]],
+                                           collapse = ", "), character(1)),
+         Reference = reference) |>
+  group_by(campaign) |>
+  ungroup() |>
+  select(Axis = label, `Levels` = n_levels, `Ref code` = Reference) |>
+  kable(align = "llrlllr")
+```
+
+*Benchmark (scaling).* Which pixels define the reference condition an indicator is
+z-scored against. 
+Each indicator is first put on a common direction (higher = better
+condition) and then converted to an anomaly $(x - \mu_{\text{ref}})/\sigma_{\text{ref}}$.
+
+* Under `global` the reference mean and standard deviation are taken over every pixel of the ecosystem, so an anomaly measures departure from the current landscape average. 
+* Under `upper_qNN` the reference set is restricted to the best-conditioned pixels (25th, 50th, 75th quartile) so an anomaly measures the shortfall from the best attainable level. Raising the quantile therefore makes the restoration target more ambitious: it pushes the whole anomaly distribution downward and rescales the spread between pixels, which changes both which pixels look most degraded and how far apart the objective can hold two plans.
+* Under `zones` the reference mean and standard deviation are computed within each zone rather than over the ecosystem as a whole, where a zone is the intersection of a production region with one of three altitude bands. An anomaly then measures departure from what is typical at a regional level.
+
+*Indicators*: Which indicators enter the composite ecosystem condition index.
+
+* `all` averages every indicator available for an ecosystem within its ECT category;
+* each `drop_<k>` level removes indicator $k$ from that category mean and rebuilds the composite from the remainder.
+
+*Weighting.* How much each indicator contributes to the composite, with the indicator set
+held fixed.
+
+Levels were chosen to span a range of departures from equal weighting. Departure is $\tfrac{1}{2}\sum_i |w_i - 1/n|$, taken within each
+ecosystem and averaged by eligible-pixel share: 0 at equal weighting, 1 when all weight
+falls on one indicator.
+
+* 13 structured weightings cover the near range. 
+  + `w_flat` gives each indicator an equal share $1/n$
+  + `w_cat` splits weight equally between the abiotic and biotic blocks and equally within each, reproducing the default rasters
+  + each `w_<k>` doubles indicator $k$'s share to $2/n$ and shrinks the rest proportionally.
+* 12 further weightings extend the range. Candidates were drawn at random from all possible weightings, and a candidate was kept only if its departure fell close to one of three target values (0.20, 0.35, 0.50), until four different candidates had been kept at each. The targets were set using a screening step that ranks pixels under a candidate weighting without running the optimiser.
+
+This gives `r AXES$n_levels[AXES$axis == "weighting"]` weightings at `r N_SEEDS` seeds
+spanning nine departures from 0 to 0.50, referenced to equal weighting. Each is applied
+per ecosystem by keeping the indicators measured there and rescaling to sum to one.
+
+### Analysis 
+
+Every non-dominated plan from every run was pooled into a single archive of
+`r .n(.gn(RPT, "cross", "n_plans"))` unique plans and then re-scored under each of the
+`r N_VARIANTS` condition variants with a standalone evaluator, validated against the
+search engine itself to a maximum relative error of
+`r sprintf("%.1e", .gn(RPT, "layers", "benefit_vs_engine_max_rel_err"))` on benefit and
+`r sprintf("%.1e", .gn(RPT, "layers", "cost_vs_engine_max_rel_err"))` on cost. A plan's
+deviation under a variant is its cost-matched benefit regret against the best any plan
+achieved under that variant.
+
+The weighting axis is carried on a structurally different raster construction from the
+other two: a weighting scenario writes one all-indicator weighted composite to both the
+abiotic and the biotic layer, so the objective becomes `2*eff*w(C)` rather than
+`eff*w(A) + eff*w(B)`, and the abiotic-to-biotic block balance is a property of the
+weight vector instead of a hardcoded 1:1. Because the improvement weight is nonlinear,
+the equal-block weighting scenario and the default all-indicator scenario are therefore
+not the same scenario, and each axis is referenced to its own no-perturbation level.
+
+Robustness is defined over the pooled archive across all variants. Every plan is re-scored under all variants, and the cost-matched benefit regret is calculated as the deviation of each solution compared to the best solution under that variant. The 25% of plans with the lowest maximum regret form the robust subset - those that stay close to the best available plan whichever formulation is chosen.

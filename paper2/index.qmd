@@ -1,0 +1,52 @@
+---
+title: Uncertanty in restoration prioritization
+authors:
+  - name: Isabel Nicholson Thomas
+    affiliation: ETH Zürich
+    roles: writing (original draft)
+    corresponding: true
+    orcid: 0009-0006-7451-8074
+  - name: Jonas Schwaab
+    affiliation: Leibniz University Hannover
+    roles: writing (review & editing)
+    corresponding: false
+    orcid: 0000-0003-4625-3882
+  - name: Eva Ruedin
+    affiliation: ETH Zürich
+    roles: data
+    corresponding: false
+  - name: Adrienne Grêt-Regamey
+    affiliation: ETH Zürich
+    roles: writing (review & editing), supervision
+    corresponding: false
+    orcid: 0000-0001-8156-9503
+bibliography: rest_moo_paper.bib
+---
+
+# Introduction
+{{< include _introduction.qmd >}}
+
+# Methods
+{{< include _methods.qmd >}}
+
+# Results
+## Baseline results
+
+*to establish behaviour of optimiser*
+
+{{< include _results_baseline.qmd >}}
+
+## Uncertainty analysis
+{{< include _results_uncertainty.qmd >}}
+
+# Discussion
+{{< include _discussion.qmd >}}
+
+# Conclusions
+
+# Supplementary material
+{{< include _methods_operator_detail.qmd >}}
+
+# References
+
+

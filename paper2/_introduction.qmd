@@ -1,0 +1,32 @@
+* General context of the need to develop robust plans for restoration
+  + Systematic conservation planning (SCP) methods using optimisation algorithms allow for exploration of potential solutions and uncertainties that can help to drive interaction with decision-makers
+
+* Importance of correct problem formulation for prioritisation
+  + Setting conservation and restoration priorities requires four elements to be explicit: an objective function, a defined set of candidate actions, a model relating actions to outcomes, and resource constraints [@game_six_2013]. Where these are left implicit, prioritisation may be less effective.
+
+* Uncertainty from ecosystem condition
+  + SCP efforts guiding restoration may be inadequate if they don’t consider ecosystem condition [@van_lanen_considering_2025]
+  + Whilst efforts continue to standardise assessment of condition particularly in the accounting context, many different concepts are used [@nicholson_thomas_towards_2025], [@rendon_analysis_2019] . 
+  + Therefore even where an objective for restoration is stated, evaluating it requires navigating complex definition of ecosystem condition. 
+  + Uncertainty from the definition of ecosystem condition enters restoration prioritisation in two ways: what counts as success, and what counts as the current state being improved upon.
+
+* Forms of uncertainty for restoration prioritisation
+  + [@regan_taxonomy_2002] distinguish epistemic uncertainty (imperfect knowledge of facts) from linguistic uncertainty (vagueness, ambiguity, and contested definitions of terms). 
+  + [@kujala_treatment_2013] added a third category, human decision uncertainty — uncertainty arising from stakeholders' differing values, objectives, and preferences, which is not resolved by better data or clearer terminology. 
+  + Restoration prioritisation draws on these three forms of uncertainty:
+    - indicator choice as epistemic uncertainty
+    - ecosystem condition as linguistic uncertainty
+    - objective definition as human decision uncertainty.
+  + although these categorisations are note very clear and overlap
+
+* Analysis framework: 
+  + Many Objective Robust Decision Making (MORDM) [@kasprzyk_many_2013] offers a structure for interrogating uncertainty and incorporating it in the decision-making process, rather than treating it as noise around a single answer. Currently only incorporating at the steps Problem Formulation, Generating Alternatives, Uncertainty Analysis.
+  + Generating alternatives through optimisation produces a population of candidate spatial plans rather than one optimum, which when combined with the results of uncertainty analysis step.
+  + This makes it possible to ask which restoration priorities are robust to formulation choice and which are not, and to identify the conditions under which a given plan's priorities would fail.
+
+![MORDM outline](MORDM_diagram.jpg)
+
+Research questions (to be refined):
+
+* How sensitive is the selection of priority areas for restoration of terrestrial  ecosystems in Switzerland to the choice of restoration objectives?
+* Given sensitivity to the problem formulation, can a set of robust priority areas be identified/under what conditions does this robust set become contested?
