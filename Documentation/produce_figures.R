@@ -362,7 +362,13 @@ if (length(runs_meta) > 0L) {
   # ceiling. (Min-max normalising the pooled matrix would NOT help: dominated-HV
   # fraction is invariant to per-axis affine rescaling.) HV is only comparable
   # within a scaling group.
-  .scaling_of <- function(nm) if (grepl("q75", nm)) "upper_q75" else "global"
+  # Recover the scaling level from a run-dir / tag name. Generic over the benchmark
+  # family (global, upper_q25/q50/q75/q90, zones) so adding a quantile level needs no
+  # edit here; anything unrecognised falls back to "global".
+  .scaling_of <- function(nm) {
+    hit <- regmatches(nm, regexpr("upper_q[0-9]+|zones", nm))
+    if (length(hit) == 0L || !nzchar(hit[1L])) "global" else hit[1L]
+  }
   hv_groups   <- stats::setNames(vapply(names(runs_meta), .scaling_of, character(1)),
                                  names(runs_meta))
   shared_hv <- tryCatch(compute_shared_hv(runs_meta, obj_names, groups = hv_groups),
@@ -429,7 +435,7 @@ if (length(runs_meta) > 0L) {
       df$scenario <- .fac_label(nm)
       # Scaling level governs restoration_potential's magnitude (~100x apart), so
       # it is the grouping the objectives must be normalised WITHIN.
-      df$scaling  <- if (grepl("scal-upper_q75", nm)) "upper_q75" else "global"
+      df$scaling  <- .scaling_of(nm)
       tibble::as_tibble(df)
     })
     if (nrow(nd_overlay) > 0L) {
