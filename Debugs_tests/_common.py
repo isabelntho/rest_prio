@@ -7,7 +7,8 @@ Unicode check marks the shared visualisations code prints on a cp1252 console.
 It also centralises the boilerplate that used to be copy-pasted across ~25 scripts:
 the standard Bern / global_all initial-conditions load, the direct-evaluation BASE
 params, the run constants (POP_SIZE / N_GENERATIONS / RANDOM_SEEDS), the union-find
-adjacency / n_components metric, and a "newest pkl per seed" selector.
+adjacency / n_components metric, the spatial-spread summary of a front, and a
+"newest pkl per seed" selector.
 
 Because each diagnostic is launched as `pixi run python Debugs_tests/<mod>.py`, the
 script's own directory is sys.path[0], so `from _common import ...` resolves without
@@ -105,6 +106,33 @@ def cluster_metrics(sel, nbr):
                     parent[ra] = rb
     n_comp = len({find(i) for i in range(len(idx))})
     return adjacency, n_comp
+
+
+def spread_metrics(dec_nd, ic, grid=16):
+    """Spatial-spread summary of a set of non-dominated restoration plans.
+
+    `dec_nd` is the (n_nd, n_var) decision block of the non-dominated solutions. Returns
+    centroid_spread (how far apart the plans' centres of mass sit), the number of coarse
+    grid cells ever restored, and top_cell_share (how concentrated the selections are).
+    """
+    shape = ic["shape"]; W = shape[1]
+    elig = np.asarray(ic["restoration_eligible_indices"])
+    n_rest = elig.size
+    D = dec_nd[:, :n_rest].astype(bool)
+    rows, cols = np.divmod(elig, W)
+    cents = np.array([[rows[d].mean(), cols[d].mean()] for d in D if d.any()])
+    cent_spread = float(np.hypot(cents[:, 0].std(), cents[:, 1].std())) if len(cents) else 0.0
+    H = shape[0]
+    cell = (rows * grid // H) * grid + (cols * grid // W)
+    freq = D.mean(axis=0)
+    ever = freq > 0
+    cells_touched = np.unique(cell[ever]).size
+    cells_total = np.unique(cell).size
+    sel_per_cell = np.bincount(cell, weights=freq, minlength=cell.max() + 1)
+    conc = float(sel_per_cell.max() / sel_per_cell.sum()) if sel_per_cell.sum() else 1.0
+    return dict(n_nd=len(D), centroid_spread=cent_spread,
+                cells_touched=cells_touched, cells_total=cells_total,
+                top_cell_share=conc)
 
 
 def newest_per_seed(pattern_fmt, seeds):

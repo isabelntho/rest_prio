@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 import numpy as np
 
-from _common import REPO_ROOT, RESULTS_DIR, DIAG_DIR, load_ic, use_agg
+from _common import REPO_ROOT, RESULTS_DIR, DIAG_DIR, load_ic, use_agg, spread_metrics
 
 OBJECTIVES_3 = ["restoration_potential", "spatial_clustering", "cost"]
 
@@ -450,28 +450,6 @@ REGEV_PARAMS = {
 }
 
 
-def _regev_spread_metrics(dec_nd, ic, grid=16):
-    """Spatial-spread summary of the non-dominated restoration plans."""
-    shape = ic["shape"]; W = shape[1]
-    elig = np.asarray(ic["restoration_eligible_indices"])
-    n_rest = elig.size
-    D = dec_nd[:, :n_rest].astype(bool)
-    rows, cols = np.divmod(elig, W)
-    cents = np.array([[rows[d].mean(), cols[d].mean()] for d in D if d.any()])
-    cent_spread = float(np.hypot(cents[:, 0].std(), cents[:, 1].std())) if len(cents) else 0.0
-    H = shape[0]
-    cell = (rows * grid // H) * grid + (cols * grid // W)
-    freq = D.mean(axis=0)
-    ever = freq > 0
-    cells_touched = np.unique(cell[ever]).size
-    cells_total = np.unique(cell).size
-    sel_per_cell = np.bincount(cell, weights=freq, minlength=cell.max() + 1)
-    conc = float(sel_per_cell.max() / sel_per_cell.sum()) if sel_per_cell.sum() else 1.0
-    return dict(n_nd=len(D), centroid_spread=cent_spread,
-                cells_touched=cells_touched, cells_total=cells_total,
-                top_cell_share=conc)
-
-
 def cmd_region_evolve(arg):
     import glob
     from Core_optimisation.resto_anom import run_optimization_instance
@@ -493,7 +471,7 @@ def cmd_region_evolve(arg):
     hv = np.asarray(res["algorithm_info"]["hypervolume_history"], float)
     dec = np.asarray(res["decisions"])
     nd = np.asarray(res["is_nondominated"], bool)
-    m = _regev_spread_metrics(dec[nd], ic)
+    m = spread_metrics(dec[nd], ic)
     print(f"\nwall={dt:.0f}s  HV {hv[0]:.4g}->{hv[-1]:.4g} ({(hv[-1]-hv[0])/abs(hv[0])*100:+.2f}%)")
     print(f"non-dominated plans: {m['n_nd']}")
     print(f"centroid spread (px): {m['centroid_spread']:.0f}   (higher = plans sit in different areas)")

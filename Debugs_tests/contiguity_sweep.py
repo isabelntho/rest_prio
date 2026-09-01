@@ -6,12 +6,17 @@ Subcommands (pixi run python Debugs_tests/contiguity_sweep.py <cmd>):
   run        RUN ONLY. Runs the potential-vs-cost problem at several min-patch levels S
              (+ optional scattered baseline) across several seeds, and SAVES one pkl per
              (level, seed) as res_*_contig_<level>_seed_<seed>.pkl. Process-level
-             parallelism only (each run forced n_jobs=1; GRID_WORKERS runs concurrent as
-             separate processes). Edit SMOKE below for a fast wiring check. Does NOT plot.
+             parallelism only (evaluation is sequential within a run; GRID_WORKERS runs
+             concurrent as separate processes). Edit SMOKE below for a fast wiring check.
+             Does NOT plot.
 
   fronts     Overlay the pooled potential-vs-cost Pareto fronts by contiguity level and
              print the summary table (hv / patch sizes / n_components / adjacency). Reads
              the saved pkls; re-runnable to tweak the figure.
+
+  summary    Write the two tidy CSVs that paper2/_results_baseline.qmd reads:
+             outputs/r_inputs/contiguity_summary/contiguity_{solutions,runs}.csv
+             (one row per non-dominated solution / per run). Reads the saved pkls.
 
   spatial    For each level, an example-solution map + per-pixel RFOP, from the same pkls.
 
@@ -58,14 +63,29 @@ from Core_optimisation.spatial_operations import _label_components, build_restor
 # ===========================================================================
 SMOKE = False                     # True = fast wiring check; False = real sweep
 # Process-level parallelism ONLY (see run_custom_parallel.py / grid_parallel.py):
-# each run is forced to n_jobs=1, and GRID_WORKERS runs execute concurrently as
+# each run evaluates sequentially, and GRID_WORKERS runs execute concurrently as
 # separate processes. GRID_WORKERS <= 1 = sequential in-process fallback.
 # Bound GRID_WORKERS by RAM, not cores: each worker holds its own ~1.3M-pixel
 # raster copy (the IC is pickled once into every worker via the pool initializer).
-GRID_WORKERS = 6                  # number of runs executing concurrently (processes)
+#
+# The scenario parameters below MIRROR the production driver
+# Core_optimisation/run_custom_nsga2.py (custom_scenario_params + PIXEL_TOLERANCE +
+# HV_PATIENCE), so the only thing this sweep varies is min_patch_size. Keep them in sync
+# with that file. The search BUDGET is deliberately smaller than production's 100 x 150:
+# this is a 15-run comparison of levels, not a production front, and pop 50 x 100 gens is
+# the budget the earlier contiguity sweeps used.
+GRID_WORKERS = 5                  # number of runs executing concurrently (processes)
 RUN_POP_SIZE = 50
 RUN_N_GENERATIONS = 100
-RUN_RANDOM_SEEDS = [606, 707, 808, 909, 102]
+RUN_PIXEL_TOLERANCE = 0.1         # run_custom_nsga2.PIXEL_TOLERANCE
+# Hypervolume early stopping ON: a run halts once its hypervolume has not improved for
+# RUN_HV_PATIENCE generations. Note this differs from run_custom_nsga2, which disables it
+# (HV_PATIENCE = N_GENERATIONS + 1) precisely because runs being compared then share a
+# generation budget. With it on, levels can stop at different generations, so read the
+# `generations` column of contiguity_runs.csv alongside any cross-level front comparison -
+# a level with a smaller front may simply have run fewer generations.
+RUN_HV_PATIENCE = 15
+RUN_RANDOM_SEEDS = [606, 707, 808]
 MIN_PATCH_LEVELS = [1, 2, 5, 10, 25]  # min clump size in pixels = hectares; 1 = no floor
 INCLUDE_SCATTERED = False              # add the unconstrained bitflip baseline
 
@@ -76,15 +96,33 @@ if SMOKE:
     INCLUDE_SCATTERED = True
     GRID_WORKERS = 2
 
+# Verbatim copy of run_custom_nsga2.custom_scenario_params, minus min_patch_size (the
+# swept axis, set per level in _build_tasks) and minus the warm-start keys (WARM_SEEDING
+# is False on this path, so they are inert).
 RUN_BASE_PARAMS = {
-    "max_restoration_fraction": 0.05, "spatial_clustering": 0,
-    "biotic_effect": 0.01, "abiotic_effect": 0.01, "normalize_objectives": True,
-    "burden_sharing": "no", "rp_formulation": "sum", "rp_threshold": 0.0,
-    "region_seeds": 25, "region_seeds_min": 5, "region_growth_bias": "scored",
-    "region_mutation_edits": 100, "region_random_share": 1,
+    "max_restoration_fraction": 0.05,
+    "spatial_clustering": 0,
+    "biotic_effect": 0.01,
+    "abiotic_effect": 0.01,
+    "normalize_objectives": True,
+    "burden_sharing": "no",
+    "rp_formulation": "sum",
+    "rp_threshold": 0.0,
+    "sampling_strategy": "region_evolve",
+    "repair_scored": False,
+    "region_seeds": 25,
+    "region_seeds_min": 5,
+    "region_growth_bias": "scored",
+    "region_random_share": 0.5,
+    "region_mutation_edits": 100,
+    "region_score_temperature": 1.0,
 }
 
 LOG_DIR = os.path.join(REPO_ROOT, "outputs", "logs")
+# All of this sweep's R exports land under ONE parent folder so the Quarto document can
+# point at a single root instead of pattern-matching loose r_inputs sub-folders. Stamped
+# once per `run` invocation (below) and passed to every worker.
+R_EXPORT_ROOT = os.path.join(REPO_ROOT, "outputs", "r_inputs")
 
 # --- worker plumbing (module-level so it pickles under Windows 'spawn') ------
 # initial_conditions is shipped to each worker ONCE via the pool initializer
@@ -101,12 +139,12 @@ def _init_worker(ic):
 def _run_one(task):
     """Run a single (level, seed) optimisation. Returns a small picklable tuple.
 
-    Process-level parallelism IS the parallelism here, so the inner pymoo eval thread
-    pool is forced serial (n_jobs=1). Redirects this run's verbose stdout/stderr to a
+    Process-level parallelism IS the parallelism here; evaluation within a run is
+    sequential. Redirects this run's verbose stdout/stderr to a
     per-run log file so concurrent runs do not interleave, and restores the streams
     afterwards (a worker process is reused across several tasks).
     """
-    run_label, _label, params, seed = task
+    run_label, _label, params, seed, r_export_parent = task
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"{run_label}.log")
     t0 = time.perf_counter()
@@ -121,7 +159,9 @@ def _run_one(task):
                     pop_size=RUN_POP_SIZE, n_generations=RUN_N_GENERATIONS,
                     save_results=(not SMOKE), verbose=True,
                     random_seed=seed, use_repair=True, use_patch_approach=False,
-                    pixel_tolerance=0.05, algorithm_type="nsga2", run_label=run_label,
+                    pixel_tolerance=RUN_PIXEL_TOLERANCE, hv_patience=RUN_HV_PATIENCE,
+                    algorithm_type="nsga2", run_label=run_label,
+                    r_export_parent=r_export_parent,
                 )
                 ok = True
             except Exception as e:  # noqa: BLE001 - report, don't crash the pool
@@ -132,21 +172,29 @@ def _run_one(task):
     return run_label, ok, elapsed, err
 
 
-def _build_tasks():
-    """Build the flat list of (run_label, label, params, seed) runs."""
+def _build_tasks(r_export_parent):
+    """Build the flat list of (run_label, label, params, seed, r_export_parent) runs.
+
+    The level label carries the sampling strategy ('evolve') as well as S, because the
+    plot commands key on it: pkls from an earlier sweep that used a different strategy
+    sit in the same results folder under their own level name, and pooling the two would
+    silently mix configurations. See PLOT_LEVEL_RE.
+    """
+    strategy = str(RUN_BASE_PARAMS.get("sampling_strategy", "region_grow")).lower()
+    tag = "evolve" if strategy == "region_evolve" else "region"
+
     levels = []
     if INCLUDE_SCATTERED:
         levels.append(("scattered", {**RUN_BASE_PARAMS, "sampling_strategy": "scattered"}))
     for lvl_s in MIN_PATCH_LEVELS:
-        levels.append((f"region S={lvl_s}",
-                       {**RUN_BASE_PARAMS, "sampling_strategy": "region_grow", "min_patch_size": lvl_s}))
+        levels.append((f"{tag} S={lvl_s}", {**RUN_BASE_PARAMS, "min_patch_size": lvl_s}))
 
     tasks = []
     for seed in RUN_RANDOM_SEEDS:
         for label, params in levels:
             safe_label = label.replace(" ", "_").replace("=", "")
-            run_label = f"contig_random_{safe_label}_seed_{seed}"
-            tasks.append((run_label, label, params, seed))
+            run_label = f"contig_{safe_label}_seed_{seed}"
+            tasks.append((run_label, label, params, seed, r_export_parent))
     return tasks
 
 
@@ -154,15 +202,22 @@ def cmd_run():
     ic = load_ic(["restoration_benefit", "cost"])
     _init_worker(ic)  # stash for the serial fallback path
 
-    tasks = _build_tasks()
+    stamp = time.strftime("%Y%m%d_%H%M")
+    r_export_parent = None if SMOKE else os.path.join(R_EXPORT_ROOT, f"{stamp}_contig_sweep")
+    tasks = _build_tasks(r_export_parent)
     n_runs = len(tasks)
     ok = 0
     t0 = time.perf_counter()
 
-    mode = f"PARALLEL ({GRID_WORKERS} workers x n_jobs=1)" if GRID_WORKERS > 1 else "SERIAL"
+    mode = f"PARALLEL ({GRID_WORKERS} workers)" if GRID_WORKERS > 1 else "SERIAL"
     print(f"\n===== Contiguity sweep: {n_runs} runs, {mode}, "
           f"pop={RUN_POP_SIZE}, gens={RUN_N_GENERATIONS} =====")
+    print(f"Strategy={RUN_BASE_PARAMS.get('sampling_strategy')}, "
+          f"tol={RUN_PIXEL_TOLERANCE}, hv_patience={RUN_HV_PATIENCE}"
+          f"{' (early stopping off)' if RUN_HV_PATIENCE > RUN_N_GENERATIONS else ''}, "
+          f"S levels={MIN_PATCH_LEVELS}, seeds={RUN_RANDOM_SEEDS}")
     print(f"Per-run logs -> {LOG_DIR}\\<run_label>.log")
+    print(f"R exports    -> {r_export_parent}")
 
     if GRID_WORKERS > 1:
         with ProcessPoolExecutor(max_workers=GRID_WORKERS,
@@ -194,7 +249,9 @@ def cmd_run():
         print("SMOKE mode: save_results was off, so no pkls were written.")
     else:
         print("Pkls: outputs/results_files/res_<timestamp>_contig_<level>_seed_<seed>.pkl")
+        print(f"R exports: {r_export_parent}")
         print("Make the figure + table:  pixi run python Debugs_tests/contiguity_sweep.py fronts")
+        print("Write the CSVs the Quarto report reads:  ... contiguity_sweep.py summary")
 
 
 # ===========================================================================
@@ -206,7 +263,14 @@ PKL_GLOB = "*_contig_*.pkl"         # which runs to gather
 # PLOT_SEEDS: the main knob for choosing WHICH sweep to plot. The results folder can hold
 # runs from earlier sweeps (different seeds and/or a different objective). Set to the seed
 # list of the sweep you want; None = every seed found (fine for a single sweep on disk).
-PLOT_SEEDS = {606, 707, 808, 909, 102}
+PLOT_SEEDS = {606, 707, 808}
+# Second selection knob, on the LEVEL rather than the seed. outputs/results_files holds
+# contig pkls from earlier sweeps that used a different sampling strategy; those carry
+# their own level names ('region_S5', 'random_region_S5', 'scattered'), so without this
+# filter they would show up as extra series on the figure and extra rows in the table,
+# pooled with the current sweep as if they were the same experiment. Set to None to plot
+# every level found.
+PLOT_LEVEL_RE = r"^evolve_S\d+$"
 # Safety backstop: never pool runs from a different objective formulation (older
 # 'restoration_potential' vs newer 'restoration_benefit').
 POTENTIAL_OBJ = "restoration_benefit"
@@ -252,6 +316,8 @@ def gather_pkls(seeds=_INHERIT):
             continue
         level, seed = tail.rsplit("_seed_", 1)
         if allow is not None and seed not in allow:
+            continue
+        if PLOT_LEVEL_RE is not None and not re.match(PLOT_LEVEL_RE, level):
             continue
         groups[(level, seed)].append(p)
     if skipped:
@@ -381,7 +447,7 @@ def cmd_fronts():
             ax.scatter(-F[:, 0], F[:, 1], s=18, alpha=0.85, zorder=2,
                        label=f"{lvl} (n={stats[lvl]['n']}, {stats[lvl]['n_seeds']} seeds)")
             plotted += 1
-    ax.set_xlabel("restoration benefit (-potential sum)")
+    ax.set_xlabel("restoration benefit")
     ax.set_ylabel("implementation cost")
     ax.set_title("Price of contiguity: potential-vs-cost front by minimum patch size")
     if plotted:
@@ -399,6 +465,111 @@ def cmd_fronts():
         print(f"{lvl:<14}{st['n_seeds']:>6}{st['n']:>5}{st['hv']:>11.4g}"
               f"{st['mean_patch']:>12.0f}{st['min_patch']:>11.0f}"
               f"{st['n_components']:>9.1f}{st['adjacency']:>11.0f}")
+
+
+# ===========================================================================
+# summary  (tidy CSVs for the Quarto report)
+# ===========================================================================
+# paper2/_results_baseline.qmd builds its price-of-contiguity figures from these two
+# files. Patch geometry (component labelling on the 4-connected neighbour table) is far
+# cheaper to compute here, where the decision vectors already live, than in R off
+# pixel_selection.csv - so the R side only ever reads these small tidy frames.
+SUMMARY_DIR = os.path.join(REPO_ROOT, "outputs", "r_inputs", "contiguity_summary")
+SUMMARY_SOLUTIONS = os.path.join(SUMMARY_DIR, "contiguity_solutions.csv")
+SUMMARY_RUNS = os.path.join(SUMMARY_DIR, "contiguity_runs.csv")
+
+
+def _patch_stats(sel, nbr_bundle):
+    """Component geometry of one boolean selection over the restoration-eligible pixels."""
+    nbr, rows, cols, shape = nbr_bundle
+    sizes = np.array([c.size for c in _label_components(sel, shape, rows, cols)], dtype=float)
+    if sizes.size == 0:
+        return dict(n_pixels=0, n_components=0, mean_patch=0.0,
+                    min_patch=0.0, max_patch=0.0, adjacency=0)
+    return dict(n_pixels=int(sel.sum()), n_components=int(sizes.size),
+                mean_patch=float(sizes.mean()), min_patch=float(sizes.min()),
+                max_patch=float(sizes.max()), adjacency=_adjacency(sel, nbr))
+
+
+def cmd_summary():
+    """Write the per-solution and per-run CSVs the Quarto report reads."""
+    import csv
+
+    by_level = gather_pkls()
+    if not by_level:
+        print(f"No pkls matching {PKL_GLOB} (level filter {PLOT_LEVEL_RE!r}, "
+              f"seeds {PLOT_SEEDS}) in {RESULTS_DIR}. Run the sweep first.")
+        return
+    levels = sorted(by_level, key=label_sort_key)
+    all_paths = [p for lvl in levels for p in by_level[lvl]]
+    nbr_bundle = _get_nbr_bundle(all_paths)
+    n_rest = nbr_bundle[0].shape[0]
+
+    sol_rows, run_rows, skipped = [], [], 0
+    for lvl in levels:
+        for path in sorted(by_level[lvl], key=_newness_key):
+            with open(path, "rb") as f:
+                res = pickle.load(f)
+            names = list(res["objective_names"])
+            if POTENTIAL_OBJ not in names:
+                skipped += 1
+                continue
+            pot, cost = _obj_indices(names)
+            sp = res.get("scenario_params", {}) or {}
+            ai = res.get("algorithm_info", {}) or {}
+            seed = os.path.basename(path).rsplit("_seed_", 1)[1].rsplit(".pkl", 1)[0]
+            S = int(sp.get("min_patch_size", 1))
+            raw = np.asarray(res["objectives_raw"], float)
+            nd = np.asarray(res["is_nondominated"], bool)
+            dec = np.asarray(res["decisions"])
+            hv_hist = ai.get("hypervolume_history", []) or []
+
+            for i in np.where(nd)[0]:
+                st = _patch_stats(dec[i, :n_rest].astype(bool), nbr_bundle)
+                sol_rows.append({
+                    "level": lvl, "min_patch_size": S, "seed": seed, "solution_id": int(i),
+                    # objectives_raw stores the maximised objective negated; flip it back
+                    # so the CSV is in "larger = better" benefit units, as the R side and
+                    # load_run_data() both assume.
+                    "restoration_benefit": -float(raw[i, pot]),
+                    "implementation_cost": float(raw[i, cost]),
+                    **st,
+                })
+            run_rows.append({
+                "level": lvl, "min_patch_size": S, "seed": seed,
+                "n_nondominated": int(nd.sum()),
+                "generations": int(ai.get("actual_generations") or len(hv_hist)),
+                "final_hypervolume": float(hv_hist[-1]) if len(hv_hist) else float("nan"),
+                "pop_size": int(ai.get("pop_size") or 0),
+                "sampling_strategy": str(sp.get("sampling_strategy", "")),
+                "pkl": os.path.basename(path),
+            })
+
+    if not sol_rows:
+        print(f"No '{POTENTIAL_OBJ}' runs found - nothing written.")
+        return
+    if skipped:
+        print(f"(skipped {skipped} run(s) whose objective is not '{POTENTIAL_OBJ}')")
+
+    os.makedirs(SUMMARY_DIR, exist_ok=True)
+    for path, rows in ((SUMMARY_SOLUTIONS, sol_rows), (SUMMARY_RUNS, run_rows)):
+        with open(path, "w", newline="", encoding="ascii") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"{len(rows):>5} rows -> {path}")
+
+    print(f"\n{'level':<12}{'S':>4}{'seeds':>7}{'n_nd':>6}{'mean_patch':>12}"
+          f"{'min_patch':>11}{'n_comp':>9}")
+    for lvl in levels:
+        r = [x for x in sol_rows if x["level"] == lvl]
+        if not r:
+            continue
+        n_seeds = len({x["seed"] for x in r})
+        print(f"{lvl:<12}{r[0]['min_patch_size']:>4}{n_seeds:>7}{len(r):>6}"
+              f"{np.mean([x['mean_patch'] for x in r]):>12.0f}"
+              f"{np.min([x['min_patch'] for x in r]):>11.0f}"
+              f"{np.mean([x['n_components'] for x in r]):>9.1f}")
 
 
 # ===========================================================================
@@ -658,6 +829,7 @@ def cmd_animate(arg):
 COMMANDS = {
     "run": lambda a: cmd_run(),
     "fronts": lambda a: cmd_fronts(),
+    "summary": lambda a: cmd_summary(),
     "spatial": lambda a: cmd_spatial(),
     "jaccard": lambda a: cmd_jaccard(),
     "snapshot": cmd_snapshot,
