@@ -37,7 +37,7 @@ REGION = "Bern"
 #                    FACTORIAL_CONSTRUCTIONS x FACTORIAL_POLICIES x SEEDS (iEMSs Block 4)
 SCENARIO_MODE = "custom"
 
-# Condition scenario tag — selects pre-computed anomaly rasters from data/anomaly_scenarios/
+# Condition scenario tag - selects pre-computed anomaly rasters from data/anomaly_scenarios/
 # Available tags:
 #   global_all | global_drop_smd | global_drop_sbd | global_drop_soc |
 #   global_drop_uzl | global_drop_tsd | global_drop_can | global_drop_cdi |
@@ -46,8 +46,8 @@ SCENARIO_MODE = "custom"
 CONDITION_SCENARIO = "global_all"
 
 # Seeds used by both condition_grid and policy_grid modes.
-#   List[int] — runs each scenario/variant once per seed; labels: <name>_seed<n>
-#   None       — runs each scenario/variant once using RANDOM_SEED; labels: <name>
+#   List[int] - runs each scenario/variant once per seed; labels: <name>_seed<n>
+#   None       - runs each scenario/variant once using RANDOM_SEED; labels: <name>
 #SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
 SEEDS = 101
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
@@ -55,31 +55,14 @@ print(f"Scenario mode: {SCENARIO_MODE}")
 
 log_path = setup_logger(log_dir=str(LOGS_DIR), run_label=f"{ECOSYSTEM_TO_RUN}_{REGION.lower()}")
 if log_path:
-    print(f"Verbose output → {log_path}")
+    print(f"Verbose output -> {log_path}")
 
 OBJECTIVES = ["restoration_benefit", "spatial_clustering", "cost"]  # iEMSs headline objectives
 #OBJECTIVES = ["abiotic", "biotic", "cost"]
 #["restoration_potential", "cost", "es_future_val", "es_future_robustness"] # test ES future value as an objective
-# Available objective names:
-#   "abiotic"               – minimise abiotic condition anomaly (restoration pixels)
-#   "biotic"                – minimise biotic condition anomaly (restoration pixels)
-#   "cost"                  – minimise implementation cost
-#   "connectivity"          – maximise connectivity gain (precomputed per pixel, conversion pixels)
-#                             Replaces the older "landscape" objective as the default landscape metric.
-#   "landscape"             – legacy landscape anomaly via SN-density recalculation (conversion pixels)
-#   "landscape_context"     – minimise mean abiotic anomaly of eligible neighbours within 500 m;
-#                             rewards selecting pixels whose surroundings are already in good condition
-#   "restoration_potential" – minimise mean of per-pixel abiotic + biotic baseline anomaly;
-#                             single combined ecological condition score (lower = more degraded = higher potential)
-#   "spatial_clustering"    – maximise spatial compactness of the selected pixels
-#                             (number of orthogonal shared edges between selected pixels;
-#                             configuration-dependent, computed each evaluation). Rewards
-#                             clumped solutions. NB: distinct from the custom_scenario_params
-#                             'spatial_clustering' knob, which only soft-biases sampling.
-#   "es_future_val"         – maximise total ES performance of selected pixels under future scenarios
-#                             (source: Mean_sum_of_change_ES.tif; higher sum = greater future ES gain)
-#   "es_future_robustness"  – minimise total ES instability of selected pixels under future scenarios
-#                             (source: Undesirable_deviation_sum_of_change_ES.tif; lower sum = more robust)
+# Available names + what each means: see all_objectives in data_loader.py.
+# NB: the "spatial_clustering" objective is distinct from the custom_scenario_params
+# 'spatial_clustering' knob below, which only soft-biases sampling.
 SAMPLE_FRACTION = None
 SAMPLE_SEED = 42
 POP_SIZE = 92 #previously 50?
@@ -139,7 +122,7 @@ custom_scenario_params = {
 
 # Named policy scenarios for SCENARIO_MODE == "policy_grid".
 # Each entry is a dict of parameter overrides applied on top of custom_scenario_params.
-# An empty dict {} means "no overrides" — mirrors the condition baseline run.
+# An empty dict {} means "no overrides" - mirrors the condition baseline run.
 # Run labels will be the key name (e.g. "policy_ambitious"), with no seed suffix,
 # using CONDITION_SCENARIO and RANDOM_SEED defined above.
 POLICY_VARIANTS = {
@@ -151,48 +134,49 @@ POLICY_VARIANTS = {
                                 "burden_sharing": "yes"},                          # ambitious + burden shared
 }
 
-# Benchmark condition scenarios run in policy_grid mode with baseline params × SEEDS.
+# Benchmark condition scenarios run in policy_grid mode with baseline params x SEEDS.
 # Labels: <tag>_seed<n>  (or <tag> when SEEDS is None).
 BENCHMARK_SCENARIOS = ["upper_q75_all"]
 
-# ── Factorial design (SCENARIO_MODE == "factorial") — iEMSs Block 4 ──────────
+# -- Factorial design (SCENARIO_MODE == "factorial") - iEMSs Block 4 ----------
 # Fully-crossed design over the decision-making + model formulation factors.
-# Every cell is the product (form × scaling × construction × policy) × SEEDS.
+# Every cell is the product (form x scaling x construction x policy) x SEEDS.
 #
-#   FACTORIAL_FORMS         objective target form → scenario_params['rp_formulation']
-#                           {"sum", "threshold"}  (Axis 2: what counts as success)
-#   FACTORIAL_SCALINGS      condition reference benchmark → raster tag PREFIX.
+#   FACTORIAL_FORMS         objective target form -> scenario_params['rp_formulation']
+#                           {"sum", "threshold", "shortfall"}
+#                           (Axis 2: what counts as success)
+#   FACTORIAL_SCALINGS      condition reference benchmark -> raster tag PREFIX.
 #                           "global" = anomaly, "upper_q75" = q75 (Axis: scaling).
-#   FACTORIAL_CONSTRUCTIONS condition-indicator construction → raster tag SUFFIX.
+#   FACTORIAL_CONSTRUCTIONS condition-indicator construction -> raster tag SUFFIX.
 #                           "all" = full indicator set; "drop_<ind>" / reduced builds.
-#                           PLACEHOLDER — fill once the 2–3 construction levels are
+#                           PLACEHOLDER - fill once the 2-3 construction levels are
 #                           defined (and the matching crossed rasters exist in
 #                           data/anomaly_scenarios/, produced by ec_anomalies.r).
-#   FACTORIAL_POLICIES      policy/governance lever → overrides on custom_scenario_params.
+#   FACTORIAL_POLICIES      policy/governance lever -> overrides on custom_scenario_params.
 #
-# scaling × construction together select the condition_scenario raster tag,
+# scaling x construction together select the condition_scenario raster tag,
 # built as f"{scaling}_{construction}" (e.g. "global_all", "upper_q75_drop_smd"),
 # which must match the .tif files written by ec_anomalies.r and resolved in
 # data_loader.load_initial_conditions.
 #
 # Each cell's factor levels are written to its run_config as flat factor_* keys
 # (factor_form / factor_scaling / factor_construction / factor_policy) so they
-# survive export_to_r → metadata.json and are recoverable for variance
+# survive export_to_r -> metadata.json and are recoverable for variance
 # partitioning in R (load_run_factorial / compute_rfop_variance_partition).
-FACTORIAL_FORMS = ["sum", "threshold"]
+FACTORIAL_FORMS = ["sum", "threshold", "shortfall"]
 FACTORIAL_SCALINGS = ["global", "upper_q75"]
 # Construction axis = 3 levels: "all" + the 2 HIGHEST-LEVERAGE agricultural drops.
 # Which 2 comes from Block 2's R3c Jaccard, so RUN BLOCKS 1+2 FIRST, then fill the
-# two drop_<ind> slots below. Design: 2 form × 2 scaling × 3 policy × 3 construction
-# × 5 seeds = 180 runs. (Left at just "all" until filled, so a premature factorial
+# two drop_<ind> slots below. Design: 3 form x 2 scaling x 3 policy x 3 construction
+# x 5 seeds = 270 runs. (Left at just "all" until filled, so a premature factorial
 # run stays small rather than expanding to the full 9-level LOO.)
 # Each tag needs rasters at BOTH scalings ("global_<c>" and "upper_q75_<c>"); all
 # agricultural q75 drops are generated by ec_anomalies.r, so any 2 picks are ready.
 #   Available drops: smd sbd soc uzl cdi swf_h swf_t ndvi
 FACTORIAL_CONSTRUCTIONS = [
     "all",
-    "drop_smd",   # ← fill from Block 2 R3c Jaccard
-    #"drop_<highest_leverage_2>",   # ← fill from Block 2 R3c Jaccard
+    "drop_smd",   # <- fill from Block 2 R3c Jaccard
+    #"drop_<highest_leverage_2>",   # <- fill from Block 2 R3c Jaccard
 ]
 FACTORIAL_POLICIES = {
     "status_quo":    {},                                  # baseline budget, no burden sharing
@@ -227,7 +211,7 @@ N_CAPTURE_GENS = 5
 PROFILE = False
 PROFILE_TOP_N = 30
 
-# Snapshot of the full configuration block — written to run_registry.jsonl alongside results.
+# Snapshot of the full configuration block - written to run_registry.jsonl alongside results.
 run_config = {
     "ecosystem": ECOSYSTEM_TO_RUN,
     "region": REGION,
@@ -267,7 +251,7 @@ else:
 
 
 def _run():
-    """Main execution body — separated so cProfile can wrap it cleanly."""
+    """Main execution body - separated so cProfile can wrap it cleanly."""
     global all_results, run_times
     all_results = {}
     run_times = {}
@@ -296,12 +280,12 @@ def _run():
                 )
             elif SCENARIO_MODE == "condition_grid":
                 # Sweep all 13 condition scenario tags.
-                # If SEEDS is a list, run each tag × seed.
+                # If SEEDS is a list, run each tag x seed.
                 # If SEEDS is None, run each tag once with RANDOM_SEED.
                 # Agricultural-focus LOO set (iEMSs Blocks 1+2). LOO is restricted to
                 # indicators present in the agricultural EC set (setup.r): smd/sbd/soc
                 # (abiotic) + uzl/cdi/swf_h/swf_t/ndvi (biotic). tsd/can/lai are
-                # forest-only — dropping them is a no-op over agricultural pixels — so
+                # forest-only - dropping them is a no-op over agricultural pixels - so
                 # they are excluded. upper_q75_all is the q75 benchmark for R3.
                 _condition_tags = [
                     "global_all",
@@ -368,12 +352,12 @@ def _run():
                             _grid_times[_run_label] = _item_elapsed
                             if _grid_results is not None:
                                 all_results[_run_label] = _grid_results
-                                print(f"  ✓ {_run_label} completed ({_item_elapsed/60:.1f} min)")
+                                print(f"  OK {_run_label} completed ({_item_elapsed/60:.1f} min)")
                             else:
-                                print(f"  ✗ {_run_label} returned no results ({_item_elapsed/60:.1f} min)")
+                                print(f"  FAIL {_run_label} returned no results ({_item_elapsed/60:.1f} min)")
                         except Exception as _e:
                             _grid_times[_run_label] = time.perf_counter() - _item_start
-                            print(f"  ✗ {_run_label} failed: {_e}")
+                            print(f"  FAIL {_run_label} failed: {_e}")
                         _grid_done += 1
 
                 _grid_elapsed = time.perf_counter() - _grid_start
@@ -386,20 +370,20 @@ def _run():
                     print(f"  Average per run: {_avg/60:.1f} min ({_avg:.0f} s)")
                 print(f"  Results PKLs: results_files/res_<timestamp>_<run_label>.pkl (one per grid element)")
             elif SCENARIO_MODE == "policy_grid":
-                # Run each named policy variant × SEEDS against CONDITION_SCENARIO.
-                # Also run BENCHMARK_SCENARIOS × SEEDS with baseline params.
+                # Run each named policy variant x SEEDS against CONDITION_SCENARIO.
+                # Also run BENCHMARK_SCENARIOS x SEEDS with baseline params.
                 # Labels: <variant>_seed<n>  /  <benchmark_tag>_seed<n>
-                # (no seed suffix when SEEDS is None — uses RANDOM_SEED)
+                # (no seed suffix when SEEDS is None - uses RANDOM_SEED)
                 _pg_use_seeds = SEEDS is not None
                 _pg_seeds     = SEEDS if _pg_use_seeds else [RANDOM_SEED]
                 _pg_total     = len(POLICY_VARIANTS) * len(_pg_seeds) + len(BENCHMARK_SCENARIOS) * len(_pg_seeds)
 
-                print(f"\n  Policy variants to run ({len(POLICY_VARIANTS)} × {len(_pg_seeds)} seeds):")
+                print(f"\n  Policy variants to run ({len(POLICY_VARIANTS)} x {len(_pg_seeds)} seeds):")
                 for _vname, _vparams in POLICY_VARIANTS.items():
-                    _diff = {k: v for k, v in _vparams.items()} or {"(baseline — no overrides)": ""}
+                    _diff = {k: v for k, v in _vparams.items()} or {"(baseline - no overrides)": ""}
                     print(f"    {_vname}: {_diff}")
                 if BENCHMARK_SCENARIOS:
-                    print(f"  Benchmark scenarios ({len(BENCHMARK_SCENARIOS)} × {len(_pg_seeds)} seeds):")
+                    print(f"  Benchmark scenarios ({len(BENCHMARK_SCENARIOS)} x {len(_pg_seeds)} seeds):")
                     for _btag in BENCHMARK_SCENARIOS:
                         print(f"    {_btag}")
 
@@ -413,7 +397,7 @@ def _run():
                 _pg_r_parent = _os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 _os.makedirs(_pg_r_parent, exist_ok=True)
                 print(f"  Grid R export parent: {_pg_r_parent}/")
-                # ── policy variants ──────────────────────────────────────────────
+                # -- policy variants ----------------------------------------------
                 _ic_policy = load_initial_conditions(
                     ".",
                     objectives=OBJECTIVES,
@@ -463,14 +447,14 @@ def _run():
                             _grid_times[_run_lbl] = _item_elapsed
                             if _presults is not None:
                                 all_results[_run_lbl] = _presults
-                                print(f"  ✓ {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
+                                print(f"  OK {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
                             else:
-                                print(f"  ✗ {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
+                                print(f"  FAIL {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
                         except Exception as _e:
                             _grid_times[_run_lbl] = time.perf_counter() - _item_start
-                            print(f"  ✗ {_run_lbl} failed: {_e}")
+                            print(f"  FAIL {_run_lbl} failed: {_e}")
 
-                # ── benchmark scenarios ──────────────────────────────────────────
+                # -- benchmark scenarios ------------------------------------------
                 for _btag in BENCHMARK_SCENARIOS:
                     _ic_bench = load_initial_conditions(
                         ".",
@@ -518,12 +502,12 @@ def _run():
                             _grid_times[_run_lbl] = _item_elapsed
                             if _bresults is not None:
                                 all_results[_run_lbl] = _bresults
-                                print(f"  ✓ {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
+                                print(f"  OK {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
                             else:
-                                print(f"  ✗ {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
+                                print(f"  FAIL {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
                         except Exception as _e:
                             _grid_times[_run_lbl] = time.perf_counter() - _item_start
-                            print(f"  ✗ {_run_lbl} failed: {_e}")
+                            print(f"  FAIL {_run_lbl} failed: {_e}")
 
                 _grid_elapsed   = time.perf_counter() - _grid_start
                 _grid_succeeded = len(all_results)
@@ -536,8 +520,8 @@ def _run():
                 print(f"  Results PKLs: results_files/res_<timestamp>_<label>.pkl")
             elif SCENARIO_MODE == "factorial":
                 # Fully-crossed design (iEMSs Block 4):
-                #   form × scaling × construction × policy × SEEDS
-                # scaling × construction select the condition raster tag
+                #   form x scaling x construction x policy x SEEDS
+                # scaling x construction select the condition raster tag
                 # ("{scaling}_{construction}"); form + policy are scenario_params
                 # overrides. initial_conditions are cached per unique tag because
                 # loading rasters dominates runtime and patch geometry is tag-only.
@@ -556,12 +540,12 @@ def _run():
                 _grid_r_parent = _os.path.join(str(R_INPUTS_DIR), f"{_grid_ts}_{RUN_LABEL}")
                 _os.makedirs(_grid_r_parent, exist_ok=True)
                 print(f"  Factorial design: {_grid_total} runs "
-                      f"({len(FACTORIAL_FORMS)} form × {len(FACTORIAL_SCALINGS)} scaling × "
-                      f"{len(FACTORIAL_CONSTRUCTIONS)} construction × "
-                      f"{len(FACTORIAL_POLICIES)} policy × {len(_seeds)} seed)")
+                      f"({len(FACTORIAL_FORMS)} form x {len(FACTORIAL_SCALINGS)} scaling x "
+                      f"{len(FACTORIAL_CONSTRUCTIONS)} construction x "
+                      f"{len(FACTORIAL_POLICIES)} policy x {len(_seeds)} seed)")
                 print(f"  Grid R export parent: {_grid_r_parent}/")
 
-                _ic_cache = {}  # condition_scenario tag → initial_conditions (or None if missing)
+                _ic_cache = {}  # condition_scenario tag -> initial_conditions (or None if missing)
                 for _seed in _seeds:
                     for _scaling in FACTORIAL_SCALINGS:
                         for _construction in FACTORIAL_CONSTRUCTIONS:
@@ -579,13 +563,13 @@ def _run():
                                         condition_scenario=_tag,
                                     )
                                 except Exception as _e:
-                                    print(f"  ✗ could not load condition rasters for tag '{_tag}': {_e}")
+                                    print(f"  FAIL could not load condition rasters for tag '{_tag}': {_e}")
                                     _ic_cache[_tag] = None
                             _ic = _ic_cache[_tag]
                             if _ic is None:
                                 _skipped = len(FACTORIAL_FORMS) * len(FACTORIAL_POLICIES)
                                 _grid_done += _skipped
-                                print(f"  ✗ skipping {_skipped} cells needing missing tag '{_tag}'")
+                                print(f"  FAIL skipping {_skipped} cells needing missing tag '{_tag}'")
                                 continue
                             for _form in FACTORIAL_FORMS:
                                 for _pol_name, _pol_overrides in FACTORIAL_POLICIES.items():
@@ -636,12 +620,12 @@ def _run():
                                         _grid_times[_run_lbl] = _item_elapsed
                                         if _fresults is not None:
                                             all_results[_run_lbl] = _fresults
-                                            print(f"  ✓ {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
+                                            print(f"  OK {_run_lbl} completed ({_item_elapsed/60:.1f} min)")
                                         else:
-                                            print(f"  ✗ {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
+                                            print(f"  FAIL {_run_lbl} returned no results ({_item_elapsed/60:.1f} min)")
                                     except Exception as _e:
                                         _grid_times[_run_lbl] = time.perf_counter() - _item_start
-                                        print(f"  ✗ {_run_lbl} failed: {_e}")
+                                        print(f"  FAIL {_run_lbl} failed: {_e}")
 
                 _grid_elapsed   = time.perf_counter() - _grid_start
                 _grid_succeeded = len(all_results)
@@ -663,7 +647,7 @@ def _run():
                     aggregation_factor=AGGREGATION_FACTOR,
                     condition_scenario=CONDITION_SCENARIO,
                 )
-                print(f"✓ Data loaded for {run_label}")
+                print(f"OK Data loaded for {run_label}")
 
                 results = run_optimization_instance(
                     initial_conditions=initial_conditions,
@@ -692,16 +676,16 @@ def _run():
                 if results is not None:
                     all_results[run_label] = results
                     run_times[run_label] = time.perf_counter() - _run_start
-                    print(f"\n✓ {run_label.title()} optimisation completed successfully!")
+                    print(f"\nOK {run_label.title()} optimisation completed successfully!")
                 else:
                     run_times[run_label] = time.perf_counter() - _run_start
-                    print(f"\n✗ {run_label.title()} optimisation failed.")
+                    print(f"\nFAIL {run_label.title()} optimisation failed.")
             else:
                 run_times[run_label] = time.perf_counter() - _run_start
 
         except Exception as e:
             run_times[run_label] = time.perf_counter() - _run_start
-            print(f"\n✗ Error optimising {run_label} ecosystem: {e}")
+            print(f"\nFAIL Error optimising {run_label} ecosystem: {e}")
             continue
 
     print(f"\n{'='*80}")
@@ -719,7 +703,7 @@ def _run():
         total_runs = len(runs)
         print(f"Successfully completed {successful_runs}/{total_runs} ecosystem optimisations:")
         for run_label, _ in runs:
-            status = "✓ SUCCESS" if run_label in all_results else "✗ FAILED"
+            status = "OK SUCCESS" if run_label in all_results else "FAIL FAILED"
             elapsed = run_times.get(run_label)
             time_str = f"  ({elapsed/60:.1f} min)" if elapsed is not None else ""
             print(f"  {run_label.title():<12}: {status}{time_str}")
@@ -727,9 +711,9 @@ def _run():
         print(f"\nTotal wall-clock time: {_total_elapsed/60:.1f} min ({_total_elapsed:.0f} s)")
 
         if successful_runs > 0:
-            print(f"✓ Completed with outputs for {successful_runs} ecosystems.")
+            print(f"OK Completed with outputs for {successful_runs} ecosystems.")
         else:
-            print("✗ No optimisations completed successfully.")
+            print("FAIL No optimisations completed successfully.")
 
 
 if PROFILE:
@@ -744,6 +728,6 @@ if PROFILE:
     _profile_path = f"logs/profile_{ECOSYSTEM_TO_RUN}_{RUN_LABEL}.txt"
     with open(_profile_path, "w") as _f:
         _f.write(_profile_text)
-    print(f"Profile saved → {_profile_path}")
+    print(f"Profile saved -> {_profile_path}")
 else:
     _run()
