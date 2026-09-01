@@ -1568,6 +1568,12 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             growth_bias = str(scenario_params.get('region_growth_bias', 'scored')).lower()
             region_edits = int(scenario_params.get('region_mutation_edits', 100))
             region_seed_grid = int(scenario_params.get('region_seed_grid', 16))
+            # Stochastic ('scored') pixel ordering temperature. 0 = the historical
+            # deterministic argsort, which makes independent individuals growing in the
+            # same area converge on the IDENTICAL pixel set (the blocky, uniform-value
+            # selection-frequency map). Only region_evolve opts in below; region_grow
+            # keeps 0.0 so its runs stay reproducible against earlier results.
+            score_temperature = 0.0
 
             # Minimum-patch-size constraint (price-of-contiguity sweep). When active,
             # cap the seed count so the initial regions are already >= S on average
@@ -1601,18 +1607,22 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
                     region_seeds=region_seeds, region_seeds_min=region_seeds_min,
                     growth_bias='neutral', seed_grid=region_seed_grid,
                 )
+                score_temperature = float(scenario_params.get('region_score_temperature', 1.0))
                 mutation = RegionEvolveMutation(
                     initial_conditions, problem.max_action_pixels, region_scores,
                     n_edits=region_edits, growth_bias=growth_bias,
                     pixel_tolerance=pixel_tolerance,
+                    score_temperature=score_temperature,
                 )
                 crossover = RegionSwapCrossover(
                     initial_conditions, problem.max_action_pixels, region_scores,
                     growth_bias=growth_bias, pixel_tolerance=pixel_tolerance,
+                    score_temperature=score_temperature,
                 )
                 if verbose:
                     print(f"Using region-evolve operators (seeds<={region_seeds}, "
-                          f"grid={region_seed_grid}, bias={growth_bias})")
+                          f"grid={region_seed_grid}, bias={growth_bias}, "
+                          f"score_temp={score_temperature})")
             else:
                 sampling = RegionGrowingSampling(
                     initial_conditions, problem.max_action_pixels, region_scores,

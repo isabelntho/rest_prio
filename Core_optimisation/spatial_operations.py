@@ -21,6 +21,40 @@ from pymoo.operators.mutation.bitflip import BitflipMutation
 import rasterio
 from scipy.ndimage import generic_filter
 
+
+def _gumbel_perturb(scores, temperature, rng):
+    """Return scores perturbed for weighted-without-replacement ordering.
+
+    temperature <= 0 reproduces the original deterministic ordering (returns the
+    scores unchanged, and draws NO random numbers, so T=0 runs stay bit-identical
+    to the pre-temperature code). temperature > 0 adds Gumbel noise scaled by the
+    temperature (Gumbel-top-k trick): argsort(-result) is then a sample from the
+    weighted-without-replacement ordering over softmax(scores / temperature),
+    which still favours high scores but no longer makes two individuals growing
+    in the same neighbourhood pick the identical pixel set.
+
+    Higher temperature = more random; the deterministic argsort is the T -> 0 limit.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    if temperature <= 0:
+        return scores
+    u = rng.random(scores.shape)
+    gumbel = -np.log(-np.log(u + 1e-12) + 1e-12)
+    return scores / temperature + gumbel
+
+
+def _gumbel_perturb_scalar(score, temperature, rng):
+    """Scalar form of _gumbel_perturb for the frontier-heap inner loop.
+
+    grow_regions_from_seeds calls this up to 4x per grown pixel, so the array
+    version's allocation + shaped RNG draw is too expensive there.
+    """
+    if temperature <= 0:
+        return float(score)
+    u = rng.random()
+    return float(score) / temperature - np.log(-np.log(u + 1e-12) + 1e-12)
+
+
 # =============================================================================
 # SPATIAL ANALYSIS FUNCTIONS
 # =============================================================================
@@ -1013,7 +1047,8 @@ class RegionGrowingMutation(Mutation):
     """
 
     def __init__(self, initial_conditions, max_restored_pixels, scores,
-                 n_edits=100, growth_bias='scored', pixel_tolerance=0.05, prob=1.0):
+                 n_edits=100, growth_bias='scored', pixel_tolerance=0.05, prob=1.0,
+                 score_temperature=0.0):
         super().__init__()
         self.initial_conditions = initial_conditions
         self.max_restored_pixels = int(max_restored_pixels)
@@ -1022,6 +1057,8 @@ class RegionGrowingMutation(Mutation):
         self.growth_bias = str(growth_bias).lower()
         self.pixel_tolerance = float(pixel_tolerance)
         self.prob = float(prob)
+        # 0 = deterministic score ordering (historical behaviour); > 0 softens it.
+        self.score_temperature = float(score_temperature)
         self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
         self.flip_log = []
         self._current_gen = 0
@@ -1049,8 +1086,9 @@ class RegionGrowingMutation(Mutation):
             return pool[:0]
         m = int(min(m, pool.size))
         if self.growth_bias == 'scored' and self.scores is not None:
-            s = self.scores[pool]
-            order = np.argsort(-s if prefer_high else s)
+            s = self.scores[pool] if prefer_high else -self.scores[pool]
+            perturbed = _gumbel_perturb(s, self.score_temperature, rng)
+            order = np.argsort(-perturbed)
             return pool[order[:m]]
         return pool[rng.choice(pool.size, size=m, replace=False)]
 
@@ -1118,7 +1156,7 @@ class RegionGrowingMutation(Mutation):
 
 
 def grow_regions_from_seeds(nbr, n_rest, target_k, seeds, scores, mode, rng,
-                            avoid=None, base=None):
+                            avoid=None, base=None, temperature=0.0):
     """Grow a contiguous selection of target_k pixels from the given seed indices.
 
     Adds only currently-unselected, non-avoided eligible pixels via a frontier walk
@@ -1126,6 +1164,12 @@ def grow_regions_from_seeds(nbr, n_rest, target_k, seeds, scores, mode, rng,
     of the NEWLY grown pixels (length n_rest). `avoid` (bool array) marks pixels that
     must not be added (e.g. pixels used by regions being kept). `base` optionally
     marks already-selected pixels so the frontier does not re-add them.
+
+    `temperature` (mode='scored' only) softens the score ordering via
+    _gumbel_perturb_scalar: 0 keeps the deterministic greedy walk, higher values
+    make the frontier order progressively more random. Each candidate is pushed at
+    most once (in_heap/grown/blocked guards), so it gets exactly one Gumbel draw -
+    the correct Gumbel-top-k semantics.
     """
     grown = np.zeros(n_rest, dtype=bool)
     in_heap = np.zeros(n_rest, dtype=bool)
@@ -1137,7 +1181,10 @@ def grow_regions_from_seeds(nbr, n_rest, target_k, seeds, scores, mode, rng,
     heap = []
 
     def key(i):
-        return -float(scores[i]) if mode == 'scored' else float(rng.random())
+        # heap pops the SMALLEST key, so negate to walk descending perturbed score
+        if mode != 'scored':
+            return float(rng.random())
+        return -_gumbel_perturb_scalar(scores[i], temperature, rng)
 
     def push_nbrs(idx):
         row = nbr[idx]
@@ -1196,12 +1243,16 @@ def _label_components(sel, shape, rows, cols):
     return [sidx[ids == c] for c in range(1, nc + 1)]
 
 
-def enforce_budget_contiguous(sel, nbr, shape, rows, cols, k, tol, scores, mode, rng):
+def enforce_budget_contiguous(sel, nbr, shape, rows, cols, k, tol, scores, mode, rng,
+                              temperature=0.0):
     """Bring a selection to within [k*(1-tol), k*(1+tol)] WITHOUT fragmenting regions.
 
     Over budget: drop whole smallest components first (keeps the rest intact), then
     peel boundary pixels only if a single large component still overshoots. Under
     budget: grow contiguously outward from the current selection. Mutates sel in place.
+
+    `temperature` softens both score-ordered steps (the boundary peel and the
+    contiguous regrowth); 0 keeps the original deterministic behaviour.
     """
     lo = int(k * (1 - tol))
     hi = int(k * (1 + tol))
@@ -1222,12 +1273,16 @@ def enforce_budget_contiguous(sel, nbr, shape, rows, cols, k, tol, scores, mode,
             nb_unsel = (valid & ~sel[nb_clip]) | (~valid)
             boundary = np.where(sel & nb_unsel.any(axis=1))[0]
             if boundary.size:
-                order = boundary[np.argsort(scores[boundary])]
+                # Drop LOWEST-score boundary pixels first. Perturbing -scores and
+                # taking argsort(-perturbed) keeps that direction: at temperature 0
+                # it reduces to argsort(scores), the original ascending order.
+                order = boundary[np.argsort(-_gumbel_perturb(-scores[boundary],
+                                                             temperature, rng))]
                 sel[order[:cur - hi]] = False
     elif cur < lo:
         seeds = np.where(sel)[0]
         add = grow_regions_from_seeds(nbr, n_rest, k - cur, seeds, scores, mode, rng,
-                                      base=sel.copy())
+                                      base=sel.copy(), temperature=temperature)
         sel |= add
 
 
@@ -1248,7 +1303,8 @@ class MinPatchSizeRepair(Repair):
     """
 
     def __init__(self, initial_conditions, max_restored_pixels, min_patch_size,
-                 scores=None, pixel_tolerance=0.05, growth_bias='scored', max_iters=8):
+                 scores=None, pixel_tolerance=0.05, growth_bias='scored', max_iters=8,
+                 score_temperature=0.0):
         super().__init__()
         self.initial_conditions = initial_conditions
         self.max_restored_pixels = int(max_restored_pixels)
@@ -1257,6 +1313,8 @@ class MinPatchSizeRepair(Repair):
         self.pixel_tolerance = float(pixel_tolerance)
         self.growth_bias = str(growth_bias).lower()
         self.max_iters = int(max_iters)
+        # 0 = deterministic score ordering (historical behaviour); > 0 softens it.
+        self.score_temperature = float(score_temperature)
         self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
         self.shape = tuple(initial_conditions['shape'])
         self.call_log = []  # per-generation {min_comp_before, min_comp_after, iters}
@@ -1265,7 +1323,8 @@ class MinPatchSizeRepair(Repair):
         tol = self.pixel_tolerance
         # 1. contiguous budget enforcement (also seeds a region if sel is empty).
         enforce_budget_contiguous(sel, self.nbr, self.shape, self.rows, self.cols,
-                                  k, tol, scores, mode, rng)
+                                  k, tol, scores, mode, rng,
+                                  temperature=self.score_temperature)
         S = self.min_patch_size
         if S <= 1:
             return 0
@@ -1279,7 +1338,8 @@ class MinPatchSizeRepair(Repair):
             for c in small:
                 sel[c] = False
             enforce_budget_contiguous(sel, self.nbr, self.shape, self.rows, self.cols,
-                                      k, tol, scores, mode, rng)
+                                      k, tol, scores, mode, rng,
+                                      temperature=self.score_temperature)
             iters += 1
         return iters
 
@@ -1414,13 +1474,14 @@ class RegionEvolveMutation(RegionGrowingMutation):
         scores = self.scores if self.scores is not None else np.zeros(sel.size)
         enforce_budget_contiguous(sel, self.nbr, self._shape, self.rows, self.cols,
                                   self.max_restored_pixels, self.pixel_tolerance,
-                                  scores, mode, rng)
+                                  scores, mode, rng, temperature=self.score_temperature)
 
     def _do(self, problem, X, **kwargs):
         n_rest = problem.n_restoration_pixels
         k = self.max_restored_pixels
         scores = self.scores if self.scores is not None else np.zeros(n_rest)
         mode = 'scored' if self.growth_bias == 'scored' else 'neutral'
+        temperature = self.score_temperature
         rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
         Xp = X.copy()
         edits = np.zeros(len(X), dtype=int)
@@ -1441,14 +1502,16 @@ class RegionEvolveMutation(RegionGrowingMutation):
                 anchor = self._random_unselected(sel, rng)
                 if anchor is not None:
                     grown = grow_regions_from_seeds(self.nbr, n_rest, size, [anchor],
-                                                    scores, mode, rng, avoid=sel)
+                                                    scores, mode, rng, avoid=sel,
+                                                    temperature=temperature)
                     sel |= grown
             elif move == 'spawn':
                 anchor = self._random_unselected(sel, rng)
                 if anchor is not None:
                     s = max(1, int(0.05 * k))
                     grown = grow_regions_from_seeds(self.nbr, n_rest, s, [anchor],
-                                                    scores, mode, rng, avoid=sel)
+                                                    scores, mode, rng, avoid=sel,
+                                                    temperature=temperature)
                     sel |= grown
             elif move == 'delete' and len(comps) > 1:
                 c = comps[int(rng.integers(len(comps)))]
@@ -1463,7 +1526,8 @@ class RegionEvolveMutation(RegionGrowingMutation):
                 # forcing the budget step below to reclaim the overshoot by
                 # deleting unrelated regions. Ask for n_edits.
                 grown = grow_regions_from_seeds(self.nbr, n_rest, self.n_edits,
-                                                list(c), scores, mode, rng, base=sel)
+                                                list(c), scores, mode, rng, base=sel,
+                                                temperature=temperature)
                 sel |= grown
             elif move == 'shrink' and comps:
                 c = comps[int(rng.integers(len(comps)))]
@@ -1497,12 +1561,14 @@ class RegionSwapCrossover(Crossover):
     """
 
     def __init__(self, initial_conditions, max_restored_pixels, scores,
-                 growth_bias='scored', pixel_tolerance=0.05, **kw):
+                 growth_bias='scored', pixel_tolerance=0.05, score_temperature=0.0, **kw):
         super().__init__(2, 2, **kw)
         self.max_restored_pixels = int(max_restored_pixels)
         self.scores = np.asarray(scores, dtype=np.float64) if scores is not None else None
         self.growth_bias = str(growth_bias).lower()
         self.pixel_tolerance = float(pixel_tolerance)
+        # 0 = deterministic score ordering (historical behaviour); > 0 softens it.
+        self.score_temperature = float(score_temperature)
         self._shape = initial_conditions['shape']
         self.nbr, self.rows, self.cols = build_restoration_neighbor_table(initial_conditions)
 
@@ -1521,7 +1587,7 @@ class RegionSwapCrossover(Crossover):
         scores = self.scores if self.scores is not None else np.zeros(sel.size)
         enforce_budget_contiguous(sel, self.nbr, self._shape, self.rows, self.cols,
                                   self.max_restored_pixels, self.pixel_tolerance,
-                                  scores, mode, rng)
+                                  scores, mode, rng, temperature=self.score_temperature)
         return sel
 
     def _do(self, problem, X, **kwargs):
