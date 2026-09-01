@@ -1634,22 +1634,33 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
                     n_edits=region_edits, growth_bias=growth_bias,
                     pixel_tolerance=pixel_tolerance,
                 )
+                # Crossover choice. The default (HUX, supplied downstream by
+                # _build_algorithm when crossover stays None) swaps individual pixels, so
+                # it shatters the contiguous regions the sampler just built. 'region_swap' 
+                # recombines whole components instead,the same operator region_evolve uses. 
+                # Default keeps the historical behaviour so existing runs are unchanged.
+                region_crossover = str(scenario_params.get('region_crossover', 'hux')).lower()
+                if region_crossover == 'region_swap':
+                    crossover = RegionSwapCrossover(
+                        initial_conditions, problem.max_action_pixels, region_scores,
+                        growth_bias=growth_bias, pixel_tolerance=pixel_tolerance,
+                    )
                 if verbose:
                     print(f"Using region-growing operators (seeds={region_seeds}, "
-                          f"bias={growth_bias}, edits={region_edits})")
+                          f"bias={growth_bias}, edits={region_edits}, "
+                          f"crossover={region_crossover})")
             if not use_repair:
                 repair = None
             else:
                 # Region modes always use the contiguity-preserving repair, so every
                 # min-patch-size level differs ONLY in the floor S. S=1 means "no size
-                # floor" but still uses the same scored contiguous budget regrowth - so
-                # the price-of-contiguity sweep is a controlled comparison rather than
-                # having S=1 fall through to the scattered AdaptiveRepair (which does
-                # different optimisation work and made S=1 non-comparable).
+                # floor" but still uses the same scored contiguous budget regrowth.
                 repair = MinPatchSizeRepair(
                     initial_conditions, problem.max_action_pixels, min_patch_size,
                     scores=region_scores, pixel_tolerance=pixel_tolerance,
                     growth_bias=growth_bias,
+                    # 0.0 on the region_grow path, so only region_evolve is affected.
+                    score_temperature=score_temperature,
                 )
                 if verbose:
                     print(f"Using MinPatchSizeRepair (S={min_patch_size}, "
