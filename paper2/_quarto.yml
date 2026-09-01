@@ -4,11 +4,17 @@ project:
 manuscript:
   article: index.qmd
 
+# @sec- cross-references always render as "Section N.N"; without this the
+# headings themselves carry no numbers and the references point at nothing.
+number-sections: true
+
 format:
   html:
     comments:
       hypothesis: true
-  docx: default
+  docx:
+    # suppress the "Source: Article Notebook" links under each output
+    notebook-links: false
   jats: default
 
   # (other formats)
