@@ -106,6 +106,82 @@ make_hv_evo_plot <- function(run, obj_names = run$obj_names, obj_labels = .obj_l
     theme(strip.text = element_text(size = 10, face = "bold"))
 }
 
+# Multi-run version of make_hv_evo_plot(): every run is drawn on the SAME axes,
+# one colour per run, faceted by metric (Hypervolume + one facet per objective).
+# Built for the seed-sweep driver (quick_look_seeds.R), where the runs differ
+# only in random_seed, so overlaying makes between-seed spread visible directly.
+#
+#   runs       : named list of run objects (from load_run_data(); only
+#                df_hv / df_pop / obj_names are used, so trimmed runs are fine).
+#                List names are the legend labels; their order sets legend order.
+#   show_ribbon: draw the +/-1 SD band per run. FALSE by default - with several
+#                overlaid runs the bands swamp the mean lines.
+#   palette    : optional named/unnamed colour vector; default Dark2 (<= 8 runs).
+#
+# NB: hypervolume is only comparable across runs that share a reference point
+# and objective normalisation - the driver checks this and warns if they differ.
+make_hv_evo_plot_multi <- function(runs, obj_names = NULL, obj_labels = NULL,
+                                   show_ribbon = FALSE, palette = NULL,
+                                   legend_title = "Run", ncol = 2) {
+  if (length(runs) == 0L) stop("make_hv_evo_plot_multi(): empty run list.")
+  run_labels <- names(runs)
+  if (is.null(run_labels)) run_labels <- vapply(runs, function(r) r$label, character(1))
+
+  if (is.null(obj_names))  obj_names  <- runs[[1]]$obj_names
+  if (is.null(obj_labels)) obj_labels <- .obj_labels(obj_names)
+
+  plot_data <- bind_rows(lapply(seq_along(runs), function(i) {
+    run <- runs[[i]]
+    hv_data <- if (!is.null(run$df_hv)) {
+      data.frame(generation = run$df_hv$generation,
+                 value      = run$df_hv$hypervolume,
+                 ymin       = NA_real_, ymax = NA_real_,
+                 metric     = "Hypervolume",
+                 stringsAsFactors = FALSE)
+    } else NULL
+    evo_data <- prep_evo_data(run, obj_names, obj_labels)
+    out <- bind_rows(hv_data, evo_data)
+    if (is.null(out) || nrow(out) == 0L) return(NULL)
+    out$run <- run_labels[i]
+    out
+  }))
+
+  if (is.null(plot_data) || nrow(plot_data) == 0L)
+    stop("make_hv_evo_plot_multi(): no hypervolume or population_stats data found.")
+
+  plot_data$metric <- factor(plot_data$metric, levels = c("Hypervolume", obj_labels))
+  plot_data$run    <- factor(plot_data$run, levels = run_labels)
+
+  n_run <- length(run_labels)
+  if (is.null(palette)) {
+    palette <- if (n_run <= 8 && requireNamespace("RColorBrewer", quietly = TRUE)) {
+      RColorBrewer::brewer.pal(max(3L, n_run), "Dark2")[seq_len(n_run)]
+    } else {
+      scales::hue_pal()(n_run)
+    }
+  }
+  names(palette) <- run_labels
+
+  p <- ggplot(plot_data, aes(x = generation, y = value, colour = run))
+  if (show_ribbon)
+    p <- p + geom_ribbon(data = subset(plot_data, !is.na(ymin)),
+                         aes(ymin = ymin, ymax = ymax, fill = run),
+                         alpha = 0.12, colour = NA) +
+      scale_fill_manual(values = palette, name = legend_title)
+  p +
+    geom_line(linewidth = 0.7) +
+    facet_wrap(~metric, scales = "free_y", ncol = ncol) +
+    scale_colour_manual(values = palette, name = legend_title) +
+    scale_y_continuous(labels = scales::scientific) +
+    labs(
+      title = if (show_ribbon)
+        "Hypervolume and objective evolution (mean +/- 1 SD)"
+      else "Hypervolume and objective evolution (population mean)",
+      x = "Generation", y = NULL
+    ) +
+    theme(strip.text = element_text(size = 10, face = "bold"))
+}
+
 
 # -- Pareto front --------------------------------------------------------------
 
@@ -539,7 +615,10 @@ make_jaccard_plot <- function(run, obj_names = run$obj_names, title = NULL) {
   )
 }
 
-make_sel_freq_plot <- function(run) {
+# Selection-frequency map with a standard legend: a continuous RFOP colourbar
+# with a single grey "Eligible but not selected" key underneath it.
+# Set show_inset = TRUE for the older histogram-inset version instead.
+make_sel_freq_plot <- function(run, show_inset = FALSE) {
   if (is.null(run$df_psel)) {
     return(ggplot() +
              annotate("text", x = 0.5, y = 0.5,
@@ -557,18 +636,48 @@ make_sel_freq_plot <- function(run) {
 
   p_map <- ggplot() +
     theme_void() +
-    theme(panel.background = element_rect(fill = "white", colour = NA),
-          legend.position  = "none")
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position  = if (show_inset) "none" else "right",
+      legend.box       = "vertical",
+      legend.box.just  = "left",
+      legend.background = element_blank(),
+      legend.key       = element_blank(),
+      legend.text      = element_text(size = 9),
+      legend.title     = element_text(size = 10)
+    )
 
   if (!is.null(elig_unsel) && nrow(elig_unsel) > 0)
     p_map <- p_map + geom_raster(data = elig_unsel, aes(x = x, y = y), fill = "grey80")
 
   p_map <- p_map +
     geom_raster(data = freq_df, aes(x = x, y = y, fill = rfop_pct)) +
-    scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, 100)) +
+    scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, 100),
+                         name = "Selection frequency (%)",
+                         guide = guide_colourbar(order = 1, barheight = unit(35, "mm"))) +
     geom_sf(data = BE, fill = NA, color = "black", inherit.aes = FALSE)
 
-  .add_rfop_inset(p_map, freq_df)
+  if (show_inset) return(.add_rfop_inset(p_map, freq_df))
+
+  # Dummy layer purely to add a grey key below the colourbar.  A colour (not
+  # fill) aesthetic is used so it gets its own scale; override.aes turns the
+  # key into a filled grey square matching the map's unselected pixels.
+  if (!is.null(elig_unsel) && nrow(elig_unsel) > 0)
+    p_map <- p_map +
+      geom_point(data = data.frame(x = NA_real_, y = NA_real_),
+                 aes(x = x, y = y, colour = "Eligible but not selected"),
+                 na.rm = TRUE, inherit.aes = FALSE) +
+      scale_colour_manual(
+        name   = NULL,
+        values = c("Eligible but not selected" = "grey80"),
+        guide  = guide_legend(
+          order = 2,
+          override.aes = list(shape = 22, size = 5, stroke = 0.3,
+                              fill = "grey80", colour = "grey50")
+        )
+      )
+
+  p_map
 }
 
 # iEMSs conference version of the selection-frequency map.
@@ -1091,7 +1200,10 @@ make_pareto_overlay_scenarios <- function(nd_df, obj_names,
                                           obj_labels = .obj_labels(obj_names),
                                           title = NULL, subtitle = NULL,
                                           point_size = 1.8, point_alpha = 0.7,
-                                          normalize = TRUE, norm_within = NULL) {
+                                          normalize = TRUE, norm_within = NULL,
+                                          legend_title = "Scenario",
+                                          dom_df = NULL, dom_size_frac = 0.45,
+                                          dom_alpha = 0.25) {
   if (is.null(nd_df) || nrow(nd_df) == 0L || !"scenario" %in% names(nd_df)) {
     message("make_pareto_overlay_scenarios(): empty nd_df or missing 'scenario' column.")
     return(NULL)
@@ -1104,26 +1216,50 @@ make_pareto_overlay_scenarios <- function(nd_df, obj_names,
   obj_labels <- .obj_labels(present)
   obj_names  <- present
 
+  # Optional dominated-solution backdrop: same scenario colouring, drawn first,
+  # smaller and more transparent so the fronts stay the foreground.
+  has_dom <- !is.null(dom_df) && nrow(dom_df) > 0L &&
+             "scenario" %in% names(dom_df) && all(obj_names %in% names(dom_df))
+  if (!is.null(dom_df) && !has_dom)
+    message("make_pareto_overlay_scenarios(): dom_df ignored (empty, or missing ",
+            "'scenario' / objective columns).")
+
   # Min-max each objective to [0, 1]. When norm_within names a grouping column the
   # scaling is done within each group, so a group whose raw values are 100x smaller
   # still spans the full axis instead of collapsing to a stripe.
+  # The dominated backdrop is rescaled with the SAME min/max as the fronts (both
+  # frames pooled), otherwise the two layers would sit on different axes.
   if (normalize) {
-    .minmax <- function(x) {
-      rng <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
-      if (is.finite(rng) && rng > 0) (x - min(x, na.rm = TRUE)) / rng else rep(0, length(x))
+    .minmax_by <- function(x, ref) {
+      lo  <- min(ref, na.rm = TRUE)
+      rng <- max(ref, na.rm = TRUE) - lo
+      if (is.finite(rng) && rng > 0) (x - lo) / rng else rep(0, length(x))
     }
-    use_within <- !is.null(norm_within) && norm_within %in% names(nd_df)
+    use_within <- !is.null(norm_within) && norm_within %in% names(nd_df) &&
+                  (!has_dom || norm_within %in% names(dom_df))
     for (o in obj_names) {
-      nd_df[[o]] <- if (use_within) {
-        stats::ave(nd_df[[o]], nd_df[[norm_within]], FUN = .minmax)
+      if (use_within) {
+        grp_levels <- unique(c(as.character(nd_df[[norm_within]]),
+                               if (has_dom) as.character(dom_df[[norm_within]])))
+        for (g in grp_levels) {
+          i_nd  <- as.character(nd_df[[norm_within]]) == g
+          i_dom <- if (has_dom) as.character(dom_df[[norm_within]]) == g else FALSE
+          ref   <- c(nd_df[[o]][i_nd], if (has_dom) dom_df[[o]][i_dom])
+          nd_df[[o]][i_nd] <- .minmax_by(nd_df[[o]][i_nd], ref)
+          if (has_dom) dom_df[[o]][i_dom] <- .minmax_by(dom_df[[o]][i_dom], ref)
+        }
       } else {
-        .minmax(nd_df[[o]])
+        ref <- c(nd_df[[o]], if (has_dom) dom_df[[o]])
+        nd_df[[o]] <- .minmax_by(nd_df[[o]], ref)
+        if (has_dom) dom_df[[o]] <- .minmax_by(dom_df[[o]], ref)
       }
     }
     obj_labels <- paste0(obj_labels, " (norm.)")
   }
 
   nd_df$scenario <- as.factor(nd_df$scenario)
+  if (has_dom)
+    dom_df$scenario <- factor(dom_df$scenario, levels = levels(nd_df$scenario))
   n_scen <- nlevels(nd_df$scenario)
   pal <- if (n_scen <= 8 && requireNamespace("RColorBrewer", quietly = TRUE)) {
     RColorBrewer::brewer.pal(max(3L, n_scen), "Dark2")[seq_len(n_scen)]
@@ -1134,9 +1270,13 @@ make_pareto_overlay_scenarios <- function(nd_df, obj_names,
   pairs <- utils::combn(length(obj_names), 2, simplify = FALSE)
   plots <- lapply(pairs, function(p) {
     xi <- obj_names[p[1]]; yi <- obj_names[p[2]]
-    ggplot(nd_df, aes(x = .data[[xi]], y = .data[[yi]], colour = scenario)) +
+    g <- ggplot(nd_df, aes(x = .data[[xi]], y = .data[[yi]], colour = scenario))
+    if (has_dom)
+      g <- g + geom_point(data = dom_df, size = point_size * dom_size_frac,
+                          alpha = dom_alpha, show.legend = FALSE)
+    g +
       geom_point(size = point_size, alpha = point_alpha) +
-      scale_colour_manual(values = pal, name = "Scenario") +
+      scale_colour_manual(values = pal, name = legend_title) +
       labs(x = obj_labels[p[1]], y = obj_labels[p[2]]) +
       theme(legend.position = "right")
   })
@@ -1355,13 +1495,36 @@ load_run_data <- function(dir_path, label) {
   norm_scales  <- tryCatch(unlist(meta$algorithm$objective_normalization$scales),
                            error = function(e) NULL)
   invert_cols <- grep(
-    "anomaly|connectivity_gain|restoration_potential|landscape_context",
+    "anomaly|connectivity_gain|restoration_potential|restoration_benefit|landscape_context",
     obj_names, value = TRUE)
   if (length(invert_cols) > 0L) {
     df_obj[, invert_cols] <- -df_obj[, invert_cols]
     if (!is.null(df_norm))
       df_norm[, intersect(invert_cols, names(df_norm))] <-
         -df_norm[, intersect(invert_cols, names(df_norm))]
+    # population_stats.csv is written straight from the minimiser's per-generation
+    # stats, so the same objectives must be flipped there or the evolution facets
+    # slope the wrong way (a maximised objective looks like it is getting worse).
+    # _mean / _min / _max are signed; _std is scale-only and must NOT be flipped.
+    # Negation reverses the order, so the old _min becomes the new _max.
+    if (!is.null(df_pop)) {
+      for (oc in invert_cols) {
+        mean_col <- paste0(oc, "_mean")
+        min_col  <- paste0(oc, "_min")
+        max_col  <- paste0(oc, "_max")
+        if (mean_col %in% names(df_pop))
+          df_pop[[mean_col]] <- -df_pop[[mean_col]]
+        if (min_col %in% names(df_pop) && max_col %in% names(df_pop)) {
+          old_min <- df_pop[[min_col]]
+          df_pop[[min_col]] <- -df_pop[[max_col]]
+          df_pop[[max_col]] <- -old_min
+        } else if (min_col %in% names(df_pop)) {
+          df_pop[[min_col]] <- -df_pop[[min_col]]
+        } else if (max_col %in% names(df_pop)) {
+          df_pop[[max_col]] <- -df_pop[[max_col]]
+        }
+      }
+    }
   }
   list(label = label, dir = dir_path, meta = meta, obj_names = obj_names,
        n_obj = length(obj_names), n_solutions = meta$n_solutions,
@@ -3036,7 +3199,9 @@ collect_pareto_stats <- function(runs_meta, obj_names) {
 # against a SINGLE shared reference box (the pooled worst corner), making HV
 # directly comparable. Dimension-agnostic Monte-Carlo estimate (no HV package
 # required). Only pass runs whose objectives share the same definition/units
-# (e.g. exclude the threshold-formulation runs).
+# (e.g. exclude the threshold- and shortfall-formulation runs, whose
+# restoration_potential is a pixel count / a capped gain sum rather than an
+# anomaly sum).
 #
 #   runs_meta : named list; each element has $run = load_run_data() output
 #   obj_names : objective columns to use (raw, as in df_obj)
@@ -3837,7 +4002,7 @@ make_anova_summary_bar <- function(anova_df,
 # Colour palette / labels for factorial sources. Order here also sets bar/legend order.
 # Okabe-Ito palette (colorblind-safe under deuteranopia, protanopia, tritanopia).
 .factor_palette <- c(
-  form         = "#0072B2",   # blue        - objective target form (sum vs threshold)
+  form         = "#0072B2",   # blue        - objective target form (sum/threshold/shortfall)
   scaling      = "#E69F00",   # orange      - condition scaling / reference (anomaly vs q75)
   construction = "#009E73",   # green       - condition-indicator construction
   policy       = "#CC79A7",   # pink-purple - policy / governance lever
@@ -3893,7 +4058,9 @@ load_run_factorial <- function(dir_path, label = basename(dir_path)) {
   # ("{scaling}_{construction}", e.g. "upper_q75_drop_smd") on its known prefix.
   cond_tag <- rc$condition_scenario %||% NA_character_
   if ((is.na(scaling) || is.na(construction)) && !is.na(cond_tag)) {
-    for (pre in c("upper_q75", "global", "zones")) {
+    # Longest-prefix-first so "upper_q75" is tried before any shorter benchmark name.
+    # Covers the whole quantile family (global = the q0 end of the same series).
+    for (pre in c(paste0("upper_q", c(10, 25, 50, 75, 90)), "global", "zones")) {
       if (startsWith(cond_tag, paste0(pre, "_"))) {
         if (is.na(scaling))      scaling      <- pre
         if (is.na(construction)) construction <- sub(paste0("^", pre, "_"), "", cond_tag)
