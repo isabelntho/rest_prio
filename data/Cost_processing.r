@@ -21,6 +21,9 @@
 #   forest_cost,   grassland_cost,   cropland_cost      (unweighted)
 #   forest_cost_w, grassland_cost_w, cropland_cost_w    (weighted)
 # plus a single combined layer per weighting scheme.
+
+# note: original rasters of cost use "Y:\CH_Kanton_Bern\03_Workspaces\03_Habitat_condition\Restoration_potential\Implementation_cost_eva\Data\arealstatistik\AS18_3.tif"
+# for land use - but there was a slight mismatch in the offset.
 # =====================================================================
 
 library(terra)
@@ -43,13 +46,17 @@ DEM       <- paste0(cost_data_dir, "DEM/dem25_lv95.tif")
 rd_dist   <- paste0(cost_data_dir, "distance to road/distance_road.tif")
 soil      <- paste0(cost_data_dir, "Soil suitability/bek200_070625_shp/bek200_070625.shp")
 ownership <- paste0(cost_data_dir, "Ownership/data/GREIKA_GREIKA.shp")
-landcover <- paste0(cost_data_dir, "arealstatistik/AS18_3.tif")   # 1=crop, 2=grass, 3=forest, 0=other
+# NOAS04 land cover (same source as setup.R's LU / ec_anomalies.r's CH_LULC_PATH,
+# and same grid as EC_stack.tif - unlike AS18_3.tif, whose Arealstatistik grid sits
+# on a 50m-offset phase from every other raster in this pipeline). Classes per
+# setup.R's lu_classes: forest = 12/13, agricultural (cropland) = 15, grassland = 16/17.
+landcover <- "W:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/LULC/LULC_2018_agg.tif"
 kb_bound  <- "Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_KANTONSGEBIET.shp"
 ch_bound <- "Y:/EU_BioES_SELINA/WP3/4. Spatially_Explicit_EC/Data/CH_shps/swissBOUNDARIES3D_1_4_TLM_LANDESGEBIET.shp"
 
 ## ---- Analysis grid --------------------------------------------------
 target_crs <- "EPSG:2056"   # CH1903+ / LV95
-target_res <- 100           # metres (native resolution of AS18_3)
+target_res <- 100           # metres (native resolution of LULC_2018_agg.tif)
 
 ## ---- Tuning parameters (methodology section 4 & 6) ------------------
 slope_cap  <- 70            # slope (%) at/above which slope_norm = 1
@@ -90,16 +97,31 @@ aoi <- aggregate(project(aoi, target_crs))   # dissolve to a single polygon
 # Land cover defines the masking classes and the analysis grid.
 lc <- rast(landcover)
 
-crs(lc) <- target_crs        # AS18_3 coords are already LV95; force the label, don't trust the file
-lc <- crop(lc, aoi)          # single analysis grid (100 m, snapped)
+crs(lc) <- target_crs        # already LV95; force the label as a defensive no-op
+
+# At CH extent, crop straight to EC_stack.tif's own extent rather than to `aoi`'s
+# bounding box: ec_anomalies.r builds the CH condition (abiotic/biotic) rasters
+# directly on EC_stack.tif's native grid, not on a boundary-shapefile crop, and
+# swissBOUNDARIES3D's LANDESGEBIET (national outline, used for `aoi` above) does
+# not snap to the identical bounding box as EC_stack.tif even on the same
+# phase-0 grid - off by one row top and bottom. `aoi` is still used below to NA
+# out non-Switzerland cells; only the grid-defining crop changes.
+if (extent == "CH") {
+  ch_grid_ref <- "Y:/CH_Kanton_Bern/03_Workspaces/03_Habitat_condition/Restoration_potential/Data/EC_stack.tif"
+  lc <- crop(lc, ext(rast(ch_grid_ref)))
+} else {
+  lc <- crop(lc, aoi)          # single analysis grid (100 m, snapped)
+}
 lc_t <- mask(lc, aoi)
 
 # Land-use masks: 1 where the land use applies, NA everywhere else.
 # (Use ifel -> 1/NA so mask() below unambiguously drops all other cells;
 # a logical mask with maskvalues=c(FALSE,NA) does NOT drop the FALSE cells.)
-mask_forest <- ifel(lc == 3, 1, NA)
-mask_grass  <- ifel(lc == 2, 1, NA)
-mask_crop   <- ifel(lc == 1, 1, NA)
+# NOAS04 codes (setup.R's lu_classes): forest 12/13, agricultural (cropland) 15,
+# grassland 16/17.
+mask_forest <- ifel(lc %in% c(12, 13), 1, NA)
+mask_grass  <- ifel(lc %in% c(16, 17), 1, NA)
+mask_crop   <- ifel(lc == 15,          1, NA)
 
 # Helper: clip any layer to the study-area boundary.
 clip_aoi <- function(r) mask(r, aoi)
