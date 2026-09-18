@@ -1,4 +1,3 @@
-
 <!--
   Robustness of the restoration plans to the choice of condition indicators.
 
@@ -15,8 +14,8 @@
   include. Deleting it re-executes the WHOLE manuscript, including the python chunks of
   _restmoo_methods.qmd, which need the reticulate R package installed.
 
-  Individual stages can be re-run on the cached archive (noise, cross, classify, maps);
-  only `extract` re-reads the raw pkls. SET THE PATHS IN THE config-unc CHUNK, which
+  Individual stages can be re-run on the cached archive (noise, cross, classify, maps,
+  variantmaps); only `extract` re-reads the raw pkls. SET THE PATHS IN THE config-unc CHUNK, which
   lives with the rest of the uncertainty machinery in the methods section
   (_methods.qmd, "Uncertainty analysis") because the design paragraph there quotes the
   same numbers.
@@ -40,7 +39,7 @@ theme_set(theme_minimal(base_size = 11))
 # index.qmd includes before this file.
 if (!exists("RPT"))
   stop("RPT not found - the setup-unc-shared chunk of _methods.qmd must run first.")
-.need_stages("noise", "cross", "discrim", "interact", "classify", "maps")
+.need_stages("noise", "cross", "discrim", "interact", "classify", "maps", "variantmaps")
 
 # Re-assert the formatters defined in _methods.qmd. `_results_baseline.qmd` is included
 # between that file and this one and defines its own `.pc` at top level inside the
@@ -99,6 +98,9 @@ NOISE_JAC <- readr::read_csv(.u("noise_jaccard.csv"), show_col_types = FALSE)
 DISCRIM   <- readr::read_csv(.u("discriminability.csv"), show_col_types = FALSE)
 INTERACT  <- readr::read_csv(.u("interaction.csv"), show_col_types = FALSE)
 PLANS     <- readr::read_csv(.u("plan_summary.csv"), show_col_types = FALSE)
+# variantmaps stage: one representative plan per native variant.
+VJAC      <- readr::read_csv(.u("variant_jaccard_matrix.csv"), show_col_types = FALSE)
+VREP      <- readr::read_csv(.u("variant_representative_plans.csv"), show_col_types = FALSE)
 
 # One colour per axis, with the two seed floors deliberately grey: they are the
 # yardstick, not a finding. Order is the reading order of the tables below.
@@ -113,13 +115,16 @@ REG_ORDER <- setdiff(AX_ORDER, "seed_pooled_halves")
 JAC_ORDER <- setdiff(AX_ORDER, "seed")
 ```
 
+### Model uncertainty --- condition construction
+
 #### Deviation by formulation axis
 
-Caveat to the below figures: the weighting axis has a higher number of variations, so a larger difference is to be expected to an extent. Comparison to baseline & search stochasticity still valid.
+@fig-unc-noise shows how far each formulation axis moves a plan's benefit regret (a)
+and the selected set itself (b), against the search-stochasticity and baseline floors.
 
 ```{r}
 #| label: fig-unc-noise
-#| fig-cap: "(a) Cost-matched benefit regret by formulation axis, bar represents the median. (b) Core-selection Jaccard by formulation axis, five seeds pooled per variant."
+#| fig-cap: "(a) Cost-matched benefit regret by formulation axis; bar is the median. The axis pools differ in size (5, 12 and 25 variants for scaling, indicators and weighting), so panel (a) shows where each axis sits against the seed and baseline floors, not a quantitative ranking between axes. (b) Core-selection Jaccard by formulation axis, five seeds pooled per variant."
 #| fig-width: 8.4
 #| fig-height: 3.4
 
@@ -154,42 +159,104 @@ p_reg + p_jac + plot_layout(widths = c(1.35, 1)) +
   plot_annotation(tag_levels = "a")
 ```
 
-```{r}
-#| label: tbl-unc-axis-binding
-#| tbl-cap: "The same worst cases grouped by the axis the binding variant departs the reference on. Every departure classify ranked against gets a row, so an axis that was searched and never bound reads as zero rather than going missing."
+#### Agreement across all variants
 
-AXW <- .g(CL, "worst_axis_counts")
-# Share denominator: the archive classify ranked.
-N_PLANS <- .gn(CL, "n_plans")
-# `worst_axis_counts` holds only the axes that actually won a row-wise max, so an axis
-# searched and never binding would drop out of the table entirely and read as untested -
-# which is the opposite of what it means. The row set therefore comes from
-# `regret_by_variant`, one entry per variant classify ranked against, i.e. every departure
-# that COULD have bound; the counts are joined onto it, zero where the axis never won.
-AX_ALL <- unique(vapply(.g(CL, "regret_by_variant"), `[[`, "", "axes"))
-# `[[` on a name absent from AXW errors when the JSON object simplified to a named atomic
-# vector and returns NULL when it stayed a list; guard on names() instead, which is the
-# same for both.
-.axn <- function(a) if (a %in% names(AXW)) as.numeric(AXW[[a]]) else 0
-# A variant may depart on more than one axis at once ("scaling+construction"), which
-# `_axes_departed` writes as a "+"-joined key; label each part so the composite rows read
-# like the single-axis ones.
-.axlab_key <- function(k) vapply(strsplit(k, "+", fixed = TRUE),
-                                 function(p) paste(.axlab(p), collapse = " + "), "")
-tibble::tibble(Axis = union(AX_ALL, names(AXW))) |>
-  mutate(n = vapply(Axis, .axn, 0),
-         Share = .pc(n / N_PLANS),
-         Axis = .axlab_key(Axis)) |>
-  arrange(desc(n), Axis) |>
-  select(Axis, Plans = n, Share) |>
-  kable(align = "lrr")
+@fig-unc-noise reads the axes one at a time. Taking every pair of the
+`r .n(.gn(RPT, "variantmaps", "n_variants_native"))` variants that has runs of its own
+instead -- within an axis and across axes alike -- the core-selection Jaccard has a
+median of `r .f(.gn(RPT, "variantmaps", "pairwise_jaccard", "median"), 2)`
+(range `r .f(.gn(RPT, "variantmaps", "pairwise_jaccard", "min"), 2)`--`r .f(.gn(RPT, "variantmaps", "pairwise_jaccard", "max"), 2)`),
+and the formulation-axis blocks barely stand out in it:
+`r .f(.gn(RPT, "variantmaps", "pairwise_jaccard", "within_block_median"), 2)` for
+within-block pairs against
+`r .f(.gn(RPT, "variantmaps", "pairwise_jaccard", "cross_block_median"), 2)` across
+blocks (@fig-unc-varjac).
+
+```{r}
+#| label: fig-unc-varjac
+#| fig-cap: "Pairwise spatial similarity (Jaccard index) of the core selection -- cells chosen by at least half of a variant's pooled plans, five seeds pooled -- for every pair of the 73 condition variants that has runs of its own, ordered by formulation axis. White lines separate the axis blocks; ticks mark each block's midpoint; the diagonal (self-pairs, Jaccard 1) is left blank."
+#| fig-width: 7
+#| fig-height: 6.6
+
+SHORT_BLOCK <- c("Reference" = "Ref.",
+                 "Construction (leave-one-out)" = "Construction",
+                 "Scaling" = "Scaling",
+                 "Scaling x construction" = "Scaling x constr.",
+                 "Weighting (structured)" = "Weighting (struct.)",
+                 "Weighting (sampled)" = "Weighting (sampled)")
+
+ord  <- VREP |> arrange(plot_order, variant) |>
+  transmute(variant, idx = row_number(), block)
+nlev <- nrow(ord)
+VJ <- VJAC |>
+  left_join(transmute(ord, tag_a = variant, xi = idx), by = "tag_a") |>
+  left_join(transmute(ord, tag_b = variant, yi = idx), by = "tag_b") |>
+  # Blank the self-pairs: they are 1 by definition and would otherwise use up the
+  # top of a colour scale the off-diagonal never reaches (max ~0.74).
+  mutate(jaccard = ifelse(tag_a == tag_b, NA_real_, jaccard))
+blk <- ord |> group_by(block) |>
+  summarise(mid = mean(idx), edge = max(idx), .groups = "drop") |> arrange(mid)
+bnd <- head(sort(blk$edge), -1)
+
+ggplot(VJ, aes(xi, nlev - yi + 1, fill = jaccard)) +
+  geom_raster() +
+  geom_vline(xintercept = bnd + 0.5, colour = "white", linewidth = 0.3) +
+  geom_hline(yintercept = nlev - bnd + 0.5, colour = "white", linewidth = 0.3) +
+  scale_x_continuous(breaks = blk$mid, labels = SHORT_BLOCK[blk$block],
+                     expand = c(0, 0)) +
+  scale_y_continuous(breaks = nlev - blk$mid + 1, labels = SHORT_BLOCK[blk$block],
+                     expand = c(0, 0)) +
+  scale_fill_viridis_c(name = "Jaccard index", limits = c(0, 1),
+                       na.value = "grey92") +
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 7),
+        legend.key.height = unit(12, "mm"))
 ```
 
-## Robustness
+Reducing each variant to the single plan its own search ranked best and pooling those
+`r .n(.gn(RPT, "variantmaps", "n_representative_plans"))` plans,
+`r .n(.gn(RPT, "variantmaps", "cells_by_freq_threshold", "0.50"))` cells are restored
+by a majority of them and
+`r .n(.gn(RPT, "variantmaps", "cells_by_freq_threshold", "0.90"))` by all but a handful,
+out of `r .n(.gn(RPT, "variantmaps", "n_eligible_cells"))` eligible cells
+(@fig-unc-varfreq).
+
+```{r}
+#| label: fig-unc-varfreq
+#| fig-cap: "Selection frequency across the 73 per-variant representative plans, each the plan its own variant's search ranked best (lowest cost-matched benefit regret against that variant's own front, ties broken toward the median-cost plan). A cell's value is the fraction of the 73 plans that restore it."
+#| fig-width: 5.6
+#| fig-height: 4.8
+
+if (!exists("BE")) BE <- readRDS(.p("Documentation/BE_bern.rds"))
+VF_DF <- as.data.frame(terra::trim(terra::rast(.u("freq_variants.tif"))),
+                       xy = TRUE, na.rm = TRUE)
+names(VF_DF)[3] <- "freq"
+
+ggplot(VF_DF, aes(x, y, fill = freq)) +
+  geom_raster() +
+  geom_sf(data = BE, fill = NA, colour = "black", linewidth = 0.2, inherit.aes = FALSE) +
+  coord_sf(datum = NA) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, limits = c(0, NA),
+                       labels = scales::percent, name = "Selection frequency") +
+  theme_void(base_size = 10) +
+  theme(legend.position = "bottom", legend.box = "horizontal",
+        legend.key.height = unit(2.6, "mm"), legend.key.width = unit(20, "mm"),
+        legend.title = element_text(size = 9), legend.text = element_text(size = 8))
+```
+
+#### Robust subset
 
 Ranking the archive by worst-case regret and keeping the bottom
 `r .pc(.gn(CL, "robust_quantile"), 0)` gives `r .n(.gn(CL, "n_robust"))` robust plans, at a
-regret cutoff of `r .pc(.gn(CL, "cutoff"))`.
+regret cutoff of `r .pc(.gn(CL, "cutoff"))`. Of the formulation axes, weighting moves the
+selected set most (@fig-unc-noise): core-selection Jaccard across weighting variants has a
+median of `r .f(median(NOISE_JAC$jaccard[NOISE_JAC$comparison == "weighting"]), 2)`,
+against `r .f(median(NOISE_JAC$jaccard[NOISE_JAC$comparison == "seed_pooled_halves"]), 2)`
+for the matched seed floor (echoes [@maes_accounting_2023]).
 
 ```{r}
 #| label: tbl-unc-robust
@@ -208,6 +275,61 @@ tibble::tibble(
                       .n(.gn(RPT, "maps", "cells_selected_robust")),
                       .n(.gn(RPT, "maps", "core_robust")))) |>
   kable(align = "lrr")
+```
+
+`max_regret` is a row-wise maximum over variants, so exactly one variant sets it for any given
+plan. @fig-unc-worstvariant breaks the pooled archive down by which: only
+`r .n(length(.g(CL, "worst_variant_counts")))` of the
+`r .n(length(.g(CL, "variants")))` variants classify evaluates ever win that maximum, and one
+sampled-weighting draw alone -- not a hand-picked indicator -- is binding for over half of it.
+Weighting variants (structured and sampled together) account for
+`r .pc(.gn(CL, "worst_axis_counts", "weighting") / .gn(CL, "n_plans"))` of the archive between
+them, echoing @fig-unc-noise's finding that weighting moves the selected set most; leave-one-out
+construction variants take the rest, led by dropping soil organic carbon.
+
+```{r}
+#| label: fig-unc-worstvariant
+#| fig-cap: "Which variant sets each plan's worst-case regret. One bar per variant that is ever the row-wise argmax of max_regret over the pooled archive (14 of the 73 variants classify evaluates); bar length is the share of plans it is binding for, coloured by formulation-axis block, with the plan count in parentheses."
+#| fig-width: 7.6
+#| fig-height: 4.4
+
+# Indicator-family tags (drop_/w_<indicator>) get their IND_LABELS name; sampled-weighting
+# draws (global_w_d<BB><a-d>, no indicator of their own) get their draw id instead.
+.varlabel <- function(tag) {
+  if (tag == "global_all") return("Reference (no perturbation)")
+  if (grepl("^global_w_d[0-9]", tag))
+    return(sprintf("Weighting draw %s", sub("^d", "", .ind(tag))))
+  ind <- .ind(tag)
+  lab <- if (is.na(IND_LABELS[ind])) ind else unname(IND_LABELS[ind])
+  sprintf("%s (%s)", lab, .pert(tag))
+}
+
+WVC <- .g(CL, "worst_variant_counts")
+BIND <- tibble::tibble(variant = names(WVC), n = as.integer(unlist(WVC))) |>
+  mutate(frac = n / .gn(CL, "n_plans"),
+         label = vapply(variant, .varlabel, character(1))) |>
+  left_join(select(VREP, variant, block), by = "variant") |>
+  arrange(frac) |>
+  mutate(label = factor(label, levels = label))
+
+BLOCK_COLS <- c("Reference" = "grey45",
+                "Construction (leave-one-out)" = "#E05C2A",
+                "Scaling" = "#2A6FE0",
+                "Scaling x construction" = "#7A4FBF",
+                "Weighting (structured)" = "#1F9E5A",
+                "Weighting (sampled)" = "#8FD9AE")
+
+ggplot(BIND, aes(label, frac, fill = block)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(y = frac + 0.02 * max(frac),
+               label = sprintf("%s (%s)", scales::percent(frac, accuracy = 0.1), .n(n))),
+           hjust = 0, size = 2.6) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(labels = scales::percent, expand = expansion(c(0, 0.22))) +
+  scale_fill_manual(values = BLOCK_COLS, name = NULL) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(x = NULL, y = "Share of plans for which this variant sets the worst-case regret") +
+  theme(legend.position = "bottom", axis.text.y = element_text(size = 8))
 ```
 
 ```{r}
@@ -327,171 +449,74 @@ p_a + p_b + p_c + plot_layout(nrow = 1, guides = "collect") +
                                 legend.justification = "center"))
 ```
 
+### Scenario uncertainty --- LULC/climate futures
+
 ```{r}
-#| label: unc-characteristics
+#| label: setup-unc-scenario-regret
 #| include: false
 
-# MAP_DF is built by fig-unc-maps above: one row per eligible cell (non-NaN in
-# freq_full.tif, i.e. the union of the per-variant eligible masks), with that cell's
-# selection frequency over the full archive and over the robust subset.
-if (!exists("MAP_DF"))
-  stop("MAP_DF not found - the fig-unc-maps chunk must run before this one.")
+# Section 3.6, benefit side. Written by Core_optimisation/scenario_regret.py: it
+# re-scores every pooled plan's DIRECT restoration benefit (the global_all condition
+# layer) under the 225 Landscape Change Explorer combinations at 2040/2050/2060 = 675
+# scenario-horizons, then applies the same cost-matched regret logic as section 3.5 and
+# takes the bottom quartile of worst-case regret as the scenario-robust subset. Refresh:
+#   pixi run python -m Core_optimisation.scenario_regret all
+.srp <- .p("outputs/scenario_regret/report.json")
+if (!file.exists(.srp))
+  stop("outputs/scenario_regret/report.json not found - run:\n",
+       "  pixi run python -m Core_optimisation.scenario_regret all")
+SRG <- jsonlite::read_json(.srp, simplifyVector = TRUE)
 
-# reclass_lulc() lives in the plotting library the baseline section sources. This
-# section is otherwise independent of that one, so it is pulled in only if absent.
-if (!exists("reclass_lulc")) source(.p("Documentation/_plot_functions.R"))
+# short accessor for the scenario-regret report's `regret` block
+.sr <- function(...) .gn(SRG, "regret", ...)
 
-# The panels below read the REFERENCE variant's layers
-UNC_REF     <- .g(CFG, "campaigns", "benchmark_x_construction", "reference")
-UNC_REF_TAG <- paste(UNC_REF$scaling, UNC_REF$construction, sep = "_")
-UNC_LAYERS  <- c(
-  `Abiotic anomaly`     = file.path("data/anomaly_scenarios",
-                                    paste0("abiotic_", UNC_REF_TAG, ".tif")),
-  `Biotic anomaly`      = file.path("data/anomaly_scenarios",
-                                    paste0("biotic_", UNC_REF_TAG, ".tif")),
-  `Implementation cost` = "data/implementation_cost_corrected.tif")
-UNC_LULC_RASTER <- "data/ecosystem_lulc_masked.tif"
-
-.miss <- c(UNC_LAYERS, UNC_LULC_RASTER)[!file.exists(.p(c(UNC_LAYERS, UNC_LULC_RASTER)))]
-if (length(.miss))
-  stop("Missing raster(s) for the characteristics figures: ",
-       paste(.miss, collapse = ", "))
-
-UNC_N_SAMPLE <- 1.5e5   # cap on cells carried into the density figure
-
-.freq_breaks <- function(f) {
-  s <- f[f > 0]
-  if (!length(s))
-    stop("No cell is ever selected on this frequency surface.")
-  brk <- unique(unname(stats::quantile(s, c(0, 0.25, 0.5, 0.75, 1), type = 1)))
-  if (length(brk) < 2L)
-    stop("Every selected cell has the same selection frequency; no quartiles exist.")
-  if (length(brk) < 5L)
-    warning("Selection-frequency ties collapse the quartile breaks: ",
-            length(brk) - 1L, " groups instead of 4.")
-  brk
-}
-.freq_class <- function(f, brk) {
-  out <- factor(rep(NA_character_, length(f)),
-                levels = paste0("Q", seq_len(length(brk) - 1L)))
-  sel <- f > 0
-  out[sel] <- paste0("Q", as.integer(cut(f[sel], breaks = brk, include.lowest = TRUE)))
-  out
-}
-
-UNC_FREQ  <- c(`Full archive` = "full", `Robust subset` = "robust")
-UNC_BRK   <- lapply(UNC_FREQ, function(col) .freq_breaks(MAP_DF[[col]]))
-UNC_CELLS <- bind_cols(
-  MAP_DF[, c("x", "y")],
-  as.data.frame(lapply(names(UNC_FREQ), function(nm)
-    .freq_class(MAP_DF[[UNC_FREQ[[nm]]]], UNC_BRK[[nm]])),
-    col.names = names(UNC_FREQ), check.names = FALSE))
-
-# Quartile colours are the baseline section's ramp, so "darker = selected more often"
-# means the same thing in @fig-distributions and here.
-UNC_SETS <- c("Eligible",
-              paste0("Q", seq_len(max(vapply(UNC_BRK, length, 0L)) - 1L)))
-UNC_PAL  <- c(Eligible = "grey55",
-              setNames(colorRampPalette(c("#FEB24C", "#FD8D3C", "#E31A1C",
-                                          "#800026"))(length(UNC_SETS) - 1L),
-                       UNC_SETS[-1]))
-
-# -- Layer values at every eligible cell -------------------------------------
-UNC_XY  <- as.matrix(UNC_CELLS[, c("x", "y")])
-UNC_LYR <- tibble::as_tibble(lapply(UNC_LAYERS, function(path)
-  terra::extract(terra::rast(.p(path)), UNC_XY)[, 1]))
-
-UNC_VALS <- local({
-  set.seed(1)
-  i <- if (nrow(UNC_CELLS) > UNC_N_SAMPLE)
-    sort(sample.int(nrow(UNC_CELLS), UNC_N_SAMPLE)) else seq_len(nrow(UNC_CELLS))
-  lyr <- UNC_LYR[i, ]
-  bind_rows(lapply(names(UNC_FREQ), function(nm) {
-    q <- UNC_CELLS[[nm]][i]
-    # The eligible footprint is the same in both rows of the figure; it is repeated
-    # per row so each surface is read against it without crossing panels.
-    bind_rows(mutate(lyr, Archive = nm, Set = "Eligible"),
-              mutate(lyr[!is.na(q), ], Archive = nm,
-                     Set = as.character(q[!is.na(q)])))
-  })) |>
-    tidyr::pivot_longer(all_of(names(UNC_LAYERS)),
-                        names_to = "Layer", values_to = "value") |>
-    filter(is.finite(value)) |>
-    mutate(Layer   = factor(Layer, levels = names(UNC_LAYERS)),
-           Archive = factor(Archive, levels = names(UNC_FREQ)),
-           Set     = factor(Set, levels = UNC_SETS))
-})
-
-# Shares are counts, so they run on every eligible cell rather than on the sample.
-UNC_LULC <- local({
-  cls <- reclass_lulc(terra::extract(terra::rast(.p(UNC_LULC_RASTER)), UNC_XY)[, 1])
-  cls <- factor(ifelse(is.na(cls), "Unclassified", as.character(cls)),
-                levels = c(levels(cls), "Unclassified"))
-  bind_rows(lapply(names(UNC_FREQ), function(nm) {
-    q <- UNC_CELLS[[nm]]
-    bind_rows(tibble::tibble(Archive = nm, Set = "Eligible", Class = cls),
-              tibble::tibble(Archive = nm, Set = as.character(q[!is.na(q)]),
-                             Class = cls[!is.na(q)]))
-  })) |>
-    mutate(Archive = factor(Archive, levels = names(UNC_FREQ)),
-           Set     = factor(Set, levels = UNC_SETS)) |>
-    count(Archive, Set, Class, .drop = FALSE) |>
-    group_by(Archive, Set) |>
-    mutate(pct = 100 * n / sum(n)) |>
-    ungroup() |>
-    # An empty "Unclassified" bar is noise; every other class stays even at 0.
-    filter(Class != "Unclassified" | any(n[Class == "Unclassified"] > 0))
-})
+# The prose below is written for the discriminating verdict. Stop rather than render a
+# paragraph that contradicts the report; rewrite it from the non-discriminating fields
+# (loss_frac between_plan/between_scenario var shares, by_horizon medians) if this fires.
+if (!identical(.g(SRG, "regret", "verdict"), "discriminating"))
+  stop("scenario_regret verdict is '", .g(SRG, "regret", "verdict"),
+       "', not 'discriminating' - the paragraph after this chunk assumes discrimination.")
 ```
+
+Re-scoring benefit under the 675 scenario-horizons **does** separate the plans:
+worst-case scenario regret has a median of `r .f(.sr("worst_regret", "median"), 3)` and
+reaches `r .f(.sr("worst_regret", "p90"), 3)` at the 90th percentile. The bottom-quartile
+subset gives `r .n(.sr("n_robust"))` scenario-robust plans. Of the
+`r .n(.sr("model_robust_overlap", "n_model_robust"))` model-robust plans,
+`r .n(.sr("model_robust_overlap", "intersection"))` are also scenario-robust --
+`r .f(.sr("model_robust_overlap", "ratio_vs_chance"), 1)`x the overlap expected by chance.
+Where the two sets put restoration is only slightly more alike than chance: their per-cell
+selection frequencies correlate at
+`r .f(.sr("model_robust_overlap", "selection_frequency_pearson_r"), 2)` against a null of
+`r .f(.sr("model_robust_overlap", "selection_frequency_null_median"), 2)`, since all plans
+share a region-grown core.
 
 ```{r}
-#| label: fig-unc-characteristics
-#| fig-cap: "Distributions of the two condition layers and of cost over the eligible footprint and over the selected cells."
-#| fig-width: 8.4
-#| fig-height: 5.2
+#| label: fig-unc-scenregret
+#| fig-cap: "Worst-case regret of a plan under model-formulation uncertainty (the 85 condition variants) and under scenario uncertainty (675 land-use x climate x horizon combinations). Both are the same cost-matched benefit shortfall statistic. Box spans the interquartile range with the median line; the upper whisker reaches the 90th percentile. The lower box edge is that source's bottom-quartile robustness cutoff, so no lower whisker is drawn."
+#| fig-width: 5.5
+#| fig-height: 2.2
 
-# Each curve is scaled to its own peak rather than drawn as a probability density.
-# The panels are here to be compared by SHAPE, and a density integrates to 1 over x:
-# cost is normalised to 0-0.93 while the anomalies span roughly -2.5 to 5, so the same
-# mass makes the cost curves ~6x taller and the rows unreadable against each other.
-# The cost of the rescaling is that height no longer carries mass - a Q4 curve peaking
-# at 1 does not mean Q4 is as numerous as the eligible footprint - so the panels say
-# where a set sits on each layer, not how much of it there is.
-ggplot(UNC_VALS, aes(value, after_stat(scaled), colour = Set)) +
-  geom_density(data = ~ filter(.x, Set == "Eligible"), aes(fill = Set),
-               alpha = 0.35, linewidth = 0.3) +
-  geom_density(data = ~ filter(.x, Set != "Eligible"), fill = NA, linewidth = 0.6) +
-  # y is now common to every panel (0-1 by construction), so only x is freed.
-  facet_wrap(vars(Layer, Archive), scales = "free_x", ncol = 2) +
-  scale_fill_manual(values = UNC_PAL, guide = "none") +
-  scale_colour_manual(values = UNC_PAL, drop = FALSE, name = "Selection\nfrequency") +
-  labs(x = NULL, y = "Density (scaled to peak)")
+.sr_row <- function(label, blk) data.frame(
+  source = label,
+  p25 = .gn(SRG, "regret", blk, "p25"), med = .gn(SRG, "regret", blk, "median"),
+  p75 = .gn(SRG, "regret", blk, "p75"), p90 = .gn(SRG, "regret", blk, "p90"))
+SR_FIG <- rbind(.sr_row("Model formulation", "model_worst_regret"),
+                .sr_row("LULC + climate scenario", "worst_regret")) |>
+  mutate(source = factor(source, levels = rev(source)))
+
+# geom_boxplot(stat = "identity"): only p25/median/p75/p90 are stored, so the box is
+# p25-p75, the upper whisker p90, and the lower whisker is pinned to p25 (no lower tail).
+ggplot(SR_FIG) +
+  geom_boxplot(aes(y = source, xmin = p25, xlower = p25, xmiddle = med,
+                   xupper = p75, xmax = p90),
+               stat = "identity", orientation = "y",
+               width = 0.5, fill = "#2A6FE0", colour = "#12356b") +
+  scale_x_continuous(limits = c(0, NA), expand = expansion(c(0, 0.04))) +
+  labs(x = "Worst-case cost-matched regret", y = NULL)
 ```
 
-```{r}
-#| label: fig-unc-lulc
-#| fig-cap: "Land-use composition of the eligible footprint and of the selected cells of each frequency surface, by quartile of that surface's own selection frequency. ."
-#| fig-width: 9
-#| fig-height: 4.2
-
-# Same ecosystem-type colours as @fig-lulc-selected and the land-use maps of this
-# project (Documentation/produce_figures.R, Documentation/map_bern_landuse.R).
-UNC_LULC_PAL <- c(`Forest`                = "#1B7837",
-                  `Pastures & grasslands` = "#A6D96A",
-                  `Agricultural land`     = "#E9C46A",
-                  `Unclassified`          = "grey70")
-
-ggplot(UNC_LULC, aes(Set, pct, fill = Class)) +
-  geom_col(position = position_dodge(width = 0.8), width = 0.74) +
-  facet_wrap(~Archive, ncol=1) +
-  scale_fill_manual(values = UNC_LULC_PAL, name = "Ecosystem type") +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
-  labs(x = "Selection frequency quartile", y = "Share of cells (%)")
-```
-
-## Robustness to LULC scenarios
-
-Using the scenarios run for Bern Landscape Change Explorer and investigating the persistence of LULC class in areas selected for restoration. No plans 'survive' completely (i.e. all plans have at least one cell that changes class)
+Strict land-cover-class persistence gives a coarser reading of the same exposure. No plan 'survives' completely, in that every plan has at least one selected cell that changes class (@fig-unc-scenario).
 
 ```{r}
 #| label: setup-unc-scenario
@@ -541,7 +566,7 @@ SCEN_LOST <- SCEN |>
 
 ```{r}
 #| label: fig-unc-scenario
-#| fig-cap: "Share of an individual plan that is no longer eligible under land-use projections (3 climate x 5 economic x 3 demographic x 5 land-use = 225 combinations). Lines are the median across plans, bands the 10th-90th percentile across the robust plans."
+#| fig-cap: "Share of an individual plan that is no longer eligible under land-use projections (3 climate x 5 economic x 3 demographic x 5 land-use = 225 combinations). Lines show the median across plans, bands show the 10th-90th percentile across the robust plans."
 #| fig-width: 5.5
 #| fig-height: 3.8
 
@@ -560,4 +585,289 @@ ggplot(SCEN_LOST, aes(year, 100 * lost_p50, colour = landuse)) +
   theme(legend.text = element_text(size = 7), legend.title = element_text(size = 8),
         legend.key.width = unit(9, "mm"))
 ```
+
+### Decision uncertainty --- allocation rules
+
+```{r}
+#| label: setup-unc-alloc
+#| include: false
+
+# Section 3.7. Written by Core_optimisation/allocation_regret.py: for four distributive
+# rules and every pooled plan, the pixels the rule forces in and displaces, re-scored
+# under the 85 condition variants. Regret is the benefit shortfall against a MATCHED
+# free plan - same size, same displaced cells, refilled greedily but without the
+# municipal constraint - normalised by that variant's generic plan-pair benefit gap
+# (discriminability.csv:front_span). Robust subset per rule = bottom quartile of
+# worst-case regret.
+#
+# The plan's own free allocation is not a usable baseline. A region-grown plan is
+# compact and holds low-value cells kept for contiguity; any rule that scatters it both
+# trades those away and (with spillover, which credits un-restored neighbours) grows a
+# larger spillover ring, so the reallocated plan scores BETTER on either count. Benefit
+# is therefore taken on its direct term against the matched free plan; the `matched`
+# stage repeats it under the full model and `full_model_check` reports whether it holds.
+# Refresh:
+#   pixi run python -m Core_optimisation.allocation_regret all
+.alp <- .p("outputs/allocation_regret/report.json")
+if (!file.exists(.alp))
+  stop("outputs/allocation_regret/report.json not found - run:\n",
+       "  pixi run python -m Core_optimisation.allocation_regret all")
+ALG <- jsonlite::read_json(.alp, simplifyVector = TRUE)
+AL_PR    <- .g(ALG, "regret", "per_rule")
+AL_RULES <- .g(ALG, "regret", "rules")
+AL_LAB   <- c(equal = "Equal per municipality", area = "Proportional to area",
+              eligible = "Proportional to eligible land",
+              degradation = "Proportional to degradation")
+AL_CORE_JMIN <- .gn(ALG, "regret", "cross_rule", "pairwise_jaccard_min")
+AL_STABLE    <- AL_CORE_JMIN >= 0.6
+# rules ordered cheapest to costliest on median worst-case regret
+AL_ORD <- AL_RULES[order(vapply(AL_RULES, function(r) .gn(AL_PR[[r]], "dmax_median"), numeric(1)))]
+
+# The full-model, contiguity-matched check. NULL until the `matched` stage has run; the
+# sentence that quotes it is dropped rather than left half-written in that case.
+AL_CHK <- .g(ALG, "regret", "full_model_check")
+AL_CHK_PARA <- if (is.null(AL_CHK)) "" else paste0(
+  " Under the full effect model the rule ordering is ",
+  if (isTRUE(.g(AL_CHK, "rule_order_agrees"))) "reproduced" else "reordered",
+  " and the per-rule robust subsets are recovered to a Jaccard of ",
+  .f(min(unlist(.g(AL_CHK, "subset_jaccard"))), 2), "-",
+  .f(max(unlist(.g(AL_CHK, "subset_jaccard"))), 2), ".")
+
+# `Robust plans` is the bottom quartile and so identical for every rule; it is stated
+# in the caption instead of a constant column. The columns that vary are shown.
+ALLOC_TBL <- do.call(rbind, lapply(AL_ORD, function(r) data.frame(
+  Rule = unname(AL_LAB[r]),
+  `Worst-case regret (median)` = .f(.gn(AL_PR[[r]], "dmax_median"), 2),
+  `Variants it costs benefit (median of 85)` = .n(.gn(AL_PR[[r]], "worse_variant_count_median")),
+  `Spatial overlap with model-robust` = .f(.gn(AL_PR[[r]], "model_robust_overlap", "jaccard"), 2),
+  `Pixels reallocated (median)` = .n(.gn(AL_PR[[r]], "forced_pixels_median")),
+  check.names = FALSE, stringsAsFactors = FALSE)))
+```
+
+A free-allocation plan concentrates restoration in `r .n(.gn(ALG, "direct", "muni_used_free_median"))` of the canton's `r .n(.gn(ALG, "direct", "n_municipalities"))` municipalities, so a distributive rule rewrites most of every plan -- equal shares force in a median of `r .n(.gn(AL_PR, "equal", "forced_pixels_median"))` of `r .n(.gn(ALG, "muni", "budget_pixels"))` pixels. Measured against a size- and displacement-matched free plan (the plan's own allocation is not a usable baseline; see Methods), equal shares lose benefit under `r .n(.gn(AL_PR, "equal", "worse_variant_count_median"))` of the `r .n(.gn(ALG, "regret", "n_variants_live"))` non-saturated condition variants.
+
+@tbl-unc-alloc shows the robustness cost of each rule: from `r .f(.gn(AL_PR[[AL_ORD[1]]], "dmax_median"), 2)` for `r tolower(unname(AL_LAB[AL_ORD[1]]))` to `r .f(.gn(AL_PR[[AL_ORD[length(AL_ORD)]]], "dmax_median"), 2)` for `r tolower(unname(AL_LAB[AL_ORD[length(AL_ORD)]]))`, over three times as costly. The four rules `r if (AL_STABLE) "share a broadly stable" else "do not share a single"` decision-robust core: their robust subsets intersect in `r .n(.gn(ALG, "regret", "cross_rule", "n_core"))` plans, `r .pc(.gn(ALG, "regret", "cross_rule", "n_core") / .gn(AL_PR, "equal", "n_robust"))` of any one of them, with pairwise Jaccard at least `r .f(AL_CORE_JMIN, 2)`. `r if (AL_STABLE) "A single decision-robust set thus survives whichever rule is adopted." else "The choice of rule thus changes which plans are robust, not just the size of the regret."``r AL_CHK_PARA`
+
+```{r}
+#| label: tbl-unc-alloc
+#| tbl-cap: "Robustness cost of each municipal allocation rule over the full archive; each rule's robust subset is the bottom quartile. Worst-case regret is as defined in Methods (benefit shortfall against a size- and displacement-matched free plan)."
+
+kable(ALLOC_TBL, align = "lrrrr")
+```
+
+```{r}
+#| label: fig-unc-alloc
+#| fig-cap: "Worst-case regret of a plan under each municipal allocation rule, against a size- and displacement-matched free plan, over the full archive. Box and whiskers as in @fig-unc-scenregret. Rules ordered cheapest to costliest."
+#| fig-width: 5.5
+#| fig-height: 2.6
+
+ALLOC_FIG <- do.call(rbind, lapply(AL_ORD, function(r) data.frame(
+  rule = unname(AL_LAB[r]),
+  p25 = .gn(AL_PR[[r]], "dmax_p25"), med = .gn(AL_PR[[r]], "dmax_median"),
+  p75 = .gn(AL_PR[[r]], "dmax_p75"), p90 = .gn(AL_PR[[r]], "dmax_p90")))) |>
+  mutate(rule = factor(rule, levels = rev(rule)))
+
+# geom_boxplot(stat = "identity"): box p25-p75, upper whisker p90, lower whisker pinned
+# to p25 - only those four quantiles are stored per rule.
+ggplot(ALLOC_FIG) +
+  geom_boxplot(aes(y = rule, xmin = p25, xlower = p25, xmiddle = med,
+                   xupper = p75, xmax = p90),
+               stat = "identity", orientation = "y",
+               width = 0.5, fill = "#E05C2A", colour = "#8a2d0f") +
+  scale_x_continuous(limits = c(0, NA), expand = expansion(c(0, 0.04))) +
+  labs(x = "Worst-case regret vs a matched free plan", y = NULL)
+```
+
+### Cross-source synthesis
+
+```{r}
+#| label: setup-unc-synth
+#| include: false
+
+# Section 3.8. Written by Core_optimisation/robustness_synthesis.py from the three legs'
+# robust-subset id lists (model = plan_summary.csv:is_robust, scenario and decision from
+# their robust_plan_ids*.npy). Refresh, after the three legs:
+#   pixi run python -m Core_optimisation.robustness_synthesis
+.syp <- .p("outputs/robustness_synthesis/report.json")
+if (!file.exists(.syp))
+  stop("outputs/robustness_synthesis/report.json not found - run:\n",
+       "  pixi run python -m Core_optimisation.robustness_synthesis")
+SYN   <- jsonlite::read_json(.syp, simplifyVector = TRUE)$synthesis
+SY_PW <- .g(SYN, "pairwise")
+SY_T3 <- .g(SYN, "triples", "model|scenario|decision:core")
+
+.syrow <- function(key, label) data.frame(
+  Comparison = label,
+  Overlap    = .n(.gn(SY_PW[[key]], "intersection")),
+  Jaccard    = .f(.gn(SY_PW[[key]], "jaccard"), 2),
+  `vs chance` = paste0(.f(.gn(SY_PW[[key]], "ratio_vs_chance"), 1), "x"),
+  check.names = FALSE, stringsAsFactors = FALSE)
+SYN_TBL <- rbind(
+  .syrow("model|scenario",           "Model & scenario"),
+  .syrow("model|decision:core",      "Model & decision core"),
+  .syrow("scenario|decision:core",   "Scenario & decision core"))
+
+SY_TRANSFERS <- .g(SYN, "model_transfer_share")
+# The decision that matters is the transfer SHARE, not the enrichment ratio: at a 25%
+# base rate every overlap is a few-fold "more than chance" while still leaving most of
+# the set behind. Call the triple robust set relied-upon only if it keeps most of the
+# model-robust plans.
+SY_DEC_RANGE <- range(unlist(SY_TRANSFERS[grep("^decision:[^c]", names(SY_TRANSFERS))]))
+SY_RELIABLE  <- .gn(SY_T3, "share_of_a") >= 0.5
+
+# --- spatial character of the robust subsets (report.json `spatial` block) -------
+SY_SP  <- .g(SYN, "spatial")
+if (is.null(SY_SP$freq_calibration))
+  stop("report.json synthesis$spatial predates the geometry null and the deviation-map ",
+       "form of the frequency statistic. Re-run:\n",
+       "  pixi run python -m Core_optimisation.robustness_synthesis")
+if (is.null(.g(SY_SP, "geometry", "model", "n_patches", "p90")))
+  stop("report.json synthesis$spatial$geometry predates the p90 box-plot whisker used ",
+       "by @fig-unc-synth-geometry. Re-run:\n",
+       "  pixi run python -m Core_optimisation.robustness_synthesis")
+SY_LAB <- c(archive = "Whole archive", model = "Model-robust",
+            scenario = "Scenario-robust", `decision:core` = "Decision core",
+            triple = "All three sources")
+SY_ORD <- c("archive", "model", "scenario", "decision:core", "triple")
+
+# per-plan configuration, long over the two geometry metrics. The archive is the
+# reference, so it carries no null of its own; NA there drops its marker from the figure.
+.geo <- function(k, key, field) {
+  if (k == "archive" && field %in% c("null_median", "p_value")) return(NA_real_)
+  .gn(SY_SP, "geometry", k, key, field)
+}
+
+SY_GEO <- do.call(rbind, lapply(SY_ORD, function(k) rbind(
+  data.frame(subset = SY_LAB[[k]], metric = "Connected patches",
+             p25 = .geo(k, "n_patches", "p25"),
+             med = .geo(k, "n_patches", "median"),
+             p75 = .geo(k, "n_patches", "p75"),
+             p90 = .geo(k, "n_patches", "p90"),
+             null = .geo(k, "n_patches", "null_median"),
+             p    = .geo(k, "n_patches", "p_value")),
+  data.frame(subset = SY_LAB[[k]], metric = "Radius of gyration (km)",
+             p25 = .geo(k, "rg_km", "p25"),
+             med = .geo(k, "rg_km", "median"),
+             p75 = .geo(k, "rg_km", "p75"),
+             p90 = .geo(k, "rg_km", "p90"),
+             null = .geo(k, "rg_km", "null_median"),
+             p    = .geo(k, "rg_km", "p_value")))))
+SY_GEO$subset <- factor(SY_GEO$subset, levels = rev(unname(SY_LAB[SY_ORD])))
+
+# what the cross-source-robust plans over-select, as a ratio to the archive (1 = same)
+SY_CONC <- do.call(rbind, lapply(c("decision:core", "triple"), function(k) rbind(
+  data.frame(subset = SY_LAB[[k]], layer = "Restoration-benefit weight",
+             ratio = .gn(SY_SP, "concentration", k, "benefit_weight_vs_baseline")),
+  data.frame(subset = SY_LAB[[k]], layer = "Scenario survival",
+             ratio = .gn(SY_SP, "concentration", k, "scenario_survival_vs_baseline")))))
+SY_CONC$subset <- factor(SY_CONC$subset,
+                         levels = c("Decision core", "All three sources"))
+```
+
+Of the `r .n(.gn(SYN, "subset_sizes", "model"))` model-robust plans, `r .pc(SY_TRANSFERS[["scenario"]])` are also scenario-robust (@tbl-unc-synth). Robustness to the allocation rule barely travels with either: between `r .pc(SY_DEC_RANGE[1])` and `r .pc(SY_DEC_RANGE[2])` of model-robust plans stay robust under any one rule, and only `r .pc(SY_TRANSFERS[["decision:core"]])` under all four. Just `r .pc(.gn(SY_T3, "share_of_a"))` of the model-robust set -- `r .f(.gn(SY_T3, "ratio_vs_chance"), 1)`x the chance count -- is robust to all three sources at once. `r if (SY_RELIABLE) "A single robust set can therefore be relied on across the three sources." else "No single robust set can be relied on across the three sources: model- and scenario-robustness align, but decision-robustness is a separate property, and not even a stable one, since it moves with the allocation rule."`
+
+```{r}
+#| label: tbl-unc-synth
+#| tbl-cap: "Overlap of the three archive-wide robust subsets (each the bottom quartile of worst-case regret). The decision core is the intersection of the four allocation-rule robust subsets. 'vs chance' is the observed intersection over the size expected if the two subsets were drawn independently."
+
+kable(SYN_TBL, align = "lrrr")
+```
+
+```{r}
+#| label: fig-unc-transfer
+#| fig-cap: "Of the plans robust to model-formulation uncertainty, the fraction that are also robust to scenario uncertainty, to each municipal allocation rule, to all four rules at once, and to all three uncertainty sources together. The dashed line at 0.25 is the fraction any bottom-quartile subset would share by construction."
+#| fig-width: 6
+#| fig-height: 2.8
+
+.tr <- function(key) .gn(SYN, "model_transfer_share", key)
+TR_FIG <- rbind(
+  data.frame(what = "Scenario uncertainty", share = .tr("scenario"), grp = "one source"),
+  data.frame(what = unname(AL_LAB[AL_RULES]),
+             share = vapply(AL_RULES, function(r) .tr(paste0("decision:", r)), numeric(1)),
+             grp = "one allocation rule"),
+  data.frame(what = "All four allocation rules", share = .tr("decision:core"), grp = "combined"),
+  data.frame(what = "All three uncertainty sources", share = .gn(SY_T3, "share_of_a"),
+             grp = "combined")) |>
+  mutate(what = factor(what, levels = rev(what)),
+         grp  = factor(grp, levels = c("one source", "one allocation rule", "combined")))
+
+ggplot(TR_FIG, aes(share, what, fill = grp)) +
+  geom_col(width = 0.68) +
+  geom_vline(xintercept = 0.25, linetype = "22", colour = "grey40") +
+  scale_x_continuous(labels = function(z) paste0(100 * z, "%"),
+                     limits = c(0, NA), expand = expansion(c(0, 0.04))) +
+  labs(x = "Share of robust plans", y = NULL) +
+  theme(legend.position = "top", legend.text = element_text(size = 8))
+```
+
+### What characterises the cross-source-robust core
+
+On the whole-map statistic the all-three-robust plans look typical: their selection-frequency map correlates with the model-robust map at `r .f(.gn(SY_SP, "freq_agreement", "triple", "r"), 2)`, against a random same-size-subset null of `r .f(.gn(SY_SP, "freq_agreement", "triple", "null_median"), 2)`. That statistic has almost no room to move, though: every plan is region-grown on one landscape, so all these maps share a core, and even a subset displaced *by construction* -- the `r .n(.gn(SY_SP, "freq_calibration", "subset_size"))` most easterly-centroid plans -- correlates no less strongly (`r .f(.gn(SY_SP, "freq_calibration", "eastmost_centroid", "r"), 2)`, within the null). Subtracting the archive-wide frequency map from both sides removes the shared core, and on the resulting deviation maps the subsets are clearly displaced: `r .f(.gn(SY_SP, "freq_agreement", "triple", "deviation_r"), 2)` for the all-three-robust plans and `r .f(.gn(SY_SP, "freq_agreement", "decision:core", "deviation_r"), 2)` for the decision core, against a null near zero. This corrects the whole-map number rather than adding an independent test: `r .pc(.gn(SY_SP, "freq_agreement", "decision:core", "overlap_share"))` of the decision core is itself model-robust, and the all-three set lies inside the model-robust set by construction.
+
+Plan geometry does separate the subsets (@fig-unc-synth-geometry). Against a random same-size-subset null, the decision core is more compact than its size alone would give -- median `r .n(.gn(SY_SP, "geometry", "decision:core", "n_patches", "median"))` connected patches against `r .f(.gn(SY_SP, "geometry", "decision:core", "n_patches", "null_median"), 1)`, and `r .f(.gn(SY_SP, "geometry", "decision:core", "rg_km", "median"), 1)` km radius of gyration (dispersion) against `r .f(.gn(SY_SP, "geometry", "decision:core", "rg_km", "null_median"), 1)` km (`r .pmath(.gn(SY_SP, "geometry", "decision:core", "rg_km", "p_value"))` for both). The all-three-robust plans inherit the fewer-patches effect (`r .n(.gn(SY_SP, "geometry", "triple", "n_patches", "median"))` patches, `r .pmath(.gn(SY_SP, "geometry", "triple", "n_patches", "p_value"))`) but not the tighter-area one (`r .f(.gn(SY_SP, "geometry", "triple", "rg_km", "median"), 1)` km, `r .pmath(.gn(SY_SP, "geometry", "triple", "rg_km", "p_value"))`): they restore in fewer pieces, not in a smaller area. Patch count is bounded by the region-growing operators that built the archive, so this describes the plans the search produces, not restoration siting in general.
+
+Over the cells they over-select relative to the archive average, the robust subsets favour higher-value land -- `r .f(.gn(SY_SP, "concentration", "triple", "benefit_weight_vs_baseline"), 2)`x the archive-mean restoration-benefit weight (@fig-unc-synth-land) -- but not land more stable under the LULC/climate scenarios (`r .f(.gn(SY_SP, "concentration", "triple", "scenario_survival_vs_baseline"), 2)`x). Against eligible land the core is enriched `r .f(.gn(SY_SP, "land_cover", "enrichment_vs_eligible")[2], 2)`x in agricultural land and `r .f(.gn(SY_SP, "land_cover", "enrichment_vs_eligible")[1], 2)`x in forest (@tbl-unc-synth-landcover), but that tilt is not something robustness adds: the core's land-cover mix is a total-variation distance of only `r .f(.gn(SY_SP, "land_cover", "chisq_vs_matched", "tv_distance"), 3)` from the top `r .n(.gn(SY_SP, "land_cover", "n_triple_core"))` archive cells ranked by raw selection frequency alone (Cramer's V `r .f(.gn(SY_SP, "land_cover", "chisq_vs_matched", "cramers_v"), 3)`, negligible) -- it comes from selection frequency, not the cross-source filter.
+
+```{r}
+#| label: fig-unc-synth-geometry
+#| fig-cap: "Spatial configuration of each robust subset against the whole archive: connected patches per plan and radius of gyration (the spread of a plan's cells about their centroid, in km). Box spans the interquartile range with the median line; the upper whisker reaches the 90th percentile, and the lower whisker is pinned to the 25th (no lower tail drawn), as in @fig-unc-scenregret. Open point is the median of 2,000 random same-size archive subsets; a box whose median sits clear of the open point is structure the subset's size alone does not produce."
+#| fig-width: 6
+#| fig-height: 2.9
+
+# geom_boxplot(stat = "identity"): only p25/median/p75/p90 are stored, so the box is
+# p25-p75, the upper whisker p90, and the lower whisker is pinned to p25 (no lower tail).
+ggplot(SY_GEO, aes(y = subset)) +
+  geom_boxplot(aes(xmin = p25, xlower = p25, xmiddle = med, xupper = p75, xmax = p90),
+               stat = "identity", orientation = "y",
+               width = 0.5, fill = "#2A6FE0", colour = "#12356b") +
+  geom_point(aes(x = null), size = 2.1, shape = 21, stroke = 0.7,
+             colour = "grey35", fill = "white", na.rm = TRUE) +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_x_continuous(limits = c(0, NA), expand = expansion(c(0, 0.05))) +
+  labs(x = NULL, y = NULL)
+```
+
+```{r}
+#| label: fig-unc-synth-land
+#| fig-cap: "What the cross-source-robust plans over-select. Over the cells a subset restores more often than the archive average, the mean restoration-benefit weight and the mean scenario survival, each as a ratio to the archive baseline (dashed line at 1)."
+#| fig-width: 5
+#| fig-height: 2.1
+
+ggplot(SY_CONC, aes(ratio, layer, fill = subset)) +
+  geom_col(width = 0.6, position = position_dodge(width = 0.65)) +
+  geom_vline(xintercept = 1, linetype = "22", colour = "grey40") +
+  scale_x_continuous(limits = c(0, NA), expand = expansion(c(0, 0.05))) +
+  scale_fill_manual(values = c("Decision core" = "#E05C2A",
+                               "All three sources" = "#2A6FE0"), name = NULL) +
+  labs(x = "Ratio to archive baseline", y = NULL) +
+  theme(legend.position = "top", legend.text = element_text(size = 8))
+```
+
+```{r}
+#| label: tbl-unc-synth-landcover
+#| tbl-cap: "Land-cover composition of the cross-source-robust core (cells selected by at least half of the all-three-sources-robust plans, freq >= 50%) against the eligible footprint and against the top-N cells of the full archive ranked by raw selection frequency alone, N the cross-source-robust core size. Enrichment > 1 means the class is over-represented relative to its share of eligible land."
+
+LC <- SY_SP$land_cover
+if (is.null(LC))
+  stop("report.json synthesis$spatial has no land_cover block - it predates the ",
+       "triple-core land-cover test. Re-run:\n",
+       "  pixi run python -m Core_optimisation.robustness_synthesis")
+
+LC_HAS <- !is.null(LC$chisq_vs_matched)
+
+if (!LC_HAS) {
+  cat("No cell is selected by at least half of the cross-source-robust plans;",
+      "the core is empty at freq >=", sprintf("%.0f%%.", 100 * LC$core_freq))
+} else {
+  tibble::tibble(
+    Class                          = unlist(LC$classes),
+    `Eligible %`                   = .f(100 * unlist(LC$eligible_pct), 1),
+    `Cross-source-robust core %`   = .f(100 * unlist(LC$triple_core_pct), 1),
+    `Size-matched full %`          = .f(100 * unlist(LC$matched_full_pct), 1),
+    `Enrichment (core / eligible)` = .f(unlist(LC$enrichment_vs_eligible), 2)) |>
+    kable(align = "lrrrr")
+}
+```
+
+A cross-source-robust core exists and can be mapped; it differs from the archive in where and how it places restoration -- fewer, more compact patches, systematically displaced -- but not in what it restores.
 

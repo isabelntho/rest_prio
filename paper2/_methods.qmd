@@ -597,7 +597,18 @@ AXES$label <- unname(ifelse(is.na(AXIS_LABELS[AXES$axis]), AXES$axis,
                             AXIS_LABELS[AXES$axis]))
 ```
 
-### Set up
+### Common framework
+
+Every non-dominated plan from every run was pooled into a single archive of
+`r .n(.gn(RPT, "cross", "n_plans"))` unique plans. Each of the three uncertainty legs
+re-scores that entire archive under its own set of variants, using a standalone
+evaluator validated against the search engine itself.
+
+- **Robustness.** Under any one variant, a plan's regret is its cost-matched benefit shortfall against a reference plan, expressed as a fraction of the benefit range that variant can resolve. A plan's regret over a whole uncertainty source is its worst regret across that source's non-saturated variants, and the quarter of plans with the lowest worst-case regret form that source's robust subset - those that stay close to the best available plan whichever variant is chosen. The three sources differ only in what varies and what the reference is: the reference is the best plan the archive achieves under that variant for model and scenario uncertainty, and the same plan under free allocation for decision uncertainty.
+
+- A **discriminability screen** asks whether each variant's benefit objective can separate two real plans at all. For each variant it takes the *front span* - the benefit gap between the best and worst plan in the pooled archive, as a fraction of the best - and flags the variant as saturated when that span is at or below `DISCRIM_MIN_SPAN` = 0.10. The front span is reused as the regret normaliser in @sec-decision, and saturated variants are dropped from all worst-case statistics that follow.
+
+### Model uncertainty
 
 Three choices made when building the condition objective were searched, each replicated
 over `r N_SEEDS` seeds (@tbl-unc-design). The benchmark and leave-one-out axes are fully
@@ -605,8 +616,7 @@ crossed, so their interaction is identified as well as their main effects.
 
 The three searched axes each perturb a different step of the pipeline that turns the
 `r length(IND_LABELS)` raw indicators into the abiotic and biotic anomaly layers the
-benefit objective reads. A fourth choice, the form of the ecological objective applied to those layers, 
-is also implemented but not currently included in the results (see @sec-notes).
+benefit objective reads.
 
 ```{r}
 #| label: tbl-unc-design
@@ -633,7 +643,6 @@ condition) and then converted to an anomaly $(x - \mu_{\text{ref}})/\sigma_{\tex
 
 * Under `global` the reference mean and standard deviation are taken over every pixel of the ecosystem, so an anomaly measures departure from the current landscape average. 
 * Under `upper_qNN` the reference set is restricted to the best-conditioned pixels (25th, 50th, 75th quartile) so an anomaly measures the shortfall from the best attainable level. Raising the quantile therefore makes the restoration target more ambitious: it pushes the whole anomaly distribution downward and rescales the spread between pixels, which changes both which pixels look most degraded and how far apart the objective can hold two plans.
-* Under `zones` the reference mean and standard deviation are computed within each zone rather than over the ecosystem as a whole, where a zone is the intersection of a production region with one of three altitude bands. An anomaly then measures departure from what is typical at a regional level.
 
 *Indicators*: Which indicators enter the composite ecosystem condition index.
 
@@ -657,17 +666,6 @@ This gives `r AXES$n_levels[AXES$axis == "weighting"]` weightings at `r N_SEEDS`
 spanning nine departures from 0 to 0.50, referenced to equal weighting. Each is applied
 per ecosystem by keeping the indicators measured there and rescaling to sum to one.
 
-### Analysis 
-
-Every non-dominated plan from every run was pooled into a single archive of
-`r .n(.gn(RPT, "cross", "n_plans"))` unique plans and then re-scored under each of the
-`r N_VARIANTS` condition variants with a standalone evaluator, validated against the
-search engine itself to a maximum relative error of
-`r sprintf("%.1e", .gn(RPT, "layers", "benefit_vs_engine_max_rel_err"))` on benefit and
-`r sprintf("%.1e", .gn(RPT, "layers", "cost_vs_engine_max_rel_err"))` on cost. A plan's
-deviation under a variant is its cost-matched benefit regret against the best any plan
-achieved under that variant.
-
 The weighting axis is carried on a structurally different raster construction from the
 other two: a weighting scenario writes one all-indicator weighted composite to both the
 abiotic and the biotic layer, so the objective becomes `2*eff*w(C)` rather than
@@ -676,4 +674,26 @@ weight vector instead of a hardcoded 1:1. Because the improvement weight is nonl
 the equal-block weighting scenario and the default all-indicator scenario are therefore
 not the same scenario, and each axis is referenced to its own no-perturbation level.
 
-Robustness is defined over the pooled archive across all variants. Every plan is re-scored under all variants, and the cost-matched benefit regret is calculated as the deviation of each solution compared to the best solution under that variant. The 25% of plans with the lowest maximum regret form the robust subset - those that stay close to the best available plan whichever formulation is chosen.
+- The pooled archive is re-scored under all `r N_VARIANTS` condition variants by the standalone evaluator, which reproduces the search engine to a maximum relative error of `r sprintf("%.1e", .gn(RPT, "layers", "benefit_vs_engine_max_rel_err"))` on benefit and `r sprintf("%.1e", .gn(RPT, "layers", "cost_vs_engine_max_rel_err"))` on cost.
+
+### Scenario uncertainty analysis (LULC + climate)
+- **Uncertainty set:** the 225 Bern Landscape Change Explorer combinations (3 climate RCPs × 5 economic × 3 demographic × 5 land-use) at 3 horizons (2040, 2050, 2060) = 675 scenario-horizons. Rasters verified co-registered on the same 100 m EPSG:2056 lattice.
+- **Benefit under a scenario:** the direct term only — summed `global_all` condition anomaly over the plan's cells that still carry an eligible class under that scenario-horizon. Cost is the plan's native cost, treated as fixed.
+- **Spillover omitted deliberately:** the engine's spillover term (decay 0.2, radius 3) is a near-constant fraction of the direct term across plans, so it does not move plan ranks, the robust subset, or the discriminate-vs-saturate verdict. A full-spillover recomputation (a dilation per plan × scenario-horizon, ~10M operations) is a known more complete option not taken.
+- **Saturation pre-check:** minimum IQR of worst-case scenario regret (`SATURATION_EPS` = 0.02) required for the leg to be judged as discriminating between plans rather than eroding all plans by a scenario-wide constant. Passed — median worst-case regret 0.193, 90th percentile 0.537.
+- **Spatial-agreement null:** the scenario-robust subset's per-cell selection-frequency map is correlated against the model-robust map, read against a 200-draw random same-size-subset null (seed 20260909), since every plan is region-grown on one landscape and shares a core.
+
+### Decision uncertainty analysis (distributive allocation rules)
+- **Rules.** Four per-municipality target shares of a plan's n=K pixels: `equal area` (proportional to municipal polygon area), `eligible` (proportional to eligible/restorable pixels), `degradation` (proportional to restoration need, max(0, −mean condition anomaly)).
+- **Target construction.** Each municipality's target is proportional to its weight under the rule but capped at its eligible-pixel count, with targets whole numbers summing to exactly K. A common scaling factor multiplies the weights, and any municipality whose scaled value exceeds its cap is held at the cap; the factor is tuned by bisection (200 iterations) until these values sum to K, then rounded down, with the pixels still needed to reach K going to the municipalities with the largest fractional remainders. Recomputed per distinct plan size (~7 across the archive).
+- **Reallocation.** Under-served municipalities take their best unselected eligible cells; over-served ones give up their worst held cells, both ranked on the `global_all` condition layer (deterministic, no cost term, none of the operator-level stochastic ordering). The cells added across under-served municipalities exactly match those given up across over-served ones, so every plan keeps its original size. One deterministic realisation per plan-rule pair.
+- **Matched baseline.** Each rule plan is scored against a matched free plan: same kept cells, same number of cells added back, but taken from the best `global_all` cells anywhere in the eligible footprint rather than by municipal target. Neither plan may reuse a displaced cell, so both relocate the same number of cells. This isolates the effect of the municipal constraint: a region-grown plan carries low-value cells kept only for contiguity, so almost any rule that swaps them for better cells improves on the original plan; the free plan makes the same-sized swap without the constraint.
+- **Direct term as headline, full model as check.** `direct` (spillover off) carries the headline, because spillover credits un-restored neighbours and so rewards the dispersal a rule imposes. `matched` repeats the whole comparison under the full effect model as a bias check; since the matched plan is itself dispersed, the full model if anything flatters the baseline and overstates rule cost. Rule ordering and per-rule robust subsets are recovered (Jaccard 0.51-0.74).
+
+### Cross-source synthesis
+- All three legs produce archive-wide, regret-based, bottom-25% robust subsets on the same 14,591-plan archive. The decision-robust **core** is the intersection of the four per-rule subsets.
+- **Overlap statistics:** every pairwise and three-way combination reported as size, Jaccard, expected-by-chance count, ratio vs chance, and hypergeometric enrichment p. Transfer shares reported as the fraction of model-robust plans also clearing each other source. Cross-rule stability reported as the Jaccard of each rule's subset against the decision core.
+- **Spatial characterisation** of the robust subsets, each read against a null or the archive baseline:
+  - *Geometry* - per-plan patch count (4-connectivity) and dispersion (calculated as radius of gyration), summarised as p25/median/p75 for each subset, and each subset median tested against a 2,000-draw random same-size-subset null (two-sided). Patch count is bounded by the region-growing operators, so a geometry effect is conditional on the generator.
+  - *Frequency agreement* - each subset's per-cell selection-frequency map correlated with the model-robust map, against a 200-draw random same-size-subset null. Reported in two forms. The whole-map correlation is the published statistic; because every plan is region-grown on one landscape, it is compressed into a narrow band, which a calibration on subsets displaced by construction (extreme plan centroids) quantifies. The deviation form subtracts the archive-wide frequency map from both sides first, so the shared core drops out and the statistic reads displacement. The deviation form is a corrective on the whole-map one, not an independent test: the subsets overlap the model-robust set by 57-100%, and that overlap is reported with it.
+  - *Concentration* — over cells a subset restores more often than the archive average, the delta-weighted mean of two per-cell layers (restoration-benefit weight; scenario survival rate across the 675 scenario-horizons), expressed as a ratio to the archive baseline.

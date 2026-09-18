@@ -1,5 +1,5 @@
 ---
-title: Uncertanty in restoration prioritization
+title: Which priorities survive? Robust spatial planning for restoration under uncertainty
 authors:
   - name: Isabel Nicholson Thomas
     affiliation: ETH Zürich
@@ -30,11 +30,7 @@ bibliography: rest_moo_paper.bib
 {{< include _methods.qmd >}}
 
 # Results
-## Baseline results
 
-*to establish behaviour of optimiser*
-
-{{< include _results_baseline.qmd >}}
 
 ## Uncertainty analysis
 {{< include _results_uncertainty.qmd >}}
@@ -45,7 +41,16 @@ bibliography: rest_moo_paper.bib
 # Conclusions
 
 # Supplementary material
+
+## Baseline results
+
+*to establish behaviour of optimiser*
+
+{{< include _results_baseline.qmd >}}
+
 {{< include _methods_operator_detail.qmd >}}
+
+{{< include _supp_uncertainty.qmd >}}
 
 # References
 

@@ -1,0 +1,253 @@
+## Characteristics of the model-uncertainty robust core
+
+The condition-construction robustness leg keeps the archive plans whose cost-matched
+benefit is least sensitive to how ecosystem condition is defined (the "Robust subset"
+of the uncertainty results). This section describes what land that subset's
+high-consensus core occupies; it is the model-uncertainty counterpart of the
+cross-source-robust core characterised in the main text, and the two tables are read
+on one land-cover class scheme.
+
+```{r}
+#| label: unc-characteristics
+#| include: false
+
+# MAP_DF is built by fig-unc-maps above: one row per eligible cell (non-NaN in
+# freq_full.tif, i.e. the union of the per-variant eligible masks), with that cell's
+# selection frequency over the full archive and over the robust subset.
+if (!exists("MAP_DF"))
+  stop("MAP_DF not found - the fig-unc-maps chunk must run before this one.")
+
+# reclass_lulc() lives in the plotting library the baseline section sources. This
+# section is otherwise independent of that one, so it is pulled in only if absent.
+if (!exists("reclass_lulc")) source(.p("Documentation/_plot_functions.R"))
+
+# The panels below read the REFERENCE variant's layers
+UNC_REF     <- .g(CFG, "campaigns", "benchmark_x_construction", "reference")
+UNC_REF_TAG <- paste(UNC_REF$scaling, UNC_REF$construction, sep = "_")
+UNC_LAYERS  <- c(
+  `Abiotic anomaly`     = file.path("data/anomaly_scenarios",
+                                    paste0("abiotic_", UNC_REF_TAG, ".tif")),
+  `Biotic anomaly`      = file.path("data/anomaly_scenarios",
+                                    paste0("biotic_", UNC_REF_TAG, ".tif")),
+  `Implementation cost` = "data/implementation_cost_corrected.tif")
+UNC_LULC_RASTER <- "data/ecosystem_lulc_masked.tif"
+
+.miss <- c(UNC_LAYERS, UNC_LULC_RASTER)[!file.exists(.p(c(UNC_LAYERS, UNC_LULC_RASTER)))]
+if (length(.miss))
+  stop("Missing raster(s) for the characteristics figures: ",
+       paste(.miss, collapse = ", "))
+
+UNC_N_SAMPLE <- 1.5e5   # cap on cells carried into the density figure
+
+.freq_breaks <- function(f) {
+  s <- f[f > 0]
+  if (!length(s))
+    stop("No cell is ever selected on this frequency surface.")
+  brk <- unique(unname(stats::quantile(s, c(0, 0.25, 0.5, 0.75, 1), type = 1)))
+  if (length(brk) < 2L)
+    stop("Every selected cell has the same selection frequency; no quartiles exist.")
+  if (length(brk) < 5L)
+    warning("Selection-frequency ties collapse the quartile breaks: ",
+            length(brk) - 1L, " groups instead of 4.")
+  brk
+}
+.freq_class <- function(f, brk) {
+  out <- factor(rep(NA_character_, length(f)),
+                levels = paste0("Q", seq_len(length(brk) - 1L)))
+  sel <- f > 0
+  out[sel] <- paste0("Q", as.integer(cut(f[sel], breaks = brk, include.lowest = TRUE)))
+  out
+}
+
+UNC_FREQ  <- c(`Full archive` = "full", `Robust subset` = "robust")
+UNC_BRK   <- lapply(UNC_FREQ, function(col) .freq_breaks(MAP_DF[[col]]))
+UNC_CELLS <- bind_cols(
+  MAP_DF[, c("x", "y")],
+  as.data.frame(lapply(names(UNC_FREQ), function(nm)
+    .freq_class(MAP_DF[[UNC_FREQ[[nm]]]], UNC_BRK[[nm]])),
+    col.names = names(UNC_FREQ), check.names = FALSE))
+
+# Quartile colours are the baseline section's ramp, so "darker = selected more often"
+# means the same thing in @fig-distributions and here.
+UNC_SETS <- c("Eligible",
+              paste0("Q", seq_len(max(vapply(UNC_BRK, length, 0L)) - 1L)))
+UNC_PAL  <- c(Eligible = "grey55",
+              setNames(colorRampPalette(c("#FEB24C", "#FD8D3C", "#E31A1C",
+                                          "#800026"))(length(UNC_SETS) - 1L),
+                       UNC_SETS[-1]))
+
+# -- Layer values at every eligible cell -------------------------------------
+UNC_XY  <- as.matrix(UNC_CELLS[, c("x", "y")])
+UNC_LYR <- tibble::as_tibble(lapply(UNC_LAYERS, function(path)
+  terra::extract(terra::rast(.p(path)), UNC_XY)[, 1]))
+
+UNC_VALS <- local({
+  set.seed(1)
+  i <- if (nrow(UNC_CELLS) > UNC_N_SAMPLE)
+    sort(sample.int(nrow(UNC_CELLS), UNC_N_SAMPLE)) else seq_len(nrow(UNC_CELLS))
+  lyr <- UNC_LYR[i, ]
+  bind_rows(lapply(names(UNC_FREQ), function(nm) {
+    q <- UNC_CELLS[[nm]][i]
+    # The eligible footprint is the same in both rows of the figure; it is repeated
+    # per row so each surface is read against it without crossing panels.
+    bind_rows(mutate(lyr, Archive = nm, Set = "Eligible"),
+              mutate(lyr[!is.na(q), ], Archive = nm,
+                     Set = as.character(q[!is.na(q)])))
+  })) |>
+    tidyr::pivot_longer(all_of(names(UNC_LAYERS)),
+                        names_to = "Layer", values_to = "value") |>
+    filter(is.finite(value)) |>
+    mutate(Layer   = factor(Layer, levels = names(UNC_LAYERS)),
+           Archive = factor(Archive, levels = names(UNC_FREQ)),
+           Set     = factor(Set, levels = UNC_SETS))
+})
+
+# One LULC class per eligible cell, same raster and reclass as @fig-lulc-selected
+# of the baseline section. Extracted once and reused by UNC_LULC and the
+# enrichment block below; UNC_XY is row-aligned with MAP_DF.
+UNC_CELL_CLASS <- local({
+  cls <- reclass_lulc(terra::extract(terra::rast(.p(UNC_LULC_RASTER)), UNC_XY)[, 1])
+  factor(ifelse(is.na(cls), "Unclassified", as.character(cls)),
+         levels = c(levels(cls), "Unclassified"))
+})
+
+# Shares are counts, so they run on every eligible cell rather than on the sample.
+UNC_LULC <- local({
+  cls <- UNC_CELL_CLASS
+  bind_rows(lapply(names(UNC_FREQ), function(nm) {
+    q <- UNC_CELLS[[nm]]
+    bind_rows(tibble::tibble(Archive = nm, Set = "Eligible", Class = cls),
+              tibble::tibble(Archive = nm, Set = as.character(q[!is.na(q)]),
+                             Class = cls[!is.na(q)]))
+  })) |>
+    mutate(Archive = factor(Archive, levels = names(UNC_FREQ)),
+           Set     = factor(Set, levels = UNC_SETS)) |>
+    count(Archive, Set, Class, .drop = FALSE) |>
+    group_by(Archive, Set) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    # An empty "Unclassified" bar is noise; every other class stays even at 0.
+    filter(Class != "Unclassified" | any(n[Class == "Unclassified"] > 0))
+})
+
+# -- LULC composition of the core: vs eligible share, and vs the full archive at
+# -- matched size -----------------------------------------------------------
+# "Core" = selection frequency >= CFG$core_freq (0.5), the cut behind the
+# "Core cells" row of @tbl-unc-robust. Two questions: (a) does the robust core's
+# land-cover mix depart from eligible land, (b) does it depart from what the FULL
+# archive's own selection frequency already gives over the same number of cells.
+UNC_CORE <- CFG$core_freq
+stopifnot(all(c("full", "robust") %in% names(MAP_DF)))
+
+UNC_CLASSES <- levels(UNC_CELL_CLASS)
+UNC_N_RCORE <- sum(MAP_DF$robust >= UNC_CORE)                       # robust core size
+UNC_MATCHED <- rank(-MAP_DF$full, ties.method = "first") <= UNC_N_RCORE
+.unc_cnt <- function(keep) as.numeric(table(UNC_CELL_CLASS[keep])[UNC_CLASSES])
+.unc_pct <- function(keep) { c <- .unc_cnt(keep); 100 * c / sum(c) }
+
+UNC_ENRICH <- tibble::tibble(
+  Class           = UNC_CLASSES,
+  elig_pct        = .unc_pct(rep(TRUE, nrow(MAP_DF))),
+  full_core_pct   = .unc_pct(MAP_DF$full   >= UNC_CORE),
+  robust_core_pct = .unc_pct(MAP_DF$robust >= UNC_CORE),
+  matched_pct     = .unc_pct(UNC_MATCHED)) |>
+  mutate(enrich_robust = robust_core_pct / elig_pct) |>
+  filter(Class != "Unclassified" | elig_pct > 0)
+# Row accessor for the prose above @tbl-unc-lulc-enrichment.
+.enr <- function(cls, col) UNC_ENRICH[[col]][match(cls, UNC_ENRICH$Class)]
+
+# Largest class-share gap (percentage points) of the robust core against eligible
+# land and against the size-matched full-archive slice - the effect-size contrast
+# the prose draws, in place of a chi-square that is significant only on cell count.
+UNC_GAP_ELIG  <- max(abs(UNC_ENRICH$robust_core_pct - UNC_ENRICH$elig_pct))
+UNC_GAP_MATCH <- max(abs(UNC_ENRICH$robust_core_pct - UNC_ENRICH$matched_pct))
+
+# Cells that reach the core ONLY once the archive is filtered to robust plans,
+# and whether filtering lifts frequency differently by class: mean change within
+# the full core, per class (a class-independent lift keeps these close together).
+UNC_GAINED   <- MAP_DF$robust >= UNC_CORE & MAP_DF$full < UNC_CORE
+UNC_GAINED_N <- sum(UNC_GAINED)
+UNC_DELTA_IN_CORE <- tapply(MAP_DF$delta[MAP_DF$full >= UNC_CORE],
+                            UNC_CELL_CLASS[MAP_DF$full >= UNC_CORE], mean)
+UNC_DELTA_IN_CORE <- UNC_DELTA_IN_CORE[!is.na(UNC_DELTA_IN_CORE)]
+```
+
+```{r}
+#| label: fig-unc-characteristics
+#| fig-cap: "Distributions of the two condition layers and of cost over the eligible footprint and over the selected cells."
+#| fig-width: 8.4
+#| fig-height: 5.2
+
+# Each curve is scaled to its own peak rather than drawn as a probability density.
+# The panels are here to be compared by SHAPE, and a density integrates to 1 over x:
+# cost is normalised to 0-0.93 while the anomalies span roughly -2.5 to 5, so the same
+# mass makes the cost curves ~6x taller and the rows unreadable against each other.
+# The cost of the rescaling is that height no longer carries mass - a Q4 curve peaking
+# at 1 does not mean Q4 is as numerous as the eligible footprint - so the panels say
+# where a set sits on each layer, not how much of it there is.
+ggplot(UNC_VALS, aes(value, after_stat(scaled), colour = Set)) +
+  geom_density(data = ~ filter(.x, Set == "Eligible"), aes(fill = Set),
+               alpha = 0.35, linewidth = 0.3) +
+  geom_density(data = ~ filter(.x, Set != "Eligible"), fill = NA, linewidth = 0.6) +
+  # y is now common to every panel (0-1 by construction), so only x is freed.
+  facet_wrap(vars(Layer, Archive), scales = "free_x", ncol = 2) +
+  scale_fill_manual(values = UNC_PAL, guide = "none") +
+  scale_colour_manual(values = UNC_PAL, drop = FALSE, name = "Selection\nfrequency") +
+  labs(x = NULL, y = "Density (scaled to peak)")
+```
+
+```{r}
+#| label: fig-unc-lulc
+#| fig-cap: "Land-use composition of the eligible footprint and of the selected cells of each frequency surface, by quartile of that surface's own selection frequency."
+#| fig-width: 9
+#| fig-height: 4.2
+
+# Same ecosystem-type colours as @fig-lulc-selected and the land-use maps of this
+# project (Documentation/produce_figures.R, Documentation/map_bern_landuse.R).
+UNC_LULC_PAL <- c(`Forest`                = "#1B7837",
+                  `Pastures & grasslands` = "#A6D96A",
+                  `Agricultural land`     = "#E9C46A",
+                  `Unclassified`          = "grey70")
+
+ggplot(UNC_LULC, aes(Set, pct, fill = Class)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.74) +
+  facet_wrap(~Archive, ncol=1) +
+  scale_fill_manual(values = UNC_LULC_PAL, name = "Ecosystem type") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Selection frequency quartile", y = "Share of cells (%)")
+```
+
+Relative to its share of eligible land, the robust core is drawn disproportionately
+from agricultural land and, more mildly, forest, and away from pastures and
+grasslands. Agricultural land is `r .pc(.enr("Agricultural land", "elig_pct") / 100)`
+of the eligible footprint but `r .pc(.enr("Agricultural land", "robust_core_pct") / 100)`
+of the robust core (`r .f(.enr("Agricultural land", "enrich_robust"), 2)`x its
+eligible share); forest goes from `r .pc(.enr("Forest", "elig_pct") / 100)` to
+`r .pc(.enr("Forest", "robust_core_pct") / 100)` (`r .f(.enr("Forest", "enrich_robust"), 2)`x);
+pastures and grasslands fall from `r .pc(.enr("Pastures & grasslands", "elig_pct") / 100)`
+to `r .pc(.enr("Pastures & grasslands", "robust_core_pct") / 100)`
+(`r .f(.enr("Pastures & grasslands", "enrich_robust"), 2)`x): class shares depart
+eligible land by up to `r .f(UNC_GAP_ELIG, 1)` points.
+
+That tilt tracks raw selection frequency rather than the robustness filter. The robust
+core's land-cover mix matches the top `r .n(UNC_N_RCORE)` cells of the full archive
+ranked by raw selection frequency alone to within `r .f(UNC_GAP_MATCH, 1)` points, the
+`r .n(UNC_GAINED_N)` cells that enter the core only under filtering carry the same mix,
+and within the full core the mean rise in selection frequency under filtering is
+`r .f(min(UNC_DELTA_IN_CORE), 2)` to `r .f(max(UNC_DELTA_IN_CORE), 2)` across the three
+classes. The filter concentrates the land-cover classes that selection frequency
+already favours rather than shifting the plans onto different land.
+
+```{r}
+#| label: tbl-unc-lulc-enrichment
+#| tbl-cap: "Land-cover composition of the eligible footprint and of the core (cells selected by at least half the plans, freq >= 50%, the cut of @tbl-unc-robust), for the full archive and the robust subset. Size-matched full is the top N cells of the full archive by raw selection frequency, N the robust core size. Enrichment > 1 means the class is over-represented in the robust core relative to its share of eligible land."
+
+UNC_ENRICH |>
+  transmute(Class,
+            `Eligible %`          = .f(elig_pct, 1),
+            `Full-archive core %` = .f(full_core_pct, 1),
+            `Robust core %`       = .f(robust_core_pct, 1),
+            `Size-matched full %` = .f(matched_pct, 1),
+            `Enrichment (robust / eligible)` = .f(enrich_robust, 2)) |>
+  kable(align = "lrrrrr")
+```
