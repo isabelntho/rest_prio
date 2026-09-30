@@ -32,7 +32,7 @@ from Core_optimisation.exact_front import (
 
 def engine_delta(sel_pix, ic, params):
     """Per-cell (abiotic + biotic) improvement raster from restoration_effect."""
-    up = restoration_effect(sel_pix, np.zeros(int(ic["n_conversion_pixels"]), int), ic, dict(params))
+    up = restoration_effect(sel_pix, ic, dict(params))
     return ((up["abiotic_anomaly"] - ic["abiotic_anomaly"])
             + (up["biotic_anomaly"] - ic["biotic_anomaly"]))
 

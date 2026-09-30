@@ -73,8 +73,7 @@ def _rank_scores(a):
 
     Distribution-free on purpose. Min-max normalisation leaves a skewed layer with most
     entries nearly tied at one end, and z-scoring fixes the spread but makes the
-    effective selection pressure depend on the layer's skew - the same code gave a 48x
-    best/worst draw ratio on CH and 91x on Bern. With ranks the spacing depends only on
+    effective selection pressure depend on the layer's skew. With ranks the spacing depends only on
     ORDER, so downstream temperature/weight knobs mean the same thing in every region
     and condition scenario.
     """
@@ -176,15 +175,11 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
 
     # Rows for the two objectives that previously had none. Both are static proxies -
     # restoration_benefit's spillover and spatial_clustering's arrangement dependence
-    # cannot be expressed per pixel - but a proxy beats no row: with a single row,
-    # PatchRepair's direction blend normalises w * row to [0, 1] and returns the SAME
-    # vector for every reference direction. Only mapped to objectives when
+    # cannot be expressed per pixel. Only mapped to objectives when
     # scenario_params['direction_aware_scores'] is on (see _map_objectives_to_pixel_scores).
     scores["restoration_benefit"] = np.clip(0.5 * (wa + wb), 0.0, 1.0)
 
     # Contiguity potential: share of the 4 orthogonal neighbours that are eligible.
-    # Averaged over a patch downstream, this scores a patch by how embedded it is in
-    # eligible land, i.e. how much room it has to clump.
     nbr = np.zeros(elig.shape, dtype=np.float64)
     nbr[:, :-1] += elig[:, 1:]
     nbr[:, 1:] += elig[:, :-1]
@@ -194,7 +189,6 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
 
     if "landscape_context_1d" in initial_conditions:
         ctx = initial_conditions["landscape_context_1d"].astype(np.float64)
-        # Anomaly convention: HIGHER context anomaly = neighbours in better condition.
         # Favour good-condition surroundings -> higher ctx gets the higher repair score.
         ctx_min, ctx_max = np.nanmin(ctx), np.nanmax(ctx)
         span = ctx_max - ctx_min
@@ -226,8 +220,7 @@ def _map_objectives_to_pixel_scores(problem, initial_conditions, scenario_params
       score_obj_indices    : ...the objective's column index in the n_obj weight
                              vector.
     spatial_clustering (configuration-level) and restoration_benefit
-    (arrangement-dependent via spillover) have no exact per-pixel score, and were
-    originally omitted for that reason. That turned out to be actively harmful for the
+    (arrangement-dependent via spillover) have no exact per-pixel score. That turned out to be actively harmful for the
     common 3-objective set restoration_benefit / spatial_clustering / cost: it leaves
     exactly one score row, and PatchRepair normalises `w * row` to [0, 1], which is the
     SAME vector for every reference direction - direction-aware repair silently becomes
@@ -282,84 +275,16 @@ def initialize_patch_approach(initial_conditions, patch_size=100):
 
 # --- Restoration Effect Functions ---
 
-def conversion_mask(convert_vars, initial_conditions):
+def restoration_effect(restore_vars, initial_conditions, effect_params=None):
     """
-    Landscape anomaly for a set of conversion decisions.
+    Define what happens when restoration is selected.
+    This function calculates the effect of restoration actions on neighboring cells.
 
-    Full recalculation via compute_sn_dens (no approximation).
-    """
-    if not np.any(convert_vars):
-        return initial_conditions['landscape_anomaly']
-    
-    # Get conversion locations from conversion eligible indices
-    conversion_eligible_indices = initial_conditions['conversion_eligible_indices']
-    converted_indices = conversion_eligible_indices[convert_vars == 1]
-    shape = initial_conditions['shape']
-    
-    if len(converted_indices) == 0:
-        return initial_conditions['landscape_anomaly']
-    
-    # Create 2D conversion mask from 1D conversion decisions
-    conversion_mask_2d = np.zeros(shape, dtype=bool)
-    rows, cols = np.divmod(converted_indices, shape[1])
-    conversion_mask_2d[rows, cols] = True
-    
-    # Use full recalculation with compute_sn_dens for accuracy
-    updated_landscape = recalculate_landscape_anomaly_with_conversions(
-        initial_conditions, conversion_mask_2d
-    )
-    
-    return updated_landscape
-
-def recalculate_landscape_anomaly_with_conversions(initial_conditions, conversion_mask_2d):
-    """
-    Efficiently recalculate landscape anomaly after applying conversion actions.
-    Converts pixels to focal classes and recalculates landscape density.
-
-    Args:
-        initial_conditions: Dict with LULC data and focal classes
-        conversion_mask_2d: 2D boolean mask of pixels to convert
-
-    Returns:
-        numpy.ndarray: Updated landscape anomaly values
-    """
-    # Get original landscape LULC data and conversion info
-    lulc_data = initial_conditions["landscape_lulc_data"].copy()
-    focal_classes = initial_conditions["landscape_focal_classes"]
-    lulc_meta = initial_conditions["landscape_lulc_meta"]
-
-    # Apply conversions: convert pixels to a focal class (use first focal class)
-    target_lulc_value = focal_classes[0]
-    lulc_data[conversion_mask_2d] = target_lulc_value
-
-    # Recalculate landscape density using the in memory array
-    landscape_density = compute_sn_dens_array(
-        lulc_data,
-        nodata=lulc_meta.get("nodata"),
-        res=lulc_meta["transform"][0],
-        focal_classes=focal_classes,
-        radius_m=300
-    )
-
-    # Convert density to anomaly (higher density = lower anomaly)
-    landscape_anomaly = 1.0 - landscape_density
-
-    # Handle NaN values
-    landscape_anomaly = np.nan_to_num(landscape_anomaly, nan=0.0)
-
-    return landscape_anomaly
-
-def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_params=None):
-    """
-    Define what happens when restoration or conversion is selected.
-    This function calculates the effect of different actions on neighboring cells.
-    
     Args:
         restore_vars: Binary array (0/1) for restoration decisions
-        convert_vars: Binary array (0/1) for conversion decisions  
         initial_conditions: Dict with initial objective values
         effect_params: Parameters controlling restoration effects (dict)
-        
+
     Returns:
         dict: Updated objective values after restoration effects
     """
@@ -367,36 +292,23 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
 
     # Ensure neighbor_radius is integer for array indexing
     effect_params['neighbor_radius'] = int(round(effect_params['neighbor_radius']))
-    
+
     shape = initial_conditions['shape']
-    # Get separate eligible masks and indices for restoration and conversion
     restoration_eligible_mask = initial_conditions['restoration_eligible_mask']
-    conversion_eligible_mask = initial_conditions['conversion_eligible_mask']
     restoration_eligible_indices = initial_conditions['restoration_eligible_indices']
-    conversion_eligible_indices = initial_conditions['conversion_eligible_indices']
-    
-    # For backward compatibility
-    eligible_mask = initial_conditions['eligible_mask']
-    
-    # Create 2D masks from 1D decision variables
+
+    # Create 2D mask from 1D decision variable
     restoration_mask_2d = np.zeros(shape, dtype=bool)
-    conversion_mask_2d = np.zeros(shape, dtype=bool)
-    
+
     if np.any(restore_vars):
         # Convert restoration eligible indices with restoration decisions back to 2D coordinates
         restored_indices = restoration_eligible_indices[restore_vars == 1]
         rows, cols = np.divmod(restored_indices, shape[1])
         restoration_mask_2d[rows, cols] = True
-    
-    if np.any(convert_vars):
-        # Convert conversion eligible indices with conversion decisions back to 2D coordinates
-        converted_indices = conversion_eligible_indices[convert_vars == 1]
-        rows, cols = np.divmod(converted_indices, shape[1])
-        conversion_mask_2d[rows, cols] = True
-    
+
     # Initialize updated conditions
     updated_conditions = {}
-    
+
     # Process only objectives that are available in initial_conditions AND are
     # actual optimisation objectives. Keys loaded purely as data dependencies for
     # computed objectives  are listed in _dependency_keys.
@@ -406,7 +318,7 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     # data-only dependencies.
     _benefit_deps = ({'abiotic_anomaly', 'biotic_anomaly'}
                      if initial_conditions.get('restoration_benefit_enabled', False) else set())
-    available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']
+    available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly']
                                    if obj in initial_conditions and (obj not in _dep_only or obj in _benefit_deps)]
     
     # abiotic_anomaly and biotic_anomaly share the same action_mask
@@ -421,28 +333,9 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
         original_values = initial_conditions[objective].copy()
         updated_values = original_values.copy()
         
-        # Determine which action type affects this objective
-        if objective in ['abiotic_anomaly', 'biotic_anomaly']:
-            # Restoration affects abiotic and biotic anomalies
-            action_mask = restoration_mask_2d
-            improvement_key = f'{objective.split("_")[0]}_effect'
-        elif objective == 'landscape_anomaly':
-            # Conversion affects landscape anomaly
-            if np.any(conversion_mask_2d):
-                # Full landscape recalculation over the converted pixels.
-                updated_landscape = conversion_mask(
-                    convert_vars, initial_conditions
-                )
-                updated_conditions[objective] = updated_landscape
-                continue
-            else:
-                # No conversions - use original landscape anomaly
-                updated_conditions[objective] = original_values
-                continue
-        else:
-            # Skip unknown objectives
-            updated_conditions[objective] = updated_values
-            continue
+        # Restoration affects abiotic and biotic anomalies
+        action_mask = restoration_mask_2d
+        improvement_key = f'{objective.split("_")[0]}_effect'
         
         if np.any(action_mask):
             # Direct effect on action cells
@@ -505,18 +398,10 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
                         original_values[neighbor_mask] + weighted_neighbor_improvements
                     )
         
-        # Only apply changes to appropriate eligible pixels based on objective type
+        # Only apply changes to restoration-eligible pixels.
         # This prevents affecting NaN->0 pixels outside the study area
-        if objective in ['abiotic_anomaly', 'biotic_anomaly']:
-            # Use restoration eligible mask for restoration-affected objectives
-            updated_values = np.where(restoration_eligible_mask, updated_values, original_values)
-        elif objective == 'landscape_anomaly':
-            # Use conversion eligible mask for conversion-affected objectives
-            updated_values = np.where(conversion_eligible_mask, updated_values, original_values)
-        else:
-            # Use general eligible mask for other objectives
-            updated_values = np.where(eligible_mask, updated_values, original_values)
-        
+        updated_values = np.where(restoration_eligible_mask, updated_values, original_values)
+
         # Safety check: ensure no NaN or inf values
         if np.any(np.isnan(updated_values)) or np.any(np.isinf(updated_values)):
             print(f"WARNING: {objective} contains NaN or inf values after restoration effect!")
@@ -530,9 +415,6 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
         total_cost = 0
         if np.any(restoration_mask_2d):
             total_cost += np.sum(base_cost[restoration_mask_2d])
-        if np.any(conversion_mask_2d):
-            # Could have different cost structure for conversion in future
-            total_cost += np.sum(base_cost[conversion_mask_2d])
         updated_conditions['implementation_cost'] = total_cost
     
     return updated_conditions
@@ -606,8 +488,6 @@ class RestorationProblem(ElementwiseProblem):
         _candidates = [
             ('abiotic_anomaly',       'abiotic_anomaly'),
             ('biotic_anomaly',        'biotic_anomaly'),
-            ('landscape_anomaly',     'landscape_anomaly'),
-            ('connectivity_gain',     'connectivity_gain_1d'),
             ('landscape_context',     'landscape_context_1d'),
             ('restoration_potential', 'restoration_potential_1d'),
             ('restoration_benefit',   'restoration_benefit_enabled'),
@@ -721,12 +601,6 @@ class RestorationProblem(ElementwiseProblem):
                     scale = float(np.nansum(np.abs(base[rest_mask])))
                 else:
                     scale = float(np.nansum(np.abs(base)))
-            elif obj_name == 'landscape_anomaly':
-                l0 = self.initial_conditions['landscape_anomaly']
-                scale = float(np.nansum(np.abs(l0)))
-            elif obj_name == 'connectivity_gain':
-                cg = self.initial_conditions['connectivity_gain_1d']
-                scale = float(np.nansum(np.abs(cg)))
             elif obj_name == 'landscape_context':
                 ctx = self.initial_conditions['landscape_context_1d']
                 # Scale = sum of absolute values over all restoration-eligible pixels
@@ -943,18 +817,8 @@ class RestorationProblem(ElementwiseProblem):
     def evaluate_raw_objectives(self, x):
         """Return raw (non-normalized) objective values for a decision vector."""
         x_restore = x[:self.n_restoration_pixels]
-        x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
 
-        # Conversion objectives only valid when a landscape/connectivity objective is present.
-        has_conversion_objective = (
-            'landscape_anomaly' in self.initial_conditions
-            or 'connectivity_gain_1d' in self.initial_conditions
-        )
-        if not has_conversion_objective:
-            x_convert = x_convert.copy()
-            x_convert[:] = 0
-
-        updated_conditions = restoration_effect(x_restore, x_convert, self.initial_conditions, self.effect_params)
+        updated_conditions = restoration_effect(x_restore, self.initial_conditions, self.effect_params)
 
         raw_objectives = []
         for obj_name in self.objective_names:
@@ -962,16 +826,6 @@ class RestorationProblem(ElementwiseProblem):
                 base = self.initial_conditions[obj_name]
                 mask = self.initial_conditions["restoration_eligible_mask"]
                 obj_value = -np.sum((updated_conditions[obj_name] - base)[mask])
-            elif obj_name == 'landscape_anomaly':
-                l0 = self.initial_conditions["landscape_anomaly"]
-                l1 = updated_conditions["landscape_anomaly"]
-                eps = 1e-12
-                obj_value = np.sum(l1 - l0) / (np.sum(l0) + eps)
-            elif obj_name == 'connectivity_gain':
-                # Precomputed per-pixel gain; sum over converted pixels.
-                # Negated: minimisation problem -> maximise gain <-> minimise negative gain.
-                cg = self.initial_conditions['connectivity_gain_1d']
-                obj_value = -float(np.sum(cg[x_convert == 1]))
             elif obj_name == 'landscape_context':
                 # Precomputed per-pixel focal-mean neighbour anomaly; sum over restored pixels.
                 # Anomaly convention (see restoration_effect / anomaly_improvement_weight):
@@ -1114,25 +968,18 @@ class RestorationProblem(ElementwiseProblem):
     def _evaluate(self, x, out, *args, **kwargs):
         """
         Evaluate a restoration plan. x is [restoration decisions over the
-        n_restoration_pixels eligible pixels | conversion decisions over the
-        n_conversion_pixels ones], already repaired by sampling/repair.
+        n_restoration_pixels eligible pixels | unused trailing slots], already
+        repaired by sampling/repair.
         """
         x_restore = x[:self.n_restoration_pixels]
         x_convert = x[self.n_restoration_pixels:self.n_restoration_pixels + self.n_conversion_pixels]
 
-        # Enable conversion actions when a landscape or connectivity objective is present
-        has_conversion_objective = (
-            'landscape_anomaly' in self.initial_conditions
-            or 'connectivity_gain_1d' in self.initial_conditions
-        )
-        if not has_conversion_objective:
-            x_convert[:] = 0
-        
-        # Use both restoration and conversion decisions
-        n_restored = np.sum(x_restore)
-        n_converted = np.sum(x_convert)
-        n_total_actions = n_restored + n_converted
-        
+        # Conversion is unsupported: always hold these decisions at zero so they
+        # consume no budget.
+        x_convert[:] = 0
+
+        n_total_actions = np.sum(x_restore)
+
         # x here is always a pixel vector (PatchRestorationProblem._evaluate converts
         # patches to pixels before calling super()._evaluate). Must call the
         # unbound RestorationProblem method explicitly: self.evaluate_raw_objectives
@@ -1242,13 +1089,11 @@ class PatchRestorationProblem(RestorationProblem):
         # initial_conditions/scenario_params, not from anything the base class computes.
         self.patch_constraint_type = patch_constraint_type
         self.pixel_tolerance = pixel_tolerance
-        # With no conversion objective (same test as RestorationProblem's), conversion patches
-        # change no objective, so they must not count toward the budget either. The operators
-        # (PatchAwareSampling / PatchRepair) never select them in that case; this makes the
-        # constraint agree even for a plan that did arrive with conversion bits set.
-        self._exclude_conversion = not (
-            'landscape_anomaly' in initial_conditions
-            or 'connectivity_gain_1d' in initial_conditions)
+        # Conversion is unsupported: conversion patches change no objective, so they
+        # must not count toward the budget either. The operators (PatchAwareSampling /
+        # PatchRepair) never select them; this makes the constraint agree even for a
+        # plan that did arrive with conversion bits set.
+        self._exclude_conversion = True
 
         # Per-pixel cost arrays for the 'cost_budget' constraint, cached once here so
         # _evaluate does not re-mask the full raster every call. Indexed the same way
@@ -2471,27 +2316,22 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     Only the non-obvious arguments are documented here; scenario_params keys are
     documented at their point of use (see RestorationProblem.__init__).
 
-    extra_seed_X: optional (n_seed, n_var) int array of externally supplied genotypes, already
-        in this problem's own decision space (patch-level under use_patch_approach, pixel-level
-        otherwise), injected into the initial population via WarmStartSampling. Independent of
+    extra_seed_X: optional (n_seed, n_var) int array of externally supplied genotypes injected into the initial population via WarmStartSampling. Independent of
         `warm_seeding` (that flag controls a different, automatic per-objective seeding
-        mechanism) and works in either mode. None (default) changes nothing.
+        mechanism). None (default) changes nothing.
 
     algorithm_type: "nsga3" (default, best for >=3 objectives) sizes the population
         from n_partitions and IGNORES pop_size; "nsga2" (2-objective fronts) uses
         pop_size directly. n_partitions=8 -> 45 Das-Dennis ref dirs -> pop 45.
     patch_constraint_type: 'pixel_count' (recommended) or 'patch_count'.
-    snapshot_generations: with save_snapshots=True, an iterable of generation numbers
-        (1-indexed, matching pymoo's algorithm.n_gen) to snapshot X for instead of every
-        generation - e.g. {1, 10, 25, 50, 100} keeps the X_history small.
     mutation_prob_var / mutation_flip_count: per-variable bitflip probability, or the
         expected flip COUNT (converted to a probability; takes precedence). None keeps
         the historical 200 / n_var.
     capture_repair_diag / n_capture_gens: pixel mode + AdaptiveRepair only. Dumps paired
         pre/post-repair genotypes and raw objectives at n_capture_gens evenly-spaced
-        generations to <output_dir>/repair_diagnostics/, for comparing genotype (pairwise
-        Hamming) and phenotype diversity across repair. Analyse with
-        Debugs_tests/repair_diversity_report.py.
+        generations to <output_dir>/repair_diagnostics/, for comparing genotype and phenotype diversity across repair. 
+    snapshot_generations: with save_snapshots=True, an iterable of generation numbers
+        to snapshot X for.
     """
     # --- 1. Initialize patch approach if not already done ---
     if use_patch_approach and not initial_conditions.get('patch_approach_enabled', False):
@@ -2532,7 +2372,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         print(f"  Number of objectives: {len(problem.objective_names)} ({', '.join(problem.objective_names)})")
         sample_obj_str = "  Baseline objectives (no restoration): "
         for obj_name in problem.objective_names:
-            if obj_name in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']:
+            if obj_name in ['abiotic_anomaly', 'biotic_anomaly']:
                 val = np.sum(initial_conditions[obj_name])
                 sample_obj_str += f"{obj_name}={val:.2e}, "
         print(sample_obj_str.rstrip(", "))
