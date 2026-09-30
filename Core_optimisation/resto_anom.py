@@ -20,12 +20,13 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from .spatial_operations import AdaptiveSampling, AdaptiveRepair, compute_sn_dens_array, InstrumentedBitflipMutation, build_region_assignments_cache, RegionGrowingSampling, RegionGrowingMutation, SpatialCoverageSampling, RegionEvolveMutation, RegionSwapCrossover, MinPatchSizeRepair, WarmStartSampling, grow_region_plan, build_restoration_neighbor_table
 from .data_loader import load_initial_conditions
 from .results_saving import save_results_with_reports
-from .paths import OUTPUT_DIR
+from .paths import OUTPUTS
 from .patch_approach import (
     create_patch_mappings,
     PatchRepair,
     PatchAwareSampling,
     aggregate_patch_scores_from_pixel_scores,
+    aggregate_patch_pixel_sums,
     assign_patches_to_regions,
 )
 from .scenarios import sample_scenario_parameters
@@ -67,6 +68,26 @@ def anomaly_improvement_weight(anomaly_values, shape='exponential', scale=1.0):
     
     return weights
 
+def _rank_scores(a):
+    """Map values to evenly-spaced ranks in [0, 1]; all-constant input returns zeros.
+
+    Distribution-free on purpose. Min-max normalisation leaves a skewed layer with most
+    entries nearly tied at one end, and z-scoring fixes the spread but makes the
+    effective selection pressure depend on the layer's skew - the same code gave a 48x
+    best/worst draw ratio on CH and 91x on Bern. With ranks the spacing depends only on
+    ORDER, so downstream temperature/weight knobs mean the same thing in every region
+    and condition scenario.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    n = a.size
+    if n < 2:
+        return np.zeros(n, dtype=np.float64)
+    order = np.argsort(a, kind="stable")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(n, dtype=np.float64)
+    return ranks / (n - 1)
+
+
 def build_repair_scores(initial_conditions, scenario_params):
     """
     Build a per eligible pixel score used only for deterministic exact count repair.
@@ -94,8 +115,17 @@ def build_repair_scores(initial_conditions, scenario_params):
 
     if "implementation_cost" in initial_conditions:
         c = initial_conditions["implementation_cost"][elig].astype(np.float64)
-        c = c / (np.nanmean(c) + 1e-12)
-        scores = scores - 1e-6 * c
+        # The historical branch leaves cost negligible: measured on CH the cost term has
+        # sd 6.5e-7 against the anomaly terms' 3.2e-3, i.e. 0.02%, so it is a tie-breaker
+        # only and this "quality" ranking is effectively pure anomaly. repair_cost_weight
+        # > 0 instead blends the two as RANKS, both in [0, 1], so the weight means the
+        # same thing whatever the two layers' distributions look like and the result sits
+        # in [-w, 1]. Default 0.0 keeps existing runs bit-identical.
+        cost_weight = float(scenario_params.get("repair_cost_weight", 0.0))
+        if cost_weight > 0.0:
+            scores = _rank_scores(scores) - cost_weight * _rank_scores(c)
+        else:
+            scores = scores - 1e-6 * (c / (np.nanmean(c) + 1e-12))
 
     return np.asarray(scores, dtype=np.float64)
 
@@ -103,8 +133,9 @@ def build_repair_scores(initial_conditions, scenario_params):
 def build_per_objective_repair_scores(initial_conditions, scenario_params):
     """Per-objective pixel scores for direction-aware patch repair.
 
-    Returns a dict with keys 'abiotic', 'biotic', 'cost', and optionally
-    'landscape_context'.  Each value is a 1-D float64 array over eligible
+    Returns a dict with keys 'abiotic', 'biotic', 'cost', 'restoration_benefit',
+    'spatial_clustering', and optionally 'landscape_context' and
+    'restoration_potential'.  Each value is a 1-D float64 array over eligible
     pixels, normalized to [0, 1].  Higher score always means "prefer this
     pixel for the corresponding objective"
     """
@@ -143,6 +174,24 @@ def build_per_objective_repair_scores(initial_conditions, scenario_params):
         "cost": cost_score,
     }
 
+    # Rows for the two objectives that previously had none. Both are static proxies -
+    # restoration_benefit's spillover and spatial_clustering's arrangement dependence
+    # cannot be expressed per pixel - but a proxy beats no row: with a single row,
+    # PatchRepair's direction blend normalises w * row to [0, 1] and returns the SAME
+    # vector for every reference direction. Only mapped to objectives when
+    # scenario_params['direction_aware_scores'] is on (see _map_objectives_to_pixel_scores).
+    scores["restoration_benefit"] = np.clip(0.5 * (wa + wb), 0.0, 1.0)
+
+    # Contiguity potential: share of the 4 orthogonal neighbours that are eligible.
+    # Averaged over a patch downstream, this scores a patch by how embedded it is in
+    # eligible land, i.e. how much room it has to clump.
+    nbr = np.zeros(elig.shape, dtype=np.float64)
+    nbr[:, :-1] += elig[:, 1:]
+    nbr[:, 1:] += elig[:, :-1]
+    nbr[:-1, :] += elig[1:, :]
+    nbr[1:, :] += elig[:-1, :]
+    scores["spatial_clustering"] = nbr[elig] / 4.0
+
     if "landscape_context_1d" in initial_conditions:
         ctx = initial_conditions["landscape_context_1d"].astype(np.float64)
         # Anomaly convention: HIGHER context anomaly = neighbours in better condition.
@@ -176,11 +225,16 @@ def _map_objectives_to_pixel_scores(problem, initial_conditions, scenario_params
                              score, row-aligned with...
       score_obj_indices    : ...the objective's column index in the n_obj weight
                              vector.
-    Objectives WITHOUT a meaningful per-pixel score (spatial_clustering, which is
-    configuration-level, and restoration_benefit, which is arrangement-dependent
-    via spillover) are intentionally omitted here - they get no static warm-seed
-    and are excluded from direction-aware repair blending. Callers that want to
-    seed those objectives handle them separately (e.g. single-objective pre-opt).
+    spatial_clustering (configuration-level) and restoration_benefit
+    (arrangement-dependent via spillover) have no exact per-pixel score, and were
+    originally omitted for that reason. That turned out to be actively harmful for the
+    common 3-objective set restoration_benefit / spatial_clustering / cost: it leaves
+    exactly one score row, and PatchRepair normalises `w * row` to [0, 1], which is the
+    SAME vector for every reference direction - direction-aware repair silently becomes
+    an identity, and every individual is repaired toward one ranking. Setting
+    scenario_params['direction_aware_scores'] maps both to the static proxies built in
+    build_per_objective_repair_scores instead. Default off: it changes which extremes
+    PatchAwareSampling seeds, so existing runs stay reproducible.
     """
     per_obj_pixel_scores = build_per_objective_repair_scores(initial_conditions, scenario_params)
     obj_to_score_key = {
@@ -190,6 +244,9 @@ def _map_objectives_to_pixel_scores(problem, initial_conditions, scenario_params
         'landscape_context':     'landscape_context',
         'restoration_potential': 'restoration_potential',
     }
+    if scenario_params.get('direction_aware_scores', False):
+        obj_to_score_key['restoration_benefit'] = 'restoration_benefit'
+        obj_to_score_key['spatial_clustering'] = 'spatial_clustering'
     # Walk objective_names once so score_keys (which scores) and score_obj_indices
     # (their column in the n_obj weight vector) stay row-aligned.
     score_keys = []
@@ -352,6 +409,14 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
     available_anomaly_objectives = [obj for obj in ['abiotic_anomaly', 'biotic_anomaly', 'landscape_anomaly']
                                    if obj in initial_conditions and (obj not in _dep_only or obj in _benefit_deps)]
     
+    # abiotic_anomaly and biotic_anomaly share the same action_mask
+    # (restoration_mask_2d) and the same radius/kernel, so the neighbor
+    # dilation geometry is identical across both objectives - cache it here
+    # rather than recomputing ndimage.binary_dilation twice per evaluation.
+    # Must stay a call-local variable: every evaluation has a different
+    # restoration_mask_2d, so this must never persist across calls.
+    _restoration_neighbor_mask = None
+
     for objective in available_anomaly_objectives:
         original_values = initial_conditions[objective].copy()
         updated_values = original_values.copy()
@@ -397,15 +462,30 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
 
             # Neighbor effects
             if effect_params['neighbor_radius'] > 0:
-                # Create kernel for neighbor effects
-                radius = effect_params['neighbor_radius']
-                y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
-                kernel = (x*x + y*y) <= radius*radius
-                
-                # Apply dilation to find neighbor cells
-                neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
-                neighbor_mask = neighbor_mask & ~action_mask  # Exclude direct action cells
-                
+                is_restoration_mask = action_mask is restoration_mask_2d
+                if is_restoration_mask and _restoration_neighbor_mask is not None:
+                    neighbor_mask = _restoration_neighbor_mask
+                else:
+                    # Create kernel for neighbor effects
+                    radius = effect_params['neighbor_radius']
+                    y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+                    kernel = (x*x + y*y) <= radius*radius
+
+                    if effect_params.get('spillover_to_restored', False):
+                        # Restored cells ALSO gain from other restored cells in range. The
+                        # kernel centre is removed so a cell is not its own neighbour, and
+                        # action cells are kept (they add spillover on top of their direct
+                        # effect below). Still a coverage effect: one gain per cell.
+                        kernel = kernel.copy()
+                        kernel[radius, radius] = False
+                        neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
+                    else:
+                        # Apply dilation to find neighbor cells
+                        neighbor_mask = ndimage.binary_dilation(action_mask, structure=kernel)
+                        neighbor_mask = neighbor_mask & ~action_mask  # Exclude direct action cells
+                    if is_restoration_mask:
+                        _restoration_neighbor_mask = neighbor_mask
+
                 neighbor_improvement = improvement * effect_params['neighbor_effect_decay']
 
                 neighbor_baseline_anomalies = original_values[neighbor_mask]
@@ -415,9 +495,15 @@ def restoration_effect(restore_vars, convert_vars, initial_conditions, effect_pa
 
                 # Apply weighted neighbor improvement
                 weighted_neighbor_improvements = neighbor_improvement * neighbor_weights
-                updated_values[neighbor_mask] = (
-                    original_values[neighbor_mask] + weighted_neighbor_improvements
-                )
+                if effect_params.get('spillover_to_restored', False):
+                    # Build on updated_values so restored cells keep their direct effect.
+                    updated_values[neighbor_mask] = (
+                        updated_values[neighbor_mask] + weighted_neighbor_improvements
+                    )
+                else:
+                    updated_values[neighbor_mask] = (
+                        original_values[neighbor_mask] + weighted_neighbor_improvements
+                    )
         
         # Only apply changes to appropriate eligible pixels based on objective type
         # This prevents affecting NaN->0 pixels outside the study area
@@ -458,14 +544,21 @@ class RestorationProblem(ElementwiseProblem):
     Multi-objective restoration optimization problem.
     """
     
-    def __init__(self, initial_conditions, scenario_params):
+    def __init__(self, initial_conditions, scenario_params, pixel_tolerance=None):
         """
         Initialize the optimization problem.
 
         Args:
             initial_conditions: Dict with initial objective states
             scenario_params: Dict with scenario parameters (e.g., max_restoration_fraction, effect_params)
+            pixel_tolerance: fractional slack on the budget constraint. MUST equal the
+                tolerance the repair operator uses (see _evaluate). None keeps whatever
+                a subclass already set, else 0.0 (exact count).
         """
+        if pixel_tolerance is not None:
+            self.pixel_tolerance = float(pixel_tolerance)
+        elif not hasattr(self, 'pixel_tolerance'):
+            self.pixel_tolerance = 0.0
         self.initial_conditions = initial_conditions
         self.scenario_params = scenario_params
 
@@ -479,6 +572,9 @@ class RestorationProblem(ElementwiseProblem):
             # within neighbor_radius, decayed by neighbor_effect_decay.
             'neighbor_radius': int(scenario_params.get('neighbor_radius', 3)),
             'neighbor_effect_decay': float(scenario_params.get('neighbor_effect_decay', 0.2)),
+            # Opt-in: restored cells also gain spillover from other restored cells in range
+            # (rewards clustering). False = the un-restored-neighbours-only model above.
+            'spillover_to_restored': bool(scenario_params.get('spillover_to_restored', False)),
         }
 
         # restoration_potential formulation (Axis 2 - how the restoration target is
@@ -491,8 +587,11 @@ class RestorationProblem(ElementwiseProblem):
                 "Use 'sum', 'threshold' or 'shortfall'.")
         self.rp_threshold = float(scenario_params.get('rp_threshold', 0.0))
 
-        # spatial_clustering metric: 'adjacency' / 'components' / 'inter_patch_adjacency'
-        # (needs the patch approach). See evaluate_raw_objectives below for what each measures.
+        # spatial_clustering metric: 'adjacency' / 'components' / 'largest_patch' /
+        # 'inter_patch_adjacency' (needs the patch approach). See evaluate_raw_objectives
+        # below for what each measures. The edge-count metrics reward CONTACT and can be
+        # driven a long way by scattered plans whose patches merely touch in pairs;
+        # 'largest_patch' (LPI) rewards CONSOLIDATION instead.
         self.clustering_metric = str(scenario_params.get('clustering_metric', 'adjacency')).lower()
         # First-order per-pixel condition gain from restoration, applied to the combined
         # (abiotic + biotic) restoration_potential score used by the 'threshold' and
@@ -513,6 +612,7 @@ class RestorationProblem(ElementwiseProblem):
             ('restoration_potential', 'restoration_potential_1d'),
             ('restoration_benefit',   'restoration_benefit_enabled'),
             ('spatial_clustering',    'spatial_clustering_enabled'),
+            ('restored_area',         'restored_area_enabled'),
             ('implementation_cost',   'implementation_cost'),
             ('es_future_val',         'es_future_val_1d'),
             ('es_future_robustness',  'es_future_robustness_1d'),
@@ -569,7 +669,29 @@ class RestorationProblem(ElementwiseProblem):
         self.n_restoration_pixels = n_restoration_pixels
         self.n_conversion_pixels = n_conversion_pixels
         self.n_pixels = n_restoration_pixels  # For backward compatibility
-        
+
+        # Objective scaling reference:
+        #   'theoretical' (default) - the landscape-wide maxima in
+        #       _compute_normalization_denominators.
+        #   'attainable'  - the largest |raw| value a budget-feasible plan actually
+        #       reaches (_compute_attainable_scales).
+        # A theoretical reference can sit orders of magnitude above anything the budget
+        # can buy, which compresses that objective toward zero in normalised space and
+        # hands dominance to the other objectives. Measured on CH (5% budget,
+        # abiotic/biotic effect 0.01): restoration_benefit spanned 1.5e-4 between its
+        # greedy extremes against 1.7e-1 for spatial_clustering - 1168x narrower, i.e.
+        # decided at the level of float noise. Must run after max_action_pixels and the
+        # pixel counts above, which the probe evaluations need.
+        self.objective_scaling = str(
+            scenario_params.get('objective_scaling', 'theoretical')).lower()
+        if self.objective_scaling not in ('theoretical', 'attainable'):
+            raise ValueError(
+                f"Unknown objective_scaling: {self.objective_scaling!r}. "
+                "Use 'theoretical' or 'attainable'.")
+        if self.normalize_objectives and self.objective_scaling == 'attainable':
+            self.objective_scales = self._compute_attainable_scales()
+
+
         # Binary decision variables: 0 = no action, 1 = action
         # First n_restoration_pixels elements = restoration decisions
         # Next n_conversion_pixels elements = conversion decisions
@@ -636,6 +758,14 @@ class RestorationProblem(ElementwiseProblem):
                     scale = float(np.nansum(np.abs(_ab[rest_mask])) + np.nansum(np.abs(_bi[rest_mask])))
                 else:
                     scale = float(np.nansum(np.abs(_ab)) + np.nansum(np.abs(_bi)))
+            elif obj_name == 'restored_area':
+                # Theoretical ceiling: every restoration-eligible pixel restored. Under
+                # 'pixel_count' this objective is constant at max_action_pixels and
+                # would be pointless; it exists for 'cost_budget', where area varies
+                # and this is the natural scale. Additive (a plain pixel sum), so the
+                # standard greedy probes in _compute_attainable_scales are true extremes
+                # for it - no compact-probe special case needed, unlike spatial_clustering.
+                scale = float(self.initial_conditions['n_restoration_pixels'])
             elif obj_name == 'implementation_cost':
                 c = self.initial_conditions['implementation_cost']
                 if rest_mask is not None and conv_mask is not None:
@@ -647,7 +777,11 @@ class RestorationProblem(ElementwiseProblem):
                 _max_frac = float(self.scenario_params['max_restoration_fraction'])
                 _n_rest = int(self.initial_conditions['n_restoration_pixels'])
                 _max_pix = max(int(_max_frac * _n_rest), 1)
-                if getattr(self, 'clustering_metric', 'adjacency') == 'components':
+                _metric = getattr(self, 'clustering_metric', 'adjacency')
+                if _metric == 'largest_patch':
+                    # Already a share of the selected area, so it is its own scale.
+                    scale = 1.0
+                elif _metric == 'components':
                     # Worst case: every selected pixel its own component -> ~max_pix
                     # clusters. Scale by the pixel budget so normalised in ~[0, 1].
                     scale = float(_max_pix)
@@ -670,6 +804,129 @@ class RestorationProblem(ElementwiseProblem):
                 scale = 1.0
             scales[obj_name] = scale
 
+        return scales
+
+    def _compact_probe_order(self, budget):
+        """Pixel indices of one contiguous grown plan, or None if it cannot be built.
+
+        Grown from a single seed by a random frontier walk, so the result is a compact
+        blob rather than a scattered selection - the arrangement analogue of the greedy
+        cost/anomaly orders. Returned as an index array so the caller can treat it like
+        any other probe order.
+        """
+        try:
+            nbr, _rows, _cols = build_restoration_neighbor_table(self.initial_conditions)
+            n_rest = int(self.n_restoration_pixels)
+            selected = grow_region_plan(
+                nbr, n_rest, int(budget), 1,
+                np.zeros(n_rest, dtype=np.float64), 'neutral',
+                np.random.default_rng(0))
+            idx = np.flatnonzero(selected)
+            return idx if idx.size > 0 else None
+        except Exception as exc:
+            print(f"  (compact probe unavailable, arrangement objectives keep a "
+                  f"pixel-greedy reference: {exc})")
+            return None
+
+    def _compute_attainable_scales(self):
+        """Scale each objective by the largest |raw| value a feasible plan reaches.
+
+        Evaluates budget-feasible probe plans - greedy cheapest, greedy dearest, greedy
+        highest baseline anomaly, one random, and (when an arrangement-dependent
+        objective is present) one spatially grown compact plan - and takes the
+        per-objective maximum |raw|. Objectives whose probes are all ~0 keep their
+        theoretical scale.
+
+        The greedy orders are genuine extremes for ADDITIVE objectives (cost, anomaly
+        sums). They are NOT extremes for arrangement-dependent ones (spatial_clustering,
+        and restoration_benefit via spillover), because a pixel-greedy selection never
+        tries to clump. Without the compact probe the clustering denominator is just
+        another un-clustered plan, which makes any "fraction of attainable" figure
+        self-referential: the CH run reported 99.6% of its probe scale while reaching
+        only ~45% of what a compact arrangement can structurally reach.
+
+        Probes select pixels freely, so in patch mode the reference is mildly
+        optimistic against what whole-patch decisions can reach; it is a per-objective
+        constant either way, so dominance is unaffected. Conversion pixels are left at
+        zero, so objectives driven by conversion keep their theoretical scale.
+
+        constraint_type='cost_budget' (PatchRestorationProblem only): a FIXED PIXEL
+        COUNT probe would badly underestimate objectives like restored_area, whose
+        whole point is to vary with how cheaply the budget can be spent - e.g. on Bern,
+        plans reaching 3x the pixel_count-equivalent area for the same spend are routine
+        (see [[ch-3obj-front-is-one-dimensional]] Stage 3). Each probe order instead
+        fills by CUMULATIVE COST up to target_constraint_value, exactly mirroring what
+        the real fill loop (PatchAwareSampling/_enforce_budget) does.
+        """
+        eps = 1e-12
+        n_rest = int(self.n_restoration_pixels)
+        budget = min(int(self.max_action_pixels), n_rest)
+        scales = dict(self.objective_scales)
+        if budget <= 0:
+            return scales
+
+        ic = self.initial_conditions
+        mask = ic['restoration_eligible_mask']
+
+        constraint_type = getattr(self, 'patch_constraint_type', 'pixel_count')
+        cost_budget_mode = constraint_type == 'cost_budget'
+        if cost_budget_mode:
+            cost_for_probe = np.nan_to_num(
+                getattr(self, '_cost_restore_1d', None)
+                if getattr(self, '_cost_restore_1d', None) is not None
+                else np.asarray(ic['implementation_cost'], dtype=float)[mask])
+            target_cost = float(self.target_constraint_value)
+
+        def _fill(order):
+            """Prefix of `order` to select: by cumulative cost under cost_budget,
+            else the fixed pixel `budget` (unchanged default behaviour)."""
+            if not cost_budget_mode:
+                return order[:budget]
+            csum = np.cumsum(cost_for_probe[order])
+            k = min(int(np.searchsorted(csum, target_cost, side='right')) + 1, len(order))
+            return order[:k]
+
+        orders = []
+        if 'implementation_cost' in ic:
+            c = np.asarray(ic['implementation_cost'])[mask].astype(float)
+            asc = np.argsort(c, kind='stable')
+            orders.append(asc)          # cheapest
+            orders.append(asc[::-1])    # dearest
+        if 'abiotic_anomaly' in ic and 'biotic_anomaly' in ic:
+            gain = (np.abs(np.asarray(ic['abiotic_anomaly'])[mask])
+                    + np.abs(np.asarray(ic['biotic_anomaly'])[mask]))
+            orders.append(np.argsort(-gain, kind='stable'))
+        orders.append(np.random.default_rng(0).permutation(n_rest))
+
+        # One contiguous grown plan, so arrangement-dependent objectives get a probe
+        # that actually clumps. Skipped when no such objective is in play, since the
+        # frontier walk is the slowest probe. Still grown to the PIXEL budget even
+        # under cost_budget (grow_region_plan has no cost-aware stopping rule) - an
+        # approximation already flagged as "mildly optimistic" above; only affects
+        # spatial_clustering/restoration_benefit's scale precision, not restored_area's.
+        if {'spatial_clustering', 'restoration_benefit'}.intersection(self.objective_names):
+            compact = self._compact_probe_order(budget)
+            if compact is not None:
+                orders.append(compact)
+
+        best = np.zeros(len(self.objective_names), dtype=float)
+        for order in orders:
+            x = np.zeros(n_rest + int(self.n_conversion_pixels), dtype=int)
+            x[_fill(order)] = 1
+            # Explicit unbound call: self.evaluate_raw_objectives would dispatch to
+            # PatchRestorationProblem's override, which reads x as patch decisions.
+            raw = RestorationProblem.evaluate_raw_objectives(self, x)
+            best = np.maximum(best, np.nan_to_num(np.abs(np.asarray(raw, dtype=float))))
+
+        for i, obj_name in enumerate(self.objective_names):
+            if best[i] > eps:
+                scales[obj_name] = float(best[i])
+
+        print(f"Objective scaling: attainable ({len(orders)} probe plans, "
+              f"budget {budget} px)")
+        for obj_name in self.objective_names:
+            print(f"  {obj_name:22s} {self.objective_scales.get(obj_name, 1.0):.6g}"
+                  f" -> {scales[obj_name]:.6g}")
         return scales
 
     def _normalize_objective_vector(self, raw_objectives):
@@ -774,11 +1031,31 @@ class RestorationProblem(ElementwiseProblem):
                 sel_mask = np.zeros(shape, dtype=bool)
                 rows, cols = np.divmod(sel_idx, shape[1])
                 sel_mask[rows, cols] = True
-                if self.clustering_metric == 'components':
+                if self.clustering_metric == 'largest_patch':
+                    # Largest Patch Index: share of the selected area sitting in its
+                    # biggest 4-connected component. Negated so the minimiser maximises
+                    # it. Unlike the edge-count metrics this measures CONSOLIDATION
+                    # rather than contact: the CH run drove inter_patch_adjacency 1.6x
+                    # across its front while LPI stayed at 2.8-5.0%, i.e. many 3x3
+                    # patches touching in pairs, scattered nationwide.
+                    lab, n_comp = ndimage.label(sel_mask)
+                    n_sel = int(sel_mask.sum())
+                    if n_comp > 0 and n_sel > 0:
+                        biggest = int(np.bincount(lab.ravel())[1:].max())
+                        obj_value = -float(biggest) / float(n_sel)
+                    else:
+                        obj_value = 0.0
+                elif self.clustering_metric == 'components':
                     # Number of disconnected clusters (4-connectivity). Fewer = more
                     # clumped. Minimised directly. Insensitive to cluster size/shape
-                    # -- measures pure fragmentation -- so it need not track cost the
-                    # way edge count (proportional to amount of contiguous land bought) does.
+                    # -- measures pure fragmentation.
+                    # FALSIFIED 2026-09-18 (Stage 4.2, CH): the older claim that this
+                    # "need not track cost the way edge count does" was untested and is
+                    # WRONG - optimising it directly gave corr(clustering,cost)=+0.928
+                    # (PC1 97.3%), a MUCH stronger cost coupling than
+                    # inter_patch_adjacency's +0.194 (PC1 70.0%) under the same fixed
+                    # operators, with no meaningful consolidation gain (LPI similar
+                    # range). See [[ch-3obj-front-is-one-dimensional]].
                     _, n_comp = ndimage.label(sel_mask)
                     obj_value = float(n_comp)
                 elif self.clustering_metric == 'inter_patch_adjacency':
@@ -819,6 +1096,12 @@ class RestorationProblem(ElementwiseProblem):
                 # Lower = less total undesirable deviation = more robust -> minimise directly.
                 esr = self.initial_conditions['es_future_robustness_1d']
                 obj_value = float(np.sum(esr[x_restore == 1]))
+            elif obj_name == 'restored_area':
+                # Maximise total restored pixels -> negate for pymoo minimisation.
+                # Constant under 'pixel_count' (always max_action_pixels); meaningful
+                # only when the constraint lets area vary (patch_constraint_type=
+                # 'cost_budget'), where it is the natural counterpart to cost.
+                obj_value = -float(np.sum(x_restore))
             elif obj_name == 'implementation_cost':
                 obj_value = updated_conditions[obj_name]
             else:
@@ -850,13 +1133,27 @@ class RestorationProblem(ElementwiseProblem):
         n_converted = np.sum(x_convert)
         n_total_actions = n_restored + n_converted
         
-        raw_objectives = self.evaluate_raw_objectives(x)
+        # x here is always a pixel vector (PatchRestorationProblem._evaluate converts
+        # patches to pixels before calling super()._evaluate). Must call the
+        # unbound RestorationProblem method explicitly: self.evaluate_raw_objectives
+        # would dispatch to PatchRestorationProblem's override when self is a patch
+        # problem, which would wrongly reinterpret this pixel vector as patches.
+        raw_objectives = RestorationProblem.evaluate_raw_objectives(self, x)
         objectives = self._normalize_objective_vector(raw_objectives)
         out["F"] = objectives
         out["F_raw"] = raw_objectives
         
-        # Constraint: total number of pixels with actions (restore + convert)
-        out["G"] = [abs(n_total_actions - self.max_action_pixels)]  # Should be 0 due to exact count enforcement
+        # Constraint: total number of pixels with actions (restore + convert), feasible
+        # anywhere inside the band the repair enforces: [int(k*(1-tol)), int(k*(1+tol))]
+        # (enforce_budget_contiguous). NOTE: this used to be abs(n - k), an EXACT count,
+        # while the repair only guarantees the band. Plans the repair left inside the band
+        # but off exactly k were therefore infeasible and lost to constraint-domination,
+        # while HVCallback counts them, so population hypervolume could fall between
+        # generations. Keep pixel_tolerance identical to the repair operators' tolerance.
+        k = self.max_action_pixels
+        lo = int(k * (1 - self.pixel_tolerance))
+        hi = int(k * (1 + self.pixel_tolerance))
+        out["G"] = [float(max(0, lo - n_total_actions, n_total_actions - hi))]
 
         # Minimum-patch-size constraint (price-of-contiguity sweep). Feasible when
         # every 4-connected component of selected restoration pixels has >= S pixels;
@@ -906,6 +1203,11 @@ class PatchRestorationProblem(RestorationProblem):
     Constraint types:
     - 'patch_count': Fixed number of patches (variable pixel count)
     - 'pixel_count': Fixed number of pixels (variable patch count) - RECOMMENDED
+    - 'cost_budget': Fixed total implementation cost (variable pixel/patch count and
+      area). The counterpart to 'pixel_count' for testing whether area-vs-value
+      trade-offs are an artefact of the fixed-area constraint (see
+      [[ch-3obj-front-is-one-dimensional]]). Pairs naturally with the 'restored_area'
+      objective, which is otherwise constant under 'pixel_count'.
     """
     
     def __init__(self, initial_conditions, scenario_params,
@@ -927,28 +1229,76 @@ class PatchRestorationProblem(RestorationProblem):
         
         self.n_restoration_patches = initial_conditions['n_restoration_patches']
         self.n_conversion_patches = initial_conditions['n_conversion_patches']
-        
+
+        # Store constraint configuration NOW, before super().__init__(): the base
+        # class's __init__ calls _compute_attainable_scales() (when objective_scaling=
+        # 'attainable'), which needs self.patch_constraint_type / self._cost_restore_1d
+        # / self.target_constraint_value already set to probe a cost_budget run
+        # correctly (see that method's cost_budget_mode branch) - setting them AFTER
+        # super().__init__() would make attainable scaling silently probe a fixed pixel
+        # count instead, understating any objective (e.g. restored_area) that varies
+        # with how cheaply the budget is spent. Everything needed here (cost arrays,
+        # target_constraint_value for 'cost_budget') comes directly from
+        # initial_conditions/scenario_params, not from anything the base class computes.
+        self.patch_constraint_type = patch_constraint_type
+        self.pixel_tolerance = pixel_tolerance
+        # With no conversion objective (same test as RestorationProblem's), conversion patches
+        # change no objective, so they must not count toward the budget either. The operators
+        # (PatchAwareSampling / PatchRepair) never select them in that case; this makes the
+        # constraint agree even for a plan that did arrive with conversion bits set.
+        self._exclude_conversion = not (
+            'landscape_anomaly' in initial_conditions
+            or 'connectivity_gain_1d' in initial_conditions)
+
+        # Per-pixel cost arrays for the 'cost_budget' constraint, cached once here so
+        # _evaluate does not re-mask the full raster every call. Indexed the same way
+        # as x_restore/x_convert (boolean-mask indexing preserves row-major flatten
+        # order, matching restoration_eligible_indices/conversion_eligible_indices).
+        self._cost_restore_1d = None
+        self._cost_convert_1d = None
+        if patch_constraint_type == 'cost_budget':
+            if 'implementation_cost' not in initial_conditions:
+                raise ValueError(
+                    "patch_constraint_type='cost_budget' requires 'implementation_cost' "
+                    "in initial_conditions (i.e. 'cost' must be one of the loaded "
+                    "objectives).")
+            cost2d = np.asarray(initial_conditions['implementation_cost'], dtype=np.float64)
+            self._cost_restore_1d = np.nan_to_num(
+                cost2d[initial_conditions['restoration_eligible_mask']], nan=0.0)
+            conv_mask = initial_conditions.get('conversion_eligible_mask')
+            self._cost_convert_1d = (
+                np.nan_to_num(cost2d[conv_mask], nan=0.0) if conv_mask is not None
+                else np.zeros(int(initial_conditions['n_conversion_pixels']), dtype=np.float64))
+            # Mirrors max_action_pixels = max_restoration_fraction * n_restoration_pixels
+            # (computed independently below by the base class) - same fraction, applied
+            # to total RESTORATION-eligible cost instead of pixel count.
+            max_restoration_fraction = float(scenario_params.get('max_restoration_fraction', 0.05))
+            self.target_constraint_value = float(
+                max_restoration_fraction * np.sum(self._cost_restore_1d))
+        elif patch_constraint_type not in ('pixel_count', 'patch_count'):
+            raise ValueError(
+                f"Unknown patch_constraint_type: {patch_constraint_type!r}. "
+                "Use 'pixel_count', 'patch_count', or 'cost_budget'.")
+
         # Initialize parent class with pixel-level information
         # This sets up all the objective functions and constraints
         # We'll override n_var after parent initialization
         super().__init__(initial_conditions, scenario_params)
-        
+
         # Override decision variable dimensions to use patches instead of pixels
         # Decision vector structure: [restoration_patches, conversion_patches]
         self.n_var = self.n_restoration_patches + self.n_conversion_patches
-        
-        # Store constraint configuration
-        self.patch_constraint_type = patch_constraint_type
-        self.pixel_tolerance = pixel_tolerance
-        
-        # Calculate target values for different constraint types
+
+        # Calculate target values for the constraint types that need base-class state
+        # (max_action_pixels, set inside super().__init__() just called). 'cost_budget'
+        # was already computed above - nothing here needs redoing for it.
         if patch_constraint_type == 'pixel_count':
             self.target_constraint_value = self.max_action_pixels
         elif patch_constraint_type == 'patch_count':
             # Estimate max patches from max pixels
             if self.n_restoration_patches > 0:
                 avg_pixels_per_patch = (
-                    initial_conditions['n_restoration_pixels'] / 
+                    initial_conditions['n_restoration_pixels'] /
                     self.n_restoration_patches
                 )
                 self.target_constraint_value = max(1, int(
@@ -956,7 +1306,10 @@ class PatchRestorationProblem(RestorationProblem):
                 ))
             else:
                 self.target_constraint_value = 0
-        
+        # 'cost_budget' target_constraint_value was already computed before
+        # super().__init__() above (see the comment there for why); unknown types were
+        # already rejected there too.
+
         print(f"Patch-based problem initialized:")
         print(f"  Decision variables: {self.n_var} patches "
               f"({self.n_restoration_patches} restoration + {self.n_conversion_patches} conversion)")
@@ -983,7 +1336,9 @@ class PatchRestorationProblem(RestorationProblem):
             self.conversion_patches,
             self.n_conversion_pixels
         )
-        
+        if self._exclude_conversion:
+            x_convert_pixels = np.zeros_like(x_convert_pixels)
+
         x_pixels = np.concatenate([x_restore_pixels, x_convert_pixels])
         super()._evaluate(x_pixels, out, *args, **kwargs)
 
@@ -1018,7 +1373,22 @@ class PatchRestorationProblem(RestorationProblem):
                 )
                 if self._constraint_debug_count < 5:
                     print(f"                    VIOLATION: G={constraint_value}")
-        
+
+        elif self.patch_constraint_type == 'cost_budget':
+            # Mirrors the 'pixel_count' branch above, tracking total COST instead of
+            # pixel count. Same widened tolerance rationale: whole-patch granularity
+            # leaves discretisation error PatchRepair's tolerance cannot fully remove.
+            cost_used = (float(np.dot(x_restore_pixels, self._cost_restore_1d))
+                         + float(np.dot(x_convert_pixels, self._cost_convert_1d)))
+            evaluation_tolerance = self.pixel_tolerance * 1.5
+            min_cost = self.target_constraint_value * (1 - evaluation_tolerance)
+            max_cost = self.target_constraint_value * (1 + evaluation_tolerance)
+
+            if min_cost <= cost_used <= max_cost:
+                constraint_value = 0.0
+            else:
+                constraint_value = min(abs(cost_used - min_cost), abs(cost_used - max_cost))
+
         out["G"] = [constraint_value]
 
         # Parity with RestorationProblem: keep out["G"] length == n_constr when the
@@ -1084,14 +1454,18 @@ class HVCallback:
     """
     Hypervolume-based early stopping callback.
     Monitors hypervolume improvement and stops optimization if no significant improvement 
-    is observed for a specified number of generations.
+    is observed for a specified number of generations. Hypervolume is computed on the
+    feasible plans only; per-generation feasible share and min/max restored pixels are logged.
     """
-    
-    def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None):
+
+    def __init__(self, patience=15, min_improvement=1e-6, verbose=True, ref_point=None,
+                 snapshot_generations=None):
         """
         patience: generations without a >= min_improvement RELATIVE HV gain before
         declaring convergence. ref_point is required (fixed across the run so HV is
         comparable between generations); see build_fixed_ref_point.
+        snapshot_generations: optional iterable of algorithm.n_gen values to snapshot
+        X for (e.g. {1, 10, 25, 50, 100}). None snapshots every generation.
         """
         self.patience = patience
         self.min_improvement = min_improvement
@@ -1107,9 +1481,17 @@ class HVCallback:
         self.f_std_history = []   # Std of F per generation
         self.f_min_history = []   # Min of F per generation  
         self.f_max_history = []   # Max of F per generation
+        # Feasibility tracking. HV is computed on FEASIBLE plans only (constraint-
+        # domination discards the rest, so counting them made HV fall between generations).
+        self.feasible_share_history = []   # fraction of the population with CV <= 0
+        self.n_action_min_history = []     # min/max restored pixels per generation
+        self.n_action_max_history = []     # (pixel mode only; None-free, empty in patch mode)
 
         # X snapshot buffering (populated only when snapshot_dir is set)
         self.snapshot_dir = None       # set by ProgressCallback when save_snapshots=True
+        self.snapshot_generations = (
+            set(snapshot_generations) if snapshot_generations is not None else None
+        )  # None = every generation; otherwise only these algorithm.n_gen values
         self.X_batch = []              # in-memory buffer of int8 arrays
         self.batch_files = []          # paths of flushed batch .npz files
         self.batch_size = 10           # flush every N generations
@@ -1132,21 +1514,37 @@ class HVCallback:
                 self.f_min_history.append(f_min.tolist())
                 self.f_max_history.append(f_max.tolist())
 
-                # Capture full population X snapshot
+                feasible = self._feasible_mask(algorithm, F)
+                self.feasible_share_history.append(float(feasible.mean()))
+                self._log_action_counts(algorithm)
+
+                # Capture full population X snapshot (all generations, or only
+                # snapshot_generations if that was given).
                 if self.snapshot_dir is not None:
-                    X_pop = algorithm.pop.get("X")
-                    if X_pop is not None:
-                        if not self._x_memory_warned and algorithm.n_gen == 1:
-                            batch_mb = self.batch_size * X_pop.shape[0] * X_pop.shape[1] / 1e6
-                            total_mb = self._n_generations_est * X_pop.shape[0] * X_pop.shape[1] / 1e6
-                            print(f"   X snapshots: {X_pop.shape[1]} vars x {X_pop.shape[0]} pop, "
+                    if not self._x_memory_warned and algorithm.n_gen == 1:
+                        X_pop_est = algorithm.pop.get("X")
+                        if X_pop_est is not None:
+                            n_snap = (
+                                len(self.snapshot_generations)
+                                if self.snapshot_generations is not None
+                                else self._n_generations_est
+                            )
+                            batch_mb = self.batch_size * X_pop_est.shape[0] * X_pop_est.shape[1] / 1e6
+                            total_mb = n_snap * X_pop_est.shape[0] * X_pop_est.shape[1] / 1e6
+                            print(f"   X snapshots: {X_pop_est.shape[1]} vars x {X_pop_est.shape[0]} pop, "
+                                  f"{n_snap} generation(s) targeted, "
                                   f"batch RAM ~{batch_mb:.0f} MB, est. total on disk ~{total_mb:.0f} MB")
                             if total_mb > 1000:
-                                print(f"   Warning: estimated X_history size exceeds 1 GB - consider reduce n_generations")
+                                print(f"   Warning: estimated X_history size exceeds 1 GB - consider "
+                                      f"narrowing snapshot_generations")
                             self._x_memory_warned = True
-                        self.X_batch.append(X_pop.astype(np.int8))
-                        if len(self.X_batch) >= self.batch_size:
-                            self._flush_batch()
+
+                    if self.snapshot_generations is None or algorithm.n_gen in self.snapshot_generations:
+                        X_pop = algorithm.pop.get("X")
+                        if X_pop is not None:
+                            self.X_batch.append(X_pop.astype(np.int8))
+                            if len(self.X_batch) >= self.batch_size:
+                                self._flush_batch()
 
                 # Calculate hypervolume
                 try:
@@ -1155,7 +1553,7 @@ class HVCallback:
                         raise ValueError("HVCallback requires a fixed ref_point")
 
                     hv_indicator = HV(ref_point=self.ref_point)
-                    current_hv = hv_indicator(F)
+                    current_hv = float(hv_indicator(F[feasible])) if feasible.any() else 0.0
                     
                     self.hv_history.append(current_hv)
                     
@@ -1194,6 +1592,26 @@ class HVCallback:
                 print(f"   Warning: HVCallback skipped at gen {getattr(algorithm, 'n_gen', '?')}: pop unavailable")
             self.hv_history.append(float('nan'))
 
+    @staticmethod
+    def _feasible_mask(algorithm, F):
+        """Boolean mask of plans with no constraint violation (all True if unconstrained)."""
+        CV = algorithm.pop.get("CV")
+        if CV is None:
+            return np.ones(len(F), dtype=bool)
+        return np.asarray(CV, dtype=float).reshape(len(F), -1).max(axis=1) <= 0
+
+    def _log_action_counts(self, algorithm):
+        """Record min/max restored pixels in the population (pixel mode only)."""
+        problem = getattr(algorithm, 'problem', None)
+        if problem is None or hasattr(problem, 'n_restoration_patches'):
+            return
+        X = algorithm.pop.get("X")
+        if X is None:
+            return
+        n = X[:, :problem.n_restoration_pixels].sum(axis=1)
+        self.n_action_min_history.append(int(n.min()))
+        self.n_action_max_history.append(int(n.max()))
+
     def _flush_batch(self):
         """Stack the in-memory X buffer and write it to a temporary .npz file."""
         if not self.X_batch:
@@ -1214,10 +1632,11 @@ class ProgressCallback:
 
     def __init__(self, verbose=True, n_generations=100,
                  hv_patience=15, hv_min_improvement=1e-6, ref_point=None,
-                 save_snapshots=False, snapshot_dir=None):
+                 save_snapshots=False, snapshot_dir=None, snapshot_generations=None):
         """
         hv_* and ref_point are forwarded to HVCallback. save_snapshots captures the
-        full population X every generation into snapshot_dir as batched .npz files.
+        full population X into snapshot_dir as batched .npz files - every generation,
+        or only snapshot_generations (an iterable of algorithm.n_gen values) if given.
         """
         self.verbose = verbose
         self.n_generations = n_generations
@@ -1227,6 +1646,7 @@ class ProgressCallback:
             min_improvement=hv_min_improvement,
             verbose=verbose,
             ref_point=ref_point,
+            snapshot_generations=snapshot_generations,
         )
         if save_snapshots and snapshot_dir is not None:
             os.makedirs(snapshot_dir, exist_ok=True)
@@ -1263,8 +1683,10 @@ class ProgressCallback:
                 if gen_violations:
                     violation_info = f" - Violations: {len(gen_violations)}"
 
+            feas = self.hv_callback.feasible_share_history
+            feas_info = f" - Feasible: {feas[-1]:.0%}" if feas else ""
             print(f"   Generation {gen}/{self.n_generations} ({progress:.1f}%) - "
-                  f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}")
+                  f"Elapsed: {elapsed/60:.1f}min - ETA: {eta/60:.1f}min{violation_info}{feas_info}")
 
         # Hypervolume-based early stopping: once the HVCallback has seen no
         # improvement for hv_patience generations, tell pymoo to terminate.
@@ -1484,6 +1906,20 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             conversion_pixel_scores=None,
             mode='mean',
         )
+        # aggregate_patch_scores_from_pixel_scores min-max normalises to [0, 1], and the
+        # underlying score is heavily skewed, so most patches end up nearly tied near one
+        # end and only the tail is distinguishable. 'rank' respaces them evenly, which
+        # both spreads the middle of the distribution and makes the knob below exact:
+        # with ranks uniform on [0, 1], _safe_softmax's (x - max)/T gives the best patch
+        # exp(1/T) times the worst patch's draw probability, independent of the layer.
+        # Default 'none' changes no existing run.
+        transform = str(scenario_params.get('patch_score_transform', 'none')).lower()
+        if transform == 'rank':
+            patch_scores = _rank_scores(patch_scores)
+        elif transform != 'none':
+            raise ValueError(
+                f"Unknown patch_score_transform: {transform!r}. Use 'none' or 'rank'.")
+
         patch_score_temperature = float(scenario_params.get('patch_score_temperature', 0.25))
         patch_random_share = float(scenario_params.get('patch_random_share', 0.15))
         patch_repair_top_k = int(scenario_params.get('patch_repair_top_k', 12))
@@ -1526,6 +1962,21 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             if burden_sharing_enabled else None
         )
 
+        # 'cost_budget': every fill/repair loop must track total COST, not pixel count.
+        # None (default) for 'pixel_count'/'patch_count' - PatchAwareSampling/PatchRepair
+        # then fall back to pixel counts exactly as before this constraint type existed.
+        budget_weights = None
+        # No conversion objective: conversion patches are inert, so keep them out of the
+        # draw and out of the budget (the constraint in PatchRestorationProblem agrees).
+        exclude_conversion = bool(getattr(problem, '_exclude_conversion', False))
+        if patch_constraint_type == 'cost_budget':
+            budget_weights = aggregate_patch_pixel_sums(
+                patch_mappings=initial_conditions['patch_mappings'],
+                restoration_pixel_values=problem._cost_restore_1d,
+                conversion_pixel_values=(np.zeros_like(problem._cost_convert_1d)
+                                         if exclude_conversion else problem._cost_convert_1d),
+            )
+
         sampling = PatchAwareSampling(
             patch_mappings=initial_conditions['patch_mappings'],
             target_pixels=problem.target_constraint_value,
@@ -1535,6 +1986,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             random_share=patch_random_share,
             per_objective_patch_scores=per_obj_patch_scores,
             patch_region_assignments=patch_region_assignments,
+            budget_weights=budget_weights,
+            exclude_conversion=exclude_conversion,
         )
         repair = PatchRepair(
             constraint_type=patch_constraint_type,
@@ -1550,6 +2003,8 @@ def _build_operators(initial_conditions, scenario_params, problem, use_patch_app
             patch_region_assignments=patch_region_assignments,
             capture_diag=capture_repair_diag, n_generations=n_generations,
             n_capture=n_capture_gens, diag_dir=diag_dir,
+            budget_weights=budget_weights,
+            exclude_conversion=exclude_conversion,
         ) if use_repair else None
 
         if verbose:
@@ -1770,10 +2225,11 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
     if verbose:
         convergence_reason = "hypervolume plateau" if callback.hv_callback.converged else "generation limit"
         final_gen = len(callback.hv_callback.hv_history)
-        print(f"\u2713 Optimization completed after {final_gen} generations ({convergence_reason})")
+        print(f"OK Optimization completed after {final_gen} generations ({convergence_reason})")
         if callback.hv_callback.hv_history:
             print(f"Final hypervolume: {callback.hv_callback.hv_history[-1]:.6f}")
-        print(f"Found {len(result.F)} Pareto-optimal solutions out of {len(result.pop.get('F'))} evaluated solutions")
+        # The front is reported below, once it has been recomputed from the full
+        # population (result.F alone undercounts it for NSGA-III - see there).
 
     initial_conditions_filtered = _filter_initial_conditions_for_return(initial_conditions)
 
@@ -1782,14 +2238,63 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
     F_full_norm = result.pop.get("F")
     F_full_raw = np.asarray([problem.evaluate_raw_objectives(xi) for xi in X_full], dtype=float)
 
+    # Guard against the run-time (F) / post-hoc (F_raw) objective mismatch that
+    # motivated calling RestorationProblem.evaluate_raw_objectives explicitly in
+    # _evaluate: if F and F_raw were ever computed on different selections, their
+    # ratio per objective would not be constant across the population.
+    _valid = np.abs(F_full_norm) >= 1e-15
+    for _oi, _oname in enumerate(problem.objective_names):
+        _mask = _valid[:, _oi]
+        if not np.any(_mask):
+            continue
+        _ratio = F_full_raw[_mask, _oi] / F_full_norm[_mask, _oi]
+        _rmin, _rmax = float(np.min(_ratio)), float(np.max(_ratio))
+        if not np.isclose(_rmin, _rmax, rtol=1e-6, atol=0.0):
+            raise RuntimeError(
+                f"Objective '{_oname}': raw/normalized ratio is not constant across "
+                f"the population (min={_rmin!r}, max={_rmax!r}). This indicates F "
+                "(run-time, normalized) and F_raw (post-hoc, via evaluate_raw_objectives) "
+                "were computed on different decision vectors."
+            )
+
+    # ----- Non-dominated front over the WHOLE final population -----
+    # NOT result.X. For NSGA-III, pymoo's result.X/algorithm.opt is
+    #   pop[intersect(fronts[0], closest)]   (nsga3.py ReferenceDirectionSurvival._do)
+    # i.e. the front-0 member CLOSEST to each occupied reference direction - one
+    # representative per niche, deliberately curated for spread. Whenever a niche holds
+    # more than one front-0 point (routine), that set is strictly smaller than the real
+    # non-dominated front, so using it here would silently mislabel genuinely
+    # non-dominated plans as dominated. NSGA-II's opt is plain pop[rank==0] and does not
+    # have this property, but sorting explicitly is correct for both.
+    _nd_idx = NonDominatedSorting().do(F_full_raw, only_non_dominated_front=True)
+    _nd_idx = np.sort(np.asarray(_nd_idx, dtype=int))
+
+    # result.X must be a SUBSET of that front: a curated representative is still a real
+    # non-dominated point, and removing points from a set can only reveal more
+    # non-dominated members, never fewer. A violation means F (run-time, normalized) and
+    # F_raw (post-hoc) really were computed on different decision vectors - the failure
+    # this guard exists to catch.
+    _nd_X = {tuple(row) for row in X_full[_nd_idx]}
+    _missing = [row for row in np.asarray(result.X) if tuple(row) not in _nd_X]
+    if _missing:
+        raise RuntimeError(
+            f"{len(_missing)} of pymoo's {len(result.X)} reported optimal solutions are "
+            f"NOT in the non-dominated front recomputed from F_raw ({len(_nd_idx)} "
+            "members). This indicates F (run-time, normalized) and F_raw (post-hoc, via "
+            "evaluate_raw_objectives) were computed on different decision vectors."
+        )
+
     # ----- Non-dominated Data -----
-    X_nd = result.X
-    F_nd_norm = result.F
-    
-    # ----- Identify non-dominated solutions within the full population -----
-    # Create a set of tuples for efficient lookup of non-dominated decision vectors
-    nd_solutions_set = {tuple(row) for row in X_nd}
-    is_nondominated = np.array([tuple(row) in nd_solutions_set for row in X_full])
+    X_nd = X_full[_nd_idx]
+
+    is_nondominated = np.zeros(len(X_full), dtype=bool)
+    is_nondominated[_nd_idx] = True
+
+    if verbose:
+        _extra = ("" if len(X_nd) == len(result.X)
+                  else f" (pymoo reported {len(result.X)} reference-direction representatives)")
+        print(f"Found {len(X_nd)} Pareto-optimal solutions out of {len(X_full)} "
+              f"evaluated solutions{_extra}")
 
     optimization_results = {
         'scenario_params': scenario_params,
@@ -1824,6 +2329,9 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
                 'f_std_history': callback.hv_callback.f_std_history,
                 'f_min_history': callback.hv_callback.f_min_history,
                 'f_max_history': callback.hv_callback.f_max_history,
+                'feasible_share_history': callback.hv_callback.feasible_share_history,
+                'n_action_min_history': callback.hv_callback.n_action_min_history,
+                'n_action_max_history': callback.hv_callback.n_action_max_history,
             },
             'hv_patience': hv_patience,
             'hv_min_improvement': hv_min_improvement,
@@ -1876,7 +2384,7 @@ def _package_results(result, problem, initial_conditions, scenario_params, callb
                         pass
                 optimization_results['X_history_path'] = x_history_path
                 if verbose:
-                    print(f"\u2713 X_history saved: {X_history.shape} -> {x_history_path}")
+                    print(f"OK X_history saved: {X_history.shape} -> {x_history_path}")
             except Exception as e:
                 if verbose:
                     print(f"Warning: Could not assemble X_history: {e}")
@@ -1891,7 +2399,7 @@ def _print_failure_diagnostics(result, problem, initial_conditions):
     """
     Print diagnostic information when optimization produces no Pareto solutions.
     """
-    print("\u2717 Optimization failed - no solutions found")
+    print("FAIL Optimization failed - no solutions found")
     if result is None:
         print("  Reason: result is None")
     elif not hasattr(result, 'F'):
@@ -1948,13 +2456,14 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                                      hv_min_improvement=1e-6, use_repair=True,
                                      random_seed=None, use_patch_approach=False, patch_size=100,
                                      patch_constraint_type='pixel_count', pixel_tolerance=0.05,
-                                     output_dir=str(OUTPUT_DIR), save_snapshots=False,
+                                     output_dir=str(OUTPUTS), save_snapshots=False,
+                                     snapshot_generations=None,
                                      run_label="", run_config=None,
                                      n_partitions=8, warm_seeding=True,
                                      r_export_parent=None, mutation_prob_var=None,
                                      mutation_flip_count=None,
                                      capture_repair_diag=False, n_capture_gens=5,
-                                     algorithm_type="nsga3"):
+                                     algorithm_type="nsga3", extra_seed_X=None):
     """
     Run the multi-objective restoration optimization for a single scenario.
     Returns the results dict, or None if the optimization produced no front.
@@ -1962,10 +2471,19 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
     Only the non-obvious arguments are documented here; scenario_params keys are
     documented at their point of use (see RestorationProblem.__init__).
 
+    extra_seed_X: optional (n_seed, n_var) int array of externally supplied genotypes, already
+        in this problem's own decision space (patch-level under use_patch_approach, pixel-level
+        otherwise), injected into the initial population via WarmStartSampling. Independent of
+        `warm_seeding` (that flag controls a different, automatic per-objective seeding
+        mechanism) and works in either mode. None (default) changes nothing.
+
     algorithm_type: "nsga3" (default, best for >=3 objectives) sizes the population
         from n_partitions and IGNORES pop_size; "nsga2" (2-objective fronts) uses
         pop_size directly. n_partitions=8 -> 45 Das-Dennis ref dirs -> pop 45.
     patch_constraint_type: 'pixel_count' (recommended) or 'patch_count'.
+    snapshot_generations: with save_snapshots=True, an iterable of generation numbers
+        (1-indexed, matching pymoo's algorithm.n_gen) to snapshot X for instead of every
+        generation - e.g. {1, 10, 25, 50, 100} keeps the X_history small.
     mutation_prob_var / mutation_flip_count: per-variable bitflip probability, or the
         expected flip COUNT (converted to a probability; takes precedence). None keeps
         the historical 200 / n_var.
@@ -2004,6 +2522,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
         problem = RestorationProblem(
             initial_conditions=initial_conditions,
             scenario_params=scenario_params,
+            pixel_tolerance=pixel_tolerance,
         )
 
     # --- 4. Print problem details ---
@@ -2060,6 +2579,14 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
                 print(f"  Warm-start: injecting {seed_X.shape[0]} objective-extreme "
                       f"seed(s) into the initial population.")
 
+    # --- 5c. Externally supplied seed genotypes (opt-in; independent of warm_seeding above,
+    # works in either mode). WarmStartSampling composes fine if both are active.
+    if extra_seed_X is not None:
+        sampling = WarmStartSampling(sampling, extra_seed_X)
+        if verbose:
+            print(f"  Seeding {len(extra_seed_X)} externally supplied genotype(s) into the "
+                  "initial population.")
+
     # --- 6. Build HV reference point ---
     hv_warmup_samples = int(scenario_params.get("hv_warmup_samples", 40 if use_patch_approach else 200))
     if verbose:
@@ -2115,6 +2642,7 @@ def run_optimization_instance(initial_conditions, scenario_params, pop_size=50,
             ref_point=fixed_ref,
             save_snapshots=save_snapshots,
             snapshot_dir=snap_dir,
+            snapshot_generations=snapshot_generations,
         )
         result = minimize(
             problem, algorithm, termination,
@@ -2154,7 +2682,7 @@ def main(workspace_dir=".", scenario='all', objectives=None, n_samples_per_param
     sample_fraction / sample_seed: spatial subsampling of eligible pixels (None = all).
     """
 
-    from .run_scenarios import run_all_scenarios_optimization
+    from .archive.run_scenarios import run_all_scenarios_optimization
 
     if scenario == "all":
         initial_conditions = load_initial_conditions(

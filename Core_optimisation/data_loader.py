@@ -656,6 +656,12 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
         # No underlying raster - configuration-dependent, computed from selected-pixel
         # geometry each evaluation (RestorationProblem.evaluate_raw_objectives).
         'spatial_clustering': None,
+        # maximise total restored area (sum of selected restoration pixels). Only
+        # meaningful when area is NOT fixed by the constraint (scenario_params
+        # ['patch_constraint_type'] == 'cost_budget'; under 'pixel_count' this
+        # objective would be constant). No underlying raster - computed directly
+        # from the decision vector (RestorationProblem.evaluate_raw_objectives).
+        'restored_area': None,
         # minimise implementation cost. Region-specific: 'CH' loads
         # data/CH_wide/cost_combined.tif; every other region uses the corrected
         # Bern layer at the data/ root.
@@ -1393,6 +1399,12 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     if 'restoration_benefit' in computed_objectives:
         initial_conditions['restoration_benefit_enabled'] = True
         logger.info("restoration_benefit objective enabled (spillover-aware abiotic+biotic improvement)")
+
+    # restored_area is likewise computed at evaluation time (sum of x_restore) - only a
+    # flag is set here.
+    if 'restored_area' in computed_objectives:
+        initial_conditions['restored_area_enabled'] = True
+        logger.info("restored_area objective enabled (total restored pixel count)")
 
     initial_conditions['sample_info'] = {
         'sample_fraction': sample_fraction,

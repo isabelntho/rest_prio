@@ -45,7 +45,7 @@ IMPLEMENTATION
 --------------
 The PatchRestorationProblem class (in resto_anom.py):
   - Inherits from RestorationProblem
-  - Converts patch decisions → pixel decisions internally
+  - Converts patch decisions -> pixel decisions internally
   - Evaluates using existing pixel-level objective functions
   - Returns patch-level constraint (number of patches used)
 
@@ -53,6 +53,7 @@ Created: February 2026
 """
 
 import os
+import warnings
 import numpy as np
 from typing import Dict, Tuple, List
 
@@ -175,6 +176,45 @@ def aggregate_patch_scores_from_pixel_scores(
             all_scores = np.ones_like(all_scores) * 0.5
 
     return np.nan_to_num(all_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def aggregate_patch_pixel_sums(
+    patch_mappings: Dict,
+    restoration_pixel_values: np.ndarray = None,
+    conversion_pixel_values: np.ndarray = None,
+) -> np.ndarray:
+    """Sum a per-pixel quantity (e.g. cost) to one RAW total per patch.
+
+    Unlike aggregate_patch_scores_from_pixel_scores this does NOT normalise the
+    result - the caller needs actual totals (e.g. total cost per patch) to dot-product
+    against a 0/1 decision vector and get a real budget, not a [0, 1] preference score.
+    Returns the same [restoration_patches | conversion_patches] concatenation shape.
+    """
+    restoration_patches = patch_mappings['restoration_patches']
+    conversion_patches = patch_mappings['conversion_patches']
+    n_rest = restoration_patches['n_patches']
+    n_conv = conversion_patches['n_patches']
+
+    rest_sums = np.zeros(n_rest, dtype=np.float64)
+    conv_sums = np.zeros(n_conv, dtype=np.float64)
+
+    if restoration_pixel_values is not None:
+        v = np.asarray(restoration_pixel_values, dtype=np.float64)
+        for pid in range(n_rest):
+            pix = np.asarray(restoration_patches['patch_to_pixels'][pid], dtype=int)
+            pix = pix[(pix >= 0) & (pix < len(v))]
+            if pix.size > 0:
+                rest_sums[pid] = float(np.nansum(v[pix]))
+
+    if conversion_pixel_values is not None:
+        v = np.asarray(conversion_pixel_values, dtype=np.float64)
+        for pid in range(n_conv):
+            pix = np.asarray(conversion_patches['patch_to_pixels'][pid], dtype=int)
+            pix = pix[(pix >= 0) & (pix < len(v))]
+            if pix.size > 0:
+                conv_sums[pid] = float(np.nansum(v[pix]))
+
+    return (np.concatenate([rest_sums, conv_sums]) if n_conv > 0 else rest_sums)
 
 # =============================================================================
 # PATCH DEFINITION AND MAPPING
@@ -408,19 +448,36 @@ class PatchAwareSampling(Sampling):
     
     def __init__(self, patch_mappings, target_pixels, pixel_tolerance=0.05,
                  patch_scores=None, score_temperature=0.25, random_share=0.15,
-                 per_objective_patch_scores=None, patch_region_assignments=None):
+                 per_objective_patch_scores=None, patch_region_assignments=None,
+                 budget_weights=None, exclude_conversion=False):
         super().__init__()
         self.patch_mappings = patch_mappings
+        # exclude_conversion: no conversion objective is in use, so conversion patches change
+        # no objective. They must then neither be drawn nor count toward the budget, or they
+        # silently take ~10 % of it. False (default) keeps every existing caller unchanged.
+        self.exclude_conversion = bool(exclude_conversion)
+        # target_pixels / pixel_tolerance / "budget": for constraint_type='pixel_count'
+        # (default, UNCHANGED) these are pixel counts, tracked via the per-patch pixel
+        # counts computed below. budget_weights is None in that case and every method
+        # falls back to those pixel counts exactly as before. For 'cost_budget',
+        # target_pixels holds a cost value instead (set by
+        # PatchRestorationProblem.__init__), and budget_weights is the matching
+        # per-patch COST SUM vector (aggregate_patch_pixel_sums) - the ONLY thing that
+        # changes; the score/size sampling blend below still uses pixel counts.
         self.target_pixels = target_pixels
         self.pixel_tolerance = pixel_tolerance
+        self.budget_weights = (
+            np.asarray(budget_weights, dtype=np.float64)
+            if budget_weights is not None else None
+        )
         self.patch_scores = patch_scores
         self.score_temperature = float(score_temperature)
         self.random_share = float(np.clip(random_share, 0.0, 1.0))
-        # Burden-sharing: per-patch region assignments (or None → disabled).
+        # Burden-sharing: per-patch region assignments (or None -> disabled).
         # Set by _build_operators only when burden_sharing='yes' and admin data
         # is available; no effect on runs without burden sharing.
         self.patch_region_assignments = patch_region_assignments  # dict or None
-        # per_objective_patch_scores: shape (n_scored_obj, n_patches) — seeds one
+        # per_objective_patch_scores: shape (n_scored_obj, n_patches) - seeds one
         # extreme solution per SCORED objective into the initial population (warm
         # start). Objectives without a per-patch score (e.g. spatial_clustering) are
         # absent and get no warm-seed, avoiding a scan-order placeholder seed.
@@ -450,6 +507,18 @@ class PatchAwareSampling(Sampling):
                                      self.conversion_pixels_per_patch]).astype(np.float64)
         self._min_patch_pixels = max(float(np.min(all_pixels[all_pixels > 0])) if np.any(all_pixels > 0) else 1.0, 1.0)
 
+        # The vector every fill loop tracks against target_pixels. Pixel counts unless
+        # budget_weights (cost sums) were supplied - see the __init__ docstring note.
+        self._budget_vec = (
+            self.budget_weights if self.budget_weights is not None else all_pixels
+        )
+        if self.exclude_conversion:
+            self._budget_vec = self._budget_vec.copy()
+            self._budget_vec[self.n_restoration_patches:] = 0.0
+        self._min_budget_unit = max(
+            float(np.min(self._budget_vec[self._budget_vec > 0]))
+            if np.any(self._budget_vec > 0) else 1.0, 1e-9)
+
         # Precompute static blended weights once; per-iteration renormalization is cheap.
         if self.patch_scores is not None and len(self.patch_scores) == len(all_pixels):
             score_part = _safe_softmax(np.asarray(self.patch_scores, dtype=np.float64),
@@ -464,6 +533,13 @@ class PatchAwareSampling(Sampling):
         else:
             self._base_weights = np.clip(all_pixels, 1e-12, None)
 
+    def _target(self, v):
+        """int() for the default pixel-count path - bit-identical to the
+        pre-cost_budget behaviour, where target_min/max/center were always
+        int-truncated; float for cost_budget, where int() would silently truncate a
+        cost value."""
+        return int(v) if self.budget_weights is None else float(v)
+
     def _candidate_weights(self, candidates: np.ndarray, all_pixels: np.ndarray) -> np.ndarray:
         """Blend quality-driven and size-driven weights to avoid deterministic collapse."""
         if candidates.size == 0:
@@ -471,29 +547,31 @@ class PatchAwareSampling(Sampling):
 
         return np.clip(self._base_weights[candidates], 1e-12, None)
 
-    def _build_extreme_solution(self, score_vec, all_pixels, n_patches):
+    def _build_extreme_solution(self, score_vec, budget_weights, n_patches):
         """Greedily fill budget in descending score order up to target_max.
 
         Returns a binary int array of shape (n_patches,) satisfying the same
-        pixel-count tolerance as normal repair.
+        tolerance as normal repair. `budget_weights` is per-patch pixel counts for
+        constraint_type='pixel_count' (unchanged default) or per-patch cost sums for
+        'cost_budget' - see self._budget_vec / the class docstring note.
         """
-        target_max = int(self.target_pixels * (1 + self.pixel_tolerance))
+        target_max = self._target(self.target_pixels * (1 + self.pixel_tolerance))
         # Break ties randomly: argsort over equal scores otherwise returns patches in
         # index (raster scan) order, which seeds a solid block along the raster's top
-        # edge. Tiny jitter (≪ score spacing) randomises ties without changing the
+        # edge. Tiny jitter (<< score spacing) randomises ties without changing the
         # ranking of genuinely different scores. Deterministic under the run seed.
         jitter = 1e-9 * np.random.random(score_vec.shape[0])
         order = np.argsort(-(score_vec + jitter))
         active = np.zeros(n_patches, dtype=int)
-        current = 0
+        current = 0.0
         for idx in order:
-            patch_pix = int(all_pixels[idx])
-            if patch_pix <= 0:
+            patch_w = float(budget_weights[idx])
+            if patch_w <= 0:
                 continue
-            if current + patch_pix > target_max:
+            if current + patch_w > target_max:
                 continue
             active[idx] = 1
-            current += patch_pix
+            current += patch_w
         return active
 
     def _do(self, problem, n_samples, **kwargs):
@@ -501,13 +579,13 @@ class PatchAwareSampling(Sampling):
         n_patches = self.n_restoration_patches + self.n_conversion_patches
         X = np.zeros((n_samples, n_patches), dtype=int)
 
-        # Combine all patch pixel counts
-        all_pixels = np.concatenate([self.restoration_pixels_per_patch,
-                                     self.conversion_pixels_per_patch])
+        # What every fill loop below tracks against target_pixels: pixel counts unless
+        # cost_budget supplied budget_weights (self._budget_vec, set in __init__).
+        budget_vec = self._budget_vec
 
         target_center = self.target_pixels
-        target_min = int(self.target_pixels * (1 - self.pixel_tolerance))
-        target_max = int(self.target_pixels * (1 + self.pixel_tolerance))
+        target_min = self._target(self.target_pixels * (1 - self.pixel_tolerance))
+        target_max = self._target(self.target_pixels * (1 + self.pixel_tolerance))
 
         # --- Warm seeding: place one extreme solution per objective at the end ---
         # Only seed when there are enough slots for at least one stochastic solution.
@@ -517,33 +595,35 @@ class PatchAwareSampling(Sampling):
             n_extreme = self.per_objective_patch_scores.shape[0]  # typically 3
             for k in range(n_extreme):
                 X[n_samples - n_extreme + k] = self._build_extreme_solution(
-                    self.per_objective_patch_scores[k], all_pixels, n_patches
+                    self.per_objective_patch_scores[k], budget_vec, n_patches
                 )
 
         for i in range(n_samples - n_extreme):
-            # ── Burden-sharing construction ──────────────────────────────────
+            # -- Burden-sharing construction ----------------------------------
             # When enabled, fill each region's patch pool independently up to
             # its fair share of the target budget.  Falls back to the standard
             # global construction if assignments are missing or incomplete.
             if self.patch_region_assignments:
-                active = self._build_burden_shared_solution(all_pixels, n_patches,
+                active = self._build_burden_shared_solution(budget_vec, n_patches,
                                                             target_min, target_max)
                 X[i, active] = 1
                 continue
 
-            # ── Standard score-guided stochastic construction ─────────────
+            # -- Standard score-guided stochastic construction -------------
             # Draw a single weighted permutation of all patches, then walk it
-            # in two phases — one argpartition + one np.random.choice replaces
+            # in two phases - one argpartition + one np.random.choice replaces
             # O(n_patches) individual k=1 sampling calls.
             active = np.zeros(n_patches, dtype=bool)
-            current = 0
+            current = 0.0
 
-            all_w = self._candidate_weights(np.arange(n_patches), all_pixels)
+            # Conversion patches are left out of the draw entirely when excluded.
+            n_draw = self.n_restoration_patches if self.exclude_conversion else n_patches
+            all_w = self._candidate_weights(np.arange(n_draw), budget_vec)
             total_w = all_w.sum()
-            probs_all = all_w / total_w if total_w > 0 else np.full(n_patches, 1.0 / n_patches)
-            perm = np.random.choice(n_patches, size=n_patches, replace=False, p=probs_all)
+            probs_all = all_w / total_w if total_w > 0 else np.full(n_draw, 1.0 / n_draw)
+            perm = np.random.choice(n_draw, size=n_draw, replace=False, p=probs_all)
 
-            # Phase 1: fill to target_min — add patches in weighted-random order.
+            # Phase 1: fill to target_min - add patches in weighted-random order.
             phase2_start = len(perm)
             for j in range(len(perm)):
                 if current >= target_min:
@@ -551,7 +631,7 @@ class PatchAwareSampling(Sampling):
                     break
                 idx = int(perm[j])
                 active[idx] = True
-                current += int(all_pixels[idx])
+                current += float(budget_vec[idx])
 
             # Phase 2: continue toward target_center with feasibility guard and
             # random early stopping (mirrors original 35% stop probability).
@@ -559,25 +639,26 @@ class PatchAwareSampling(Sampling):
                 if current >= target_center:
                     break
                 idx = int(perm[j])
-                patch_pix = int(all_pixels[idx])
-                if current + patch_pix > target_max:
-                    continue  # would overshoot upper tolerance — skip
+                patch_w = float(budget_vec[idx])
+                if current + patch_w > target_max:
+                    continue  # would overshoot upper tolerance - skip
                 if current >= target_min and np.random.random() < 0.35:
                     break
                 active[idx] = True
-                current += patch_pix
+                current += patch_w
 
             X[i, active] = 1
         
         return X
 
-    def _build_burden_shared_solution(self, all_pixels: np.ndarray,
+    def _build_burden_shared_solution(self, budget_weights: np.ndarray,
                                       n_patches: int,
-                                      target_min: int,
-                                      target_max: int) -> np.ndarray:
+                                      target_min,
+                                      target_max) -> np.ndarray:
         """
         Fill patches region-by-region so each region receives an equal share of
-        the pixel budget.  Returns a boolean active mask of length n_patches.
+        the budget. Returns a boolean active mask of length n_patches.
+        `budget_weights` is pixel counts (default) or per-patch cost sums (cost_budget).
 
         Safe fallback: if region info is incomplete, delegates to standard
         global fill.
@@ -589,12 +670,14 @@ class PatchAwareSampling(Sampling):
         n_rest = self.n_restoration_patches
 
         if n_regions == 0:
-            return self._build_global_solution(all_pixels, n_patches, target_min, target_max)
+            return self._build_global_solution(budget_weights, n_patches, target_min, target_max)
 
         # Build per-region patch index lists (restoration + conversion combined).
         region_patches: Dict[int, List[int]] = {r: [] for r in range(n_regions)}
         unassigned: List[int] = []
         for pid in range(n_patches):
+            if self.exclude_conversion and pid >= n_rest:
+                continue
             assign = rest_assign if pid < n_rest else conv_assign
             local_pid = pid if pid < n_rest else pid - n_rest
             region_id = assign.get(local_pid, -1)
@@ -603,7 +686,7 @@ class PatchAwareSampling(Sampling):
             else:
                 unassigned.append(pid)
 
-        target_center = int((target_min + target_max) / 2)
+        target_center = self._target((target_min + target_max) / 2)
         per_region_target = target_center // n_regions
         active = np.zeros(n_patches, dtype=bool)
 
@@ -611,11 +694,11 @@ class PatchAwareSampling(Sampling):
             patches_in_region = np.array(region_patches[region_id], dtype=int)
             if patches_in_region.size == 0:
                 continue
-            r_max = per_region_target + int(per_region_target * self.pixel_tolerance)
-            r_min = max(0, per_region_target - int(per_region_target * self.pixel_tolerance))
-            current = 0
+            r_max = per_region_target + self._target(per_region_target * self.pixel_tolerance)
+            r_min = max(0, per_region_target - self._target(per_region_target * self.pixel_tolerance))
+            current = 0.0
             safety = 0
-            max_steps = int(max(r_max / max(self._min_patch_pixels, 1) * 3.0, 32))
+            max_steps = int(max(r_max / max(self._min_budget_unit, 1) * 3.0, 32))
             available_mask = np.ones(len(patches_in_region), dtype=bool)
 
             while current < r_min and safety < max_steps:
@@ -626,14 +709,14 @@ class PatchAwareSampling(Sampling):
                 idx = int(_sample_without_replacement_weighted(pool, weights, 1)[0])
                 active[idx] = True
                 available_mask[patches_in_region == idx] = False
-                current += int(all_pixels[idx])
+                current += float(budget_weights[idx])
                 safety += 1
 
             while current < per_region_target and safety < max_steps:
                 pool = patches_in_region[available_mask]
                 if pool.size == 0:
                     break
-                feasible = pool[current + all_pixels[pool] <= r_max]
+                feasible = pool[current + budget_weights[pool] <= r_max]
                 if feasible.size == 0:
                     break
                 if current >= r_min and np.random.random() < 0.35:
@@ -642,43 +725,48 @@ class PatchAwareSampling(Sampling):
                 idx = int(_sample_without_replacement_weighted(feasible, weights, 1)[0])
                 active[idx] = True
                 available_mask[patches_in_region == idx] = False
-                current += int(all_pixels[idx])
+                current += float(budget_weights[idx])
                 safety += 1
 
         return active
 
-    def _build_global_solution(self, all_pixels: np.ndarray,
+    def _build_global_solution(self, budget_weights: np.ndarray,
                                n_patches: int,
-                               target_min: int,
-                               target_max: int) -> np.ndarray:
-        """Standard global stochastic fill — used as fallback."""
-        target_center = int((target_min + target_max) / 2)
+                               target_min,
+                               target_max) -> np.ndarray:
+        """Standard global stochastic fill - used as fallback.
+        `budget_weights` is pixel counts (default) or per-patch cost sums (cost_budget)."""
+        target_center = self._target((target_min + target_max) / 2)
         active = np.zeros(n_patches, dtype=bool)
-        current = 0
+        current = 0.0
         safety = 0
-        max_steps = int(max(target_max / max(self._min_patch_pixels, 1) * 3.0, 64))
+        max_steps = int(max(target_max / max(self._min_budget_unit, 1) * 3.0, 64))
         while current < target_min and safety < max_steps:
             candidates = np.where(~active)[0]
+            if self.exclude_conversion:
+                candidates = candidates[candidates < self.n_restoration_patches]
             if candidates.size == 0:
                 break
-            weights = self._candidate_weights(candidates, all_pixels)
+            weights = self._candidate_weights(candidates, budget_weights)
             idx = int(_sample_without_replacement_weighted(candidates, weights, 1)[0])
             active[idx] = True
-            current += int(all_pixels[idx])
+            current += float(budget_weights[idx])
             safety += 1
         while current < target_center and safety < max_steps:
             candidates = np.where(~active)[0]
+            if self.exclude_conversion:
+                candidates = candidates[candidates < self.n_restoration_patches]
             if candidates.size == 0:
                 break
-            feasible = candidates[current + all_pixels[candidates] <= target_max]
+            feasible = candidates[current + budget_weights[candidates] <= target_max]
             if feasible.size == 0:
                 break
             if current >= target_min and np.random.random() < 0.35:
                 break
-            weights = self._candidate_weights(feasible, all_pixels)
+            weights = self._candidate_weights(feasible, budget_weights)
             idx = int(_sample_without_replacement_weighted(feasible, weights, 1)[0])
             active[idx] = True
-            current += int(all_pixels[idx])
+            current += float(budget_weights[idx])
             safety += 1
         return active
 
@@ -692,20 +780,32 @@ class PatchRepair(Repair):
                  per_objective_patch_scores=None, ref_dirs=None,
                  score_obj_indices=None,
                  patch_region_assignments=None,
-                 capture_diag=False, n_generations=None, n_capture=5, diag_dir=None):
+                 capture_diag=False, n_generations=None, n_capture=5, diag_dir=None,
+                 budget_weights=None, exclude_conversion=False):
         super().__init__()
+        # See PatchAwareSampling: with no conversion objective, conversion patches are held at 0
+        # and never count toward the budget. False (default) keeps existing behaviour.
+        self.exclude_conversion = bool(exclude_conversion)
         self.constraint_type = constraint_type
         self.target_value = target_value
         self.patch_mappings = patch_mappings
         self.pixel_tolerance = pixel_tolerance
         self.patch_scores = patch_scores
+        # budget_weights: per-patch COST SUMS for constraint_type='cost_budget'. None
+        # (default, UNCHANGED) means _enforce_budget tracks pixel counts exactly as the
+        # old _enforce_pixel_count always did - see that method and _target below.
+        self.budget_weights = (
+            np.asarray(budget_weights, dtype=np.float64)
+            if budget_weights is not None else None
+        )
         self.score_temperature = float(score_temperature)
         self.top_k = int(max(2, top_k))
         # per_objective_patch_scores: shape (n_scored_obj, n_patches), one row per
         # objective that HAS a per-patch score.  ref_dirs: shape (n_ref_dirs, n_obj).
         # score_obj_indices maps each score row to its column in the n_obj weight
-        # vector, so objectives without a score (e.g. spatial_clustering) are simply
-        # excluded from the blend rather than given a degenerate placeholder row.
+        # vector, so objectives without a score are excluded from the blend rather than
+        # given a degenerate placeholder row. Excluding them is only safe while 2+ rows
+        # remain - see the single-row guard below.
         self.per_objective_patch_scores = (
             np.asarray(per_objective_patch_scores, dtype=np.float64)
             if per_objective_patch_scores is not None else None
@@ -718,6 +818,19 @@ class PatchRepair(Repair):
             np.asarray(ref_dirs, dtype=np.float64)
             if ref_dirs is not None else None
         )
+        # A single score row makes the blend in _do an identity: it computes w * row and
+        # rescales to [0, 1], which is the same vector for EVERY reference direction (and
+        # all-zero, hence uniform-random repair, wherever that objective's weight is 0).
+        # Fall back to the global score explicitly rather than appearing direction-aware.
+        if (self.per_objective_patch_scores is not None
+                and self.per_objective_patch_scores.shape[0] < 2):
+            warnings.warn(
+                "PatchRepair: direction-aware repair needs >= 2 per-objective score rows, "
+                "got %d, so it cannot vary by reference direction. Falling back to the "
+                "global patch score. Set scenario_params['direction_aware_scores']=True to "
+                "give restoration_benefit and spatial_clustering their own score rows."
+                % self.per_objective_patch_scores.shape[0])
+            self.per_objective_patch_scores = None
 
         # Precompute pixels per patch for efficiency
         if patch_mappings is not None:
@@ -746,7 +859,7 @@ class PatchRepair(Repair):
                 os.makedirs(self.diag_dir, exist_ok=True)
         else:
             self._capture_gens = set()
-        # Burden-sharing: per-patch region assignments (or None → disabled).
+        # Burden-sharing: per-patch region assignments (or None -> disabled).
         # No effect on runs without burden sharing.
         self.patch_region_assignments = patch_region_assignments if patch_region_assignments else None
     
@@ -802,18 +915,23 @@ class PatchRepair(Repair):
             if self.constraint_type == 'patch_count':
                 X[i] = enforce_patch_count(X[i], self.target_value)
 
-            elif self.constraint_type == 'pixel_count':
-                X[i] = self._enforce_pixel_count(
+            elif self.constraint_type in ('pixel_count', 'cost_budget'):
+                if self.exclude_conversion:
+                    X[i, n_restoration_patches:] = 0
+                X[i] = self._enforce_budget(
                     X[i],
                     n_restoration_patches,
                     self.target_value,
                     override_score_vec=score_vec_i,
                 )
 
-            # ── Burden-sharing second pass ─────────────────────────────────
+            # -- Burden-sharing second pass ---------------------------------
             # Rebalance pixels across regions after global count enforcement.
             # Only runs when patch_region_assignments is set; completely skipped
-            # otherwise, so non-burden-sharing runs are unaffected.
+            # otherwise, so non-burden-sharing runs are unaffected. Pixel-count only:
+            # _balance_regions is not yet generalised to cost_budget, so a
+            # burden_sharing + cost_budget run silently skips this second pass rather
+            # than misapplying pixel-based balancing to a cost budget.
             if self.patch_region_assignments and self.constraint_type == 'pixel_count':
                 X[i] = self._balance_regions(X[i], n_restoration_patches, self.target_value)
 
@@ -865,7 +983,7 @@ class PatchRepair(Repair):
         more than ``pixel_tolerance`` from its fair share
         (``target_pixels / n_regions``).  Over-represented regions lose their
         lowest-scored patches; under-represented regions gain highest-scored
-        unselected patches — without changing the global pixel total.
+        unselected patches - without changing the global pixel total.
 
         Safe: returns the input unchanged if region data is absent.
         """
@@ -893,9 +1011,11 @@ class PatchRepair(Repair):
                      if self.patch_scores is not None and len(self.patch_scores) == n_patches
                      else None)
 
-        # Build region → patch indices mapping once
+        # Build region -> patch indices mapping once
         region_patches: Dict[int, List[int]] = {r: [] for r in range(n_regions)}
         for pid in range(n_patches):
+            if self.exclude_conversion and pid >= n_restoration_patches:
+                continue
             assign = rest_assign if pid < n_restoration_patches else conv_assign
             local_pid = pid if pid < n_restoration_patches else pid - n_restoration_patches
             rid = assign.get(local_pid, -1)
@@ -911,7 +1031,7 @@ class PatchRepair(Repair):
             diff = region_pixels - int(per_region_target)
 
             if diff > tolerance_pix:
-                # Over-represented — remove lowest-scored active patches
+                # Over-represented - remove lowest-scored active patches
                 active_in_region = patches[result[patches] == 1]
                 if active_in_region.size == 0:
                     continue
@@ -926,7 +1046,7 @@ class PatchRepair(Repair):
                     region_pixels -= int(all_patch_sizes[pid])
 
             elif diff < -tolerance_pix:
-                # Under-represented — add highest-scored inactive patches
+                # Under-represented - add highest-scored inactive patches
                 inactive_in_region = patches[result[patches] == 0]
                 if inactive_in_region.size == 0:
                     continue
@@ -942,9 +1062,17 @@ class PatchRepair(Repair):
 
         return result
 
-    def _enforce_pixel_count(self, patch_decisions, n_restoration_patches, target_pixels,
-                             override_score_vec=None):
-        """Enforce pixel count by adding/removing patches within tolerance.
+    def _enforce_budget(self, patch_decisions, n_restoration_patches, target_pixels,
+                        override_score_vec=None):
+        """Enforce pixel_count or cost_budget by adding/removing patches within tolerance.
+
+        For constraint_type='pixel_count' (default, UNCHANGED) this tracks per-patch
+        PIXEL COUNTS exactly as the original _enforce_pixel_count always did - the
+        lazily-cached `self._cached_all_patch_sizes` path below is untouched.
+        For 'cost_budget' it tracks `self.budget_weights` (per-patch cost sums) instead,
+        the only thing that differs. Renamed from _enforce_pixel_count when cost_budget
+        was added; no other caller exists (grep confirmed) so this is a pure rename plus
+        an added branch, not a behaviour change for pixel_count/patch_count.
 
         Parameters
         ----------
@@ -953,18 +1081,27 @@ class PatchRepair(Repair):
             caller (_do) to supply a per-individual blended score vector.
         """
         result = patch_decisions.copy()
-        min_pix = int(target_pixels * (1 - self.pixel_tolerance))
-        max_pix = int(target_pixels * (1 + self.pixel_tolerance))
+        discrete = self.budget_weights is None      # pixel_count: keep exact old ints
+        min_pix = int(target_pixels * (1 - self.pixel_tolerance)) if discrete \
+            else float(target_pixels * (1 - self.pixel_tolerance))
+        max_pix = int(target_pixels * (1 + self.pixel_tolerance)) if discrete \
+            else float(target_pixels * (1 + self.pixel_tolerance))
 
-        # Use cached per-patch pixel vector (built once, reused across all calls).
-        if self._cached_all_patch_sizes is None or len(self._cached_all_patch_sizes) != len(result):
-            self._cached_all_patch_sizes = np.concatenate([
-                np.array([self.restoration_patch_pixel_counts.get(i, 0) for i in range(n_restoration_patches)], dtype=np.int64),
-                np.array([self.conversion_patch_pixel_counts.get(i, 0) for i in range(len(result) - n_restoration_patches)], dtype=np.int64),
-            ])
-        all_patch_sizes = self._cached_all_patch_sizes
+        if self.budget_weights is not None:
+            weights = self.budget_weights
+        else:
+            # Use cached per-patch pixel vector (built once, reused across all calls).
+            if self._cached_all_patch_sizes is None or len(self._cached_all_patch_sizes) != len(result):
+                self._cached_all_patch_sizes = np.concatenate([
+                    np.array([self.restoration_patch_pixel_counts.get(i, 0) for i in range(n_restoration_patches)], dtype=np.int64),
+                    np.array([self.conversion_patch_pixel_counts.get(i, 0) for i in range(len(result) - n_restoration_patches)], dtype=np.int64),
+                ])
+                if self.exclude_conversion:
+                    self._cached_all_patch_sizes[n_restoration_patches:] = 0
+            weights = self._cached_all_patch_sizes
 
-        current = int(np.dot(result.astype(np.int64), all_patch_sizes))
+        current = int(np.dot(result.astype(np.int64), weights)) if discrete \
+            else float(np.dot(result.astype(np.float64), weights))
 
         if min_pix <= current <= max_pix:
             return result
@@ -975,10 +1112,12 @@ class PatchRepair(Repair):
         elif self.patch_scores is not None and len(self.patch_scores) == len(result):
             score_vec = np.asarray(self.patch_scores, dtype=np.float64)
 
-        avg_patch = float(np.mean(all_patch_sizes[all_patch_sizes > 0])) if np.any(all_patch_sizes > 0) else 1.0
+        avg_patch = float(np.mean(weights[weights > 0])) if np.any(weights > 0) else 1.0
 
         if current < min_pix:
             remaining = np.where(result == 0)[0]
+            if self.exclude_conversion:
+                remaining = remaining[remaining < n_restoration_patches]
             if remaining.size > 0:
                 # Estimate patches needed; build a pool large enough with one argpartition.
                 n_needed = max(int(np.ceil((min_pix - current) / avg_patch)), 1)
@@ -986,7 +1125,7 @@ class PatchRepair(Repair):
                 if score_vec is not None:
                     vals = -score_vec[remaining]
                 else:
-                    vals = -all_patch_sizes[remaining].astype(np.float64)
+                    vals = -weights[remaining].astype(np.float64)
                 if pool_size < len(remaining):
                     pool_idx = remaining[np.argpartition(vals, pool_size - 1)[:pool_size]]
                 else:
@@ -996,7 +1135,7 @@ class PatchRepair(Repair):
                 if score_vec is not None:
                     pool_scores = score_vec[pool_idx]
                 else:
-                    pool_scores = all_patch_sizes[pool_idx].astype(np.float64)
+                    pool_scores = weights[pool_idx].astype(np.float64)
                 probs = _safe_softmax(pool_scores, temperature=self.score_temperature)
                 order = pool_idx[np.random.choice(len(pool_idx), size=len(pool_idx),
                                                   replace=False, p=probs)]
@@ -1005,7 +1144,7 @@ class PatchRepair(Repair):
                     if current >= min_pix:
                         break
                     result[chosen] = 1
-                    current += int(all_patch_sizes[chosen])
+                    current += weights[chosen] if not discrete else int(weights[chosen])
         else:
             active = np.where(result == 1)[0]
             if active.size > 0:
@@ -1015,17 +1154,17 @@ class PatchRepair(Repair):
                 if score_vec is not None:
                     vals = score_vec[active]
                 else:
-                    vals = all_patch_sizes[active].astype(np.float64)
+                    vals = weights[active].astype(np.float64)
                 if pool_size < len(active):
                     pool_idx = active[np.argpartition(vals, pool_size - 1)[:pool_size]]
                 else:
                     pool_idx = active
 
-                # Softmax-weight the pool (inverted: lowest score → most likely removed).
+                # Softmax-weight the pool (inverted: lowest score -> most likely removed).
                 if score_vec is not None:
                     pool_scores = -score_vec[pool_idx]
                 else:
-                    pool_scores = -all_patch_sizes[pool_idx].astype(np.float64)
+                    pool_scores = -weights[pool_idx].astype(np.float64)
                 probs = _safe_softmax(pool_scores, temperature=self.score_temperature)
                 order = pool_idx[np.random.choice(len(pool_idx), size=len(pool_idx),
                                                   replace=False, p=probs)]
@@ -1034,7 +1173,7 @@ class PatchRepair(Repair):
                     if current <= max_pix:
                         break
                     result[chosen] = 0
-                    current -= int(all_patch_sizes[chosen])
+                    current -= weights[chosen] if not discrete else int(weights[chosen])
 
         return result
 

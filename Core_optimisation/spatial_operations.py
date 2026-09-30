@@ -961,12 +961,22 @@ def grow_region_plan(nbr, n_rest, target_k, n_seeds, scores, mode, rng):
         _push_neighbours(seed)
         return True
 
-    count = 0
-    for _ in range(max(1, int(n_seeds))):
-        if count >= target_k:
-            break
-        if _add_seed():
-            count += 1
+    # Initial seeds in one batch: a weighted draw without replacement (Gumbel top-k)
+    # is distributionally identical to drawing them one at a time, but costs one
+    # O(n_rest) pass instead of one per seed (thousands of seeds at CH scale).
+    n_init = min(max(1, int(n_seeds)), int(target_k), n_rest)
+    if mode == 'scored':
+        w = scores.astype(np.float64)
+        w = w - w.min()
+        with np.errstate(divide='ignore'):
+            keys = np.log(w) + rng.gumbel(size=n_rest) if w.sum() > 0 else rng.random(n_rest)
+        init = np.argpartition(-keys, n_init - 1)[:n_init] if n_init < n_rest else np.arange(n_rest)
+    else:
+        init = rng.choice(n_rest, size=n_init, replace=False)
+    selected[init] = True
+    for seed in init:
+        _push_neighbours(int(seed))
+    count = int(init.size)
 
     while count < target_k:
         if not heap:
@@ -1508,7 +1518,10 @@ class RegionEvolveMutation(RegionGrowingMutation):
             elif move == 'spawn':
                 anchor = self._random_unselected(sel, rng)
                 if anchor is not None:
-                    s = max(1, int(0.05 * k))
+                    # Spawn a region of the plan's mean region size (a fixed 5% of the
+                    # budget was ~48x an average CH region and pushed plans to the
+                    # tolerance edge).
+                    s = max(1, int(sel.sum()) // max(1, len(comps)))
                     grown = grow_regions_from_seeds(self.nbr, n_rest, s, [anchor],
                                                     scores, mode, rng, avoid=sel,
                                                     temperature=temperature)
