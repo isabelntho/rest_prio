@@ -13,7 +13,7 @@ import pickle
 import subprocess
 import numpy as np
 from datetime import datetime
-from .paths import OUTPUT_DIR, MULTISEED_DIR
+from .paths import OUTPUTS, MULTISEED_DIR
 try:
     import scipy.stats
 except ImportError:
@@ -32,7 +32,7 @@ def _get_git_hash():
         return "no_git"
 
 
-def _append_to_registry(entry, output_dir=str(OUTPUT_DIR)):
+def _append_to_registry(entry, output_dir=str(OUTPUTS)):
     """Append a single-line JSON entry to run_registry.jsonl in output_dir.
     Write failures are silently ignored so they never break a run.
     """
@@ -43,7 +43,7 @@ def _append_to_registry(entry, output_dir=str(OUTPUT_DIR)):
     except Exception:
         pass
 
-def create_optimization_report(results, output_dir=str(OUTPUT_DIR), verbose=True, run_label="", run_timestamp=None):
+def create_optimization_report(results, output_dir=str(OUTPUTS), verbose=True, run_label="", run_timestamp=None):
     """
     Create a comprehensive optimization report including problem definition,
     algorithm details, and evolution tracking for sharing with colleagues.
@@ -486,7 +486,7 @@ def create_optimization_report(results, output_dir=str(OUTPUT_DIR), verbose=True
     
     return report_filename
 
-def create_evolution_tracking_report(results, output_dir=str(OUTPUT_DIR), verbose=True, run_label="", run_timestamp=None):
+def create_evolution_tracking_report(results, output_dir=str(OUTPUTS), verbose=True, run_label="", run_timestamp=None):
     """
     Create a detailed report tracking optimization evolution over generations.
     Useful for understanding convergence patterns and algorithm behavior.
@@ -711,14 +711,14 @@ def create_evolution_tracking_report(results, output_dir=str(OUTPUT_DIR), verbos
 def save_results_with_reports(problem_or_results, res=None, initial_conditions=None, scenario_params=None,
                                         pop_size=None, n_generations=None, total_time=None, hv_value=None,
                                         ecosystem='unknown', region='unknown', experiment_id=None, random_seed=None,
-                                        output_dir=str(OUTPUT_DIR), verbose=True, include_reports=True, include_debug=False,
+                                        output_dir=str(OUTPUTS), verbose=True, include_reports=True, include_debug=False,
                                         run_label="", r_export_parent=None):
     """
      Save optimization results with comprehensive reporting.
 
      Supports two calling styles:
      1) New style (preferred):
-         save_results_with_reports(results_dict, output_dir=str(OUTPUT_DIR), verbose=True)
+         save_results_with_reports(results_dict, output_dir=str(OUTPUTS), verbose=True)
      2) Legacy style:
          save_results_with_reports(problem, res, initial_conditions, scenario_params,
                                             pop_size, n_generations, total_time, hv_value, ...)
@@ -836,7 +836,7 @@ def save_results_with_reports(problem_or_results, res=None, initial_conditions=N
         'results_df': None # This was added in resto_anom, so we keep it for compatibility
     }
 
-def save_parameter_summary(output_dir=str(OUTPUT_DIR), n_samples_per_param=3, random_seed=42, verbose=True):
+def save_parameter_summary(output_dir=str(OUTPUTS), n_samples_per_param=3, random_seed=42, verbose=True):
     """
     Save a summary of parameter ranges and sampled values.
     
@@ -907,7 +907,7 @@ def save_parameter_summary(output_dir=str(OUTPUT_DIR), n_samples_per_param=3, ra
     
     return summary_filename
 
-def save_scenario_results(results, output_dir=str(OUTPUT_DIR), verbose=True, include_reports=True, include_debug=False, run_label="", r_export_parent=None):
+def save_scenario_results(results, output_dir=str(OUTPUTS), verbose=True, include_reports=True, include_debug=False, run_label="", r_export_parent=None):
     """
     Save single scenario optimization results to files with optional comprehensive reporting.
     
@@ -1077,7 +1077,7 @@ def save_scenario_results(results, output_dir=str(OUTPUT_DIR), verbose=True, inc
 
     return generated_files
 
-def save_combined_results(combined_results, output_dir=str(OUTPUT_DIR), verbose=True, run_label=""):
+def save_combined_results(combined_results, output_dir=str(OUTPUTS), verbose=True, run_label=""):
     """
     Save combined multi-scenario results.
     

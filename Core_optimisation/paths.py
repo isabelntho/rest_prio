@@ -16,13 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Root of the consolidated input-data tree (rasters, anomaly scenarios, prep scripts).
 DATA_DIR = PROJECT_ROOT / "data"
 
-# Root of the consolidated output tree.
+# Root of the consolidated output tree. Also the base passed as `output_dir`
+# to the save/report functions.
 OUTPUTS = PROJECT_ROOT / "outputs"
-
-# Base passed as `output_dir` to the save/report functions. Those functions create
-# results_files/, summary_files/, optimisation_reports/, evolution_reports/, r_inputs/,
-# intermediate_results/, and run_registry.jsonl *inside* this base.
-OUTPUT_DIR = OUTPUTS
 
 # Directories not created relative to `output_dir`, so they need explicit paths.
 LOGS_DIR = OUTPUTS / "logs"
@@ -30,7 +26,7 @@ MULTISEED_DIR = OUTPUTS / "multi_seed_results"
 PATCH_TESTS_DIR = OUTPUTS / "patch_tests"
 FIGS_DIR = OUTPUTS / "figs"
 
-# Convenience sub-locations under OUTPUT_DIR, for callers that build paths directly.
+# Convenience sub-locations under OUTPUTS, for callers that build paths directly.
 RESULTS_DIR = OUTPUTS / "results_files"
 SUMMARY_DIR = OUTPUTS / "summary_files"
 OPTIMISATION_REPORTS_DIR = OUTPUTS / "optimisation_reports"

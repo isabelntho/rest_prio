@@ -34,7 +34,7 @@ Created: May 2026
 import time as _time
 import sys
 import os
-from Core_optimisation.paths import OUTPUT_DIR as OUTPUTS_BASE, LOGS_DIR
+from Core_optimisation.paths import OUTPUTS as OUTPUTS_BASE, LOGS_DIR
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION

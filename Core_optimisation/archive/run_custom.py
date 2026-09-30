@@ -23,10 +23,10 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "3obj_with_benefitcorr_pixscattered"
+RUN_LABEL = "CH_3obj_lsc"
 
 # Region used for validation reference in load_initial_conditions
-REGION = "Bern"
+REGION = "CH"
 
 # Choose scenario mode:
 #   "custom"         runs exactly one scenario using custom_scenario_params
@@ -48,8 +48,8 @@ CONDITION_SCENARIO = "global_all"
 # Seeds used by both condition_grid and policy_grid modes.
 #   List[int] - runs each scenario/variant once per seed; labels: <name>_seed<n>
 #   None       - runs each scenario/variant once using RANDOM_SEED; labels: <name>
-#SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
-SEEDS = 101
+SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
+#SEEDS = 101
 print(f"\n=== RESTORATION OPTIMIZATION FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
 
@@ -57,25 +57,40 @@ log_path = setup_logger(log_dir=str(LOGS_DIR), run_label=f"{ECOSYSTEM_TO_RUN}_{R
 if log_path:
     print(f"Verbose output -> {log_path}")
 
-OBJECTIVES = ["restoration_benefit", "spatial_clustering", "cost"]  # iEMSs headline objectives
+OBJECTIVES = ["restoration_benefit", "landscape_context", "cost"]  # iEMSs headline objectives
 #OBJECTIVES = ["abiotic", "biotic", "cost"]
 #["restoration_potential", "cost", "es_future_val", "es_future_robustness"] # test ES future value as an objective
 # Available names + what each means: see all_objectives in data_loader.py.
 # NB: the "spatial_clustering" objective is distinct from the custom_scenario_params
 # 'spatial_clustering' knob below, which only soft-biases sampling.
-SAMPLE_FRACTION = None
+SAMPLE_FRACTION = 0.8
 SAMPLE_SEED = 42
 POP_SIZE = 92 #previously 50?
 N_GENERATIONS = 150
 RANDOM_SEED = 101 #42
 N_SAMPLES_PER_PARAM = 3
 N_PARTITIONS = 12#for 3 objectives 12 # for 4 objectives 6
-WARM_SEEDING = False
+# In PATCH mode this flag gates exactly one thing: whether PatchRepair receives the
+# per-objective score rows, i.e. whether repair is direction-aware. It adds no warm
+# seeds - PatchAwareSampling seeds one greedy extreme per scored objective regardless.
+# (In pixel mode it still controls warm-start seeding, see resto_anom.py:2182.)
+WARM_SEEDING = True
 # Expected number of bitflips per individual per generation (k in prob_var = k / n_var).
 # None keeps the historical default of 200. Increase for more exploration, decrease to
 # converge faster (at the risk of premature convergence).
 MUTATION_FLIP_COUNT = None  # e.g. 100, 200, 400
 #previously n partitions 12, pop size 50
+
+# Hypervolume early-stopping patience forwarded to run_optimization_instance.
+#   None              keep its default (15) - early stopping ON.
+#   N_GENERATIONS + 1 early stopping OFF, so every run gets the SAME generation
+#                     budget. Use this whenever runs are being compared: a run that
+#                     stops at generation 20 has a smaller front than one that ran
+#                     to 100 for reasons that have nothing to do with the scenario.
+HV_PATIENCE = None
+# Splatted into every run_optimization_instance call so HV_PATIENCE means the same
+# thing on every path; empty dict = let the function's own default stand.
+_HV_KW = {} if HV_PATIENCE is None else {"hv_patience": HV_PATIENCE}
 
 # Custom single scenario parameters (only used when SCENARIO_MODE == "custom")
 custom_scenario_params = {
@@ -84,8 +99,30 @@ custom_scenario_params = {
     "biotic_effect": 0.01,
     "abiotic_effect": 0.01,
     "normalize_objectives": True,
-    "patch_score_temperature": 2.0,
+    # Normalisation reference: "theoretical" (landscape-wide maxima) or "attainable"
+    # (largest |raw| a budget-feasible plan reaches). See RestorationProblem.__init__.
+    "objective_scaling": "attainable",
+    # With patch_score_transform="rank" the scores are uniform on [0, 1], so this is an
+    # exact knob: the best patch is exp(1/T) times likelier to be drawn than the worst.
+    # T=2.0 gives only 1.65x (what the old min-max scores effectively delivered);
+    # T=0.5 gives 7.4x. Set T = 1/ln(ratio) to target a specific ratio.
+    "patch_score_temperature": 0.5,
     "patch_repair_top_k": 100,
+    # --- operator fixes: all three default OFF, so older runs stay reproducible ---
+    # Respace the aggregated patch score by rank. The raw score is skewed, so min-max
+    # normalisation leaves most patches nearly tied and only the tail distinguishable;
+    # every individual is then repaired by the same hard top-k cut, which is what
+    # produced the 64.8% shared core. Rank rather than z-score so the pressure does not
+    # depend on the layer's skew. See _build_operators.
+    "patch_score_transform": "rank",
+    # Weight on cost in the repair score, as rank(anomaly) - w * rank(cost), both in
+    # [0, 1] so w is a true relative weight. 0.0 keeps the historical 1e-6 tie-breaker,
+    # which leaves the ranking effectively pure anomaly (cost sd is 0.02% of anomaly sd).
+    "repair_cost_weight": 1.0,
+    # Give restoration_benefit and spatial_clustering per-patch score rows. Without
+    # them this objective set yields ONE row, and PatchRepair's direction blend returns
+    # the same vector for every reference direction. See _map_objectives_to_pixel_scores.
+    "direction_aware_scores": True,
     "burden_sharing": "no",
     # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
     # rp_threshold is the "good state" cutoff / reference level for the latter two.
@@ -177,8 +214,8 @@ FACTORIAL_POLICIES = {
 }
 
 # Patch approach settings
-USE_PATCH_APPROACH = False
-PATCH_SIZE = 2
+USE_PATCH_APPROACH = True
+PATCH_SIZE = 3
 PATCH_CONSTRAINT_TYPE = 'pixel_count'
 PIXEL_TOLERANCE = 0.05#.15
 
@@ -189,6 +226,11 @@ AGGREGATION_FACTOR = None
 # Set to True to save per-generation population snapshots for animation
 # Output: intermediate_results/X_history_{timestamp}.npz  shape=(n_gens, pop_size, n_var) int8
 SAVE_SNAPSHOTS = False
+
+# Restrict snapshots to these algorithm.n_gen values (1-indexed) instead of every
+# generation, e.g. (1, 11, 26, 51, 101) for gens 0/10/25/50/100. None = every
+# generation (X_history can reach tens of GB at this run's pop/pixel count).
+SNAPSHOT_GENERATIONS = None
 
 # Set to True to capture paired pre-repair vs post-repair genotype/phenotype
 # diversity at a few evenly-spaced generations (pixel mode / AdaptiveRepair only).
@@ -215,11 +257,13 @@ run_config = {
     "n_generations": N_GENERATIONS,
     "random_seed": RANDOM_SEED,
     "n_samples_per_param": N_SAMPLES_PER_PARAM,
+    "hv_patience": HV_PATIENCE,
     "use_patch_approach": USE_PATCH_APPROACH,
     "patch_size": PATCH_SIZE,
     "patch_constraint_type": PATCH_CONSTRAINT_TYPE,
     "pixel_tolerance": PIXEL_TOLERANCE,
     "save_snapshots": SAVE_SNAPSHOTS,
+    "snapshot_generations": SNAPSHOT_GENERATIONS,
     "aggregation_factor": AGGREGATION_FACTOR,
     "custom_scenario_params": custom_scenario_params,
     "seeds": SEEDS,
@@ -331,6 +375,7 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                snapshot_generations=SNAPSHOT_GENERATIONS,
                                 capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                 n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
@@ -339,6 +384,7 @@ def _run():
                                 run_config=_grid_config,
                                 r_export_parent=_grid_r_parent,
                                 mutation_flip_count=MUTATION_FLIP_COUNT,
+                                **_HV_KW,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_label] = _item_elapsed
@@ -426,6 +472,7 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                snapshot_generations=SNAPSHOT_GENERATIONS,
                                 capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                 n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
@@ -434,6 +481,7 @@ def _run():
                                 run_config=_grid_config,
                                 r_export_parent=_pg_r_parent,
                                 mutation_flip_count=MUTATION_FLIP_COUNT,
+                                **_HV_KW,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed
@@ -481,6 +529,7 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                snapshot_generations=SNAPSHOT_GENERATIONS,
                                 capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                 n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
@@ -489,6 +538,7 @@ def _run():
                                 run_config=_grid_config,
                                 r_export_parent=_pg_r_parent,
                                 mutation_flip_count=MUTATION_FLIP_COUNT,
+                                **_HV_KW,
                             )
                             _item_elapsed = time.perf_counter() - _item_start
                             _grid_times[_run_lbl] = _item_elapsed
@@ -599,6 +649,7 @@ def _run():
                                             patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                             pixel_tolerance=PIXEL_TOLERANCE,
                                             save_snapshots=SAVE_SNAPSHOTS,
+                                            snapshot_generations=SNAPSHOT_GENERATIONS,
                                             capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                             n_capture_gens=N_CAPTURE_GENS,
                                             n_partitions=N_PARTITIONS,
@@ -607,6 +658,7 @@ def _run():
                                             run_config=_grid_config,
                                             r_export_parent=_grid_r_parent,
                                             mutation_flip_count=MUTATION_FLIP_COUNT,
+                                            **_HV_KW,
                                         )
                                         _item_elapsed = time.perf_counter() - _item_start
                                         _grid_times[_run_lbl] = _item_elapsed
@@ -655,6 +707,7 @@ def _run():
                     patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                     pixel_tolerance=PIXEL_TOLERANCE,
                     save_snapshots=SAVE_SNAPSHOTS,
+                    snapshot_generations=SNAPSHOT_GENERATIONS,
                     capture_repair_diag=CAPTURE_REPAIR_DIAG,
                     n_capture_gens=N_CAPTURE_GENS,
                     n_partitions=N_PARTITIONS,
@@ -662,6 +715,7 @@ def _run():
                     run_label=RUN_LABEL,
                     run_config=run_config,
                     mutation_flip_count=MUTATION_FLIP_COUNT,
+                    **_HV_KW,
                 )
 
             if SCENARIO_MODE not in ("condition_grid", "policy_grid", "factorial"):

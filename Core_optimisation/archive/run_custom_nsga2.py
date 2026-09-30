@@ -25,11 +25,11 @@ import os
 import time
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from .resto_anom import run_optimization_instance, main
-from .data_loader import load_initial_conditions
-from .grid_parallel import run_tag, run_factorial_cell, run_custom_seed
-from .logger_setup import setup_logger
-from .paths import LOGS_DIR, R_INPUTS_DIR, DATA_DIR
+from ..resto_anom import run_optimization_instance, main
+from ..data_loader import load_initial_conditions
+from ..grid_parallel import run_tag, run_factorial_cell, run_custom_seed
+from ..logger_setup import setup_logger
+from ..paths import LOGS_DIR, R_INPUTS_DIR, DATA_DIR
 
 # Algorithm selector passed to run_optimization_instance. "nsga2" uses NSGA-II
 # with an explicit POP_SIZE (below).
@@ -45,10 +45,10 @@ ECOSYSTEM_TO_RUN = "combined"
 # Short human-readable label describing what this run is testing.
 # Used in output filenames and the run_registry.jsonl log.
 # Examples: "baseline", "patch_size2_highbudget", "testing_new_repair"
-RUN_LABEL = "zones_loo_factorial"
+RUN_LABEL = "ch_patch_long"
 
 # Region used for validation reference in load_initial_conditions
-REGION = "Bern"
+REGION = "CH" #Bern
 
 # Choose scenario mode:
 #   "custom"         runs exactly one scenario using custom_scenario_params
@@ -58,7 +58,7 @@ REGION = "Bern"
 #   "policy_grid"    runs each entry in POLICY_VARIANTS once against CONDITION_SCENARIO
 #   "factorial"      fully-crossed design over FACTORIAL_FORMS x FACTORIAL_SCALINGS x
 #                    FACTORIAL_CONSTRUCTIONS x FACTORIAL_POLICIES x SEEDS (iEMSs Block 4)
-SCENARIO_MODE = "factorial"
+SCENARIO_MODE = "custom"
 
 # Which family of tags "condition_grid" mode sweeps (see _run_condition_grid).
 #   "weighting_vertex"  the original 13 rule-based vertices: w_flat, w_cat and the 11
@@ -99,7 +99,6 @@ CONDITION_SCENARIO = "global_all"
 # Seeds used by both condition_grid and policy_grid modes.
 #   List[int] - runs each scenario/variant once per seed; labels: <name>_seed<n>
 #   None       - runs each scenario/variant once using RANDOM_SEED; labels: <name>
-#SEEDS = [101, 102, 103, 104, 105] # 5 seed replicates (iEMSs run matrix, Block 0)
 SEEDS = [101, 102, 103, 104, 105]  # single-seed "quick" grid (list so condition_grid can iterate it)
 print(f"\n=== RESTORATION OPTIMIZATION (NSGA-II, 2-OBJ) FOR {ECOSYSTEM_TO_RUN.upper()} ECOSYSTEM, REGION {REGION} ===")
 print(f"Scenario mode: {SCENARIO_MODE}")
@@ -121,12 +120,12 @@ SAMPLE_SEED = 42
 # from N_PARTITIONS). N_PARTITIONS is left defined for API compatibility but is
 # unused when ALGORITHM == "nsga2".
 POP_SIZE = 100
-N_GENERATIONS = 150
+N_GENERATIONS = 300
 # Worker PROCESSES for the grid modes (parallelises whole optimisation instances:
 # one task per condition tag in condition_grid, one task per (tag, seed) cell in
 # factorial). 1 = sequential in-process fallback. Bound by RAM, not cores - each
 # concurrent run holds its own ~1.3M-pixel rasters.
-GRID_WORKERS = 5
+GRID_WORKERS = 1
 RANDOM_SEED = 101
 # In "custom" mode, a non-None SEEDS list replicates the single run once per seed (labels
 # <RUN_LABEL>_seed<n>); SEEDS=None runs once at RANDOM_SEED. The grid modes always iterate
@@ -136,15 +135,16 @@ N_SAMPLES_PER_PARAM = 3
 N_PARTITIONS = 12  # unused for NSGA-II; kept for run_optimization_instance API
 WARM_SEEDING = False
 # Expected number of bitflips per individual per generation (k in prob_var = k / n_var).
-# None keeps the historical default of 200.
-MUTATION_FLIP_COUNT = None  # e.g. 100, 200, 400
+# None keeps the historical default of 200 for Kanton Bern.
+# IGNORED by the region_grow / region_evolve strategies (they supply their own mutation).
+MUTATION_FLIP_COUNT = 1000 #None # e.g. 100, 200, 400
 # Hypervolume early-stopping patience forwarded to run_optimization_instance.
 #   None              keep its default (15) - early stopping ON.
 #   N_GENERATIONS + 1 early stopping OFF, so every run gets the SAME generation
 #                     budget. Use this whenever runs are being compared: a run that
 #                     stops at generation 20 has a smaller front than one that ran
 #                     to 100 for reasons that have nothing to do with the scenario.
-HV_PATIENCE = N_GENERATIONS + 1
+HV_PATIENCE = N_GENERATIONS +1
 # Splatted into every run_optimization_instance call so HV_PATIENCE means the same
 # thing on every path; empty dict = let the function's own default stand.
 _HV_KW = {} if HV_PATIENCE is None else {"hv_patience": HV_PATIENCE}
@@ -168,7 +168,7 @@ custom_scenario_params = {
     #                   is compared against. Produces very scattered plans.
     #   "region_grow" = contiguous regions; pair with min_patch_size to impose the
     #                   minimum-patch-size constraint (the "price of contiguity" sweep).
-    "sampling_strategy": "region_evolve",
+    "sampling_strategy": "scattered",
     # Neutral repair: with "scattered", sampling (AdaptiveSampling) and mutation
     # (bitflip) are already unbiased; repair_scored=False passes scores=None to
     # AdaptiveRepair so it only enforces the budget (constraints-only, no score bias).
@@ -181,22 +181,23 @@ custom_scenario_params = {
     # Ignored on the "scattered" path (no contiguity constraint). The sweep is driven
     # by Debugs_tests/contiguity_price_sweep.py, which overrides this across levels.
     "min_patch_size": 2,
-    # Region operator knobs (used by region_grow / the min-patch-size repair).
-    "region_seeds": 25,             # max seed regions per individual (avg region ~ budget/seeds)
-    "region_seeds_min": 5,          # min seed regions per individual
+    # Region operator knobs (used by region_grow / region_evolve / the min-patch-size repair).
+    # CH scale: 2.71M eligible px, budget k = 135,741 px. Under region_evolve the seed count
+    # is capped by the number of NON-EMPTY cells on the region_seed_grid (965 of 1600 at 40),
+    # so region_seeds/region_seeds_min must sit below that or every plan seeds every cell.
+    # avg region ~ budget / seeds: 800 -> ~170 px, 300 -> ~450 px.
+    "region_seeds": 800,        #25      # max seed regions per individual
+    "region_seeds_min": 300,    #5      # min seed regions per individual
     "region_growth_bias": "scored", # "scored" (high value / low cost) or "neutral" (random)
+    # region_grow only: region_evolve's sampler always grows neutrally.
     "region_random_share": 0.5,     # fraction of region seeds placed at random (vs scored)
-    "region_mutation_edits": 100,   # grow/shrink edit size per mutated individual
-    # Stochastic pixel-ordering temperature for the 'scored' region operators
-    # (inert when region_growth_bias is "neutral"). 0 = the old deterministic
-    # argsort, which made independent individuals growing in the same area
-    # converge on the IDENTICAL pixel set - the blocky, uniform-value RFOP map.
-    # Higher = more random but still score-preferring (Gumbel-top-k).
-    # Sweep at pop 50 x 100 gens, seed 101: T=0 plateau_frac 0.45 / 66.5k pixels
-    # selected; T=0.5 0.26 / 86.8k; T=1.0 0.15 / 110.3k. Front quality moved the
-    # other way (common-ref HV -16.8% at T=0.5, -22.7% at T=1.0), but T=1.0 was
-    # the only arm still climbing at gen 100, so the deficit may be slower
-    # convergence rather than a worse reachable front.
+    # region_grow only: "hux" (default) swaps single pixels and shreds regions;
+    # "region_swap" swaps whole components and keeps the repair cheap. region_evolve
+    # always uses region_swap regardless of this key.
+    "region_crossover": "region_swap",
+    # grow/shrink move size in pixels (~20% of an average region at CH scale).
+    "region_mutation_edits": 30, #10
+    "region_seed_grid": 40,  #16
     "region_score_temperature": 1.0,
     # Warm-start pre-optimisation budget (only used when WARM_SEEDING is True and
     # use_patch_approach is False). Objectives without a per-pixel score
@@ -268,10 +269,10 @@ FACTORIAL_POLICIES = {
 # Patch approach settings. The contiguity work uses the PIXEL representation
 # (region operators + min-patch-size constraint), so the patch approach is off;
 # set True only to run the fixed-2x2-grain patch variant instead.
-USE_PATCH_APPROACH = False
+USE_PATCH_APPROACH = True
 PATCH_SIZE = 2
 PATCH_CONSTRAINT_TYPE = 'pixel_count'
-PIXEL_TOLERANCE = 0.1 #0.05
+PIXEL_TOLERANCE = 0.01 #0.05
 
 # Spatial aggregation: block-coarsen all input rasters by this integer factor before optimisation.
 AGGREGATION_FACTOR = None
@@ -279,12 +280,17 @@ AGGREGATION_FACTOR = None
 # Set to True to save per-generation population snapshots for animation
 SAVE_SNAPSHOTS = False
 
+# Restrict snapshots to these algorithm.n_gen values (1-indexed) instead of every
+# generation, e.g. (1, 11, 26, 51, 101) for gens 0/10/25/50/100. None = every
+# generation (X_history can reach tens of GB at this run's pop/pixel count).
+SNAPSHOT_GENERATIONS = None
+
 # Set to True to capture paired pre-repair vs post-repair genotype/phenotype diversity.
 CAPTURE_REPAIR_DIAG = True
 N_CAPTURE_GENS = 5
 
 # Set to True to profile the run with cProfile and print the top 30 hotspots afterwards.
-PROFILE = False
+PROFILE = True
 PROFILE_TOP_N = 30
 
 # Snapshot of the full configuration block - written to run_registry.jsonl alongside results.
@@ -305,6 +311,7 @@ run_config = {
     "patch_constraint_type": PATCH_CONSTRAINT_TYPE,
     "pixel_tolerance": PIXEL_TOLERANCE,
     "save_snapshots": SAVE_SNAPSHOTS,
+    "snapshot_generations": SNAPSHOT_GENERATIONS,
     "aggregation_factor": AGGREGATION_FACTOR,
     "custom_scenario_params": custom_scenario_params,
     "seeds": SEEDS,
@@ -353,6 +360,7 @@ def _grid_cfg(ecosystem_for_loader, r_parent):
         "patch_constraint_type": PATCH_CONSTRAINT_TYPE,
         "pixel_tolerance": PIXEL_TOLERANCE,
         "save_snapshots": SAVE_SNAPSHOTS,
+        "snapshot_generations": SNAPSHOT_GENERATIONS,
         "n_partitions": N_PARTITIONS,
         "warm_seeding": WARM_SEEDING,
         "run_config": run_config,
@@ -467,11 +475,11 @@ def _run_condition_grid(ecosystem_for_loader, all_results, run_times, run_label)
     # Currently OFF - this grid runs the weighting axis only. Uncomment to bring
     # the LOO family back in; the drop_* rasters already exist on disk.
     _loo_tags = [
-       # "global_drop_smd", "global_drop_sbd", "global_drop_soc",
-       # "global_drop_uzl", "global_drop_cdi", "global_drop_swf_h",
-       # "global_drop_swf_t", "global_drop_ndvi",
-       # "global_drop_tsd", "global_drop_can", "global_drop_lai",
-       # "upper_q75_all",
+        "global_drop_smd", "global_drop_sbd", "global_drop_soc",
+        "global_drop_uzl", "global_drop_cdi", "global_drop_swf_h",
+        "global_drop_swf_t", "global_drop_ndvi",
+        "global_drop_tsd", "global_drop_can", "global_drop_lai",
+        "upper_q75_all",
     ]
 
     # -- Extended weighting campaign (the simplex sample) --
@@ -747,6 +755,7 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                snapshot_generations=SNAPSHOT_GENERATIONS,
                                 capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                 n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
@@ -804,6 +813,7 @@ def _run():
                                 patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                                 pixel_tolerance=PIXEL_TOLERANCE,
                                 save_snapshots=SAVE_SNAPSHOTS,
+                                snapshot_generations=SNAPSHOT_GENERATIONS,
                                 capture_repair_diag=CAPTURE_REPAIR_DIAG,
                                 n_capture_gens=N_CAPTURE_GENS,
                                 n_partitions=N_PARTITIONS,
@@ -888,6 +898,7 @@ def _run():
                         patch_constraint_type=PATCH_CONSTRAINT_TYPE,
                         pixel_tolerance=PIXEL_TOLERANCE,
                         save_snapshots=SAVE_SNAPSHOTS,
+                        snapshot_generations=SNAPSHOT_GENERATIONS,
                         capture_repair_diag=CAPTURE_REPAIR_DIAG,
                         n_capture_gens=N_CAPTURE_GENS,
                         n_partitions=N_PARTITIONS,

@@ -58,6 +58,7 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
         patch_constraint_type=cfg["patch_constraint_type"],
         pixel_tolerance=cfg["pixel_tolerance"],
         save_snapshots=cfg["save_snapshots"],
+        snapshot_generations=cfg.get("snapshot_generations", None),
         n_partitions=cfg["n_partitions"],
         warm_seeding=cfg["warm_seeding"],
         run_label=run_label,
@@ -76,6 +77,8 @@ def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):
         # existing caller. Set it to n_generations + 1 to give every run in a grid
         # the SAME generation budget, which is what makes runs comparable.
         **({"hv_patience": cfg["hv_patience"]} if "hv_patience" in cfg else {}),
+        # Omitted unless set, so every existing caller still writes under outputs/.
+        **({"output_dir": cfg["output_dir"]} if "output_dir" in cfg else {}),
     )
 
 

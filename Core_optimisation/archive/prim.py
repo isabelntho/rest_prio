@@ -29,6 +29,26 @@ so z_q = (z_g - mean(z_g[S_p])) / sd(z_g[S_p]) and the global mean/sd cancel.
             so a fixed benefit threshold would measure that rescaling, not the plan.
   prim      PRIM per plan; peeling trajectories, box selection, permutation null.
   compare   Cross-plan box comparison and figures.
+
+The stages above ask which assumptions break ONE plan. The four below transpose the
+problem - rows are plans, columns are plan CHARACTERISTICS - and ask what a robust map
+looks like. Read `features`' marginal table before any box: half of max_regret variance
+sits between condition tags, so a plan-shape box can be a provenance proxy. Inference is
+clustered on the tag throughout (CLUSTER_BY), not on the plan and not on the run.
+
+  features    Plan-level covariates for the whole archive: patch structure, compactness,
+              dispersion, land-cover composition, cost, and indicator exposure. Gated on
+              recomputing each plan's cost and benefit from the rasters.
+  plan_lhc    The same plans' regret under the continuous LHC ensemble rather than the 61
+              discrete tags, on a stratified subsample. Reports it both cost-matched
+              (comparable with the discrete outcomes) and scale-normalised (`fail`'s
+              convention); cost enters those two with OPPOSITE signs, so which one the
+              box is fitted on is a real choice, not a formatting one.
+  plan_prim   PRIM over plan characteristics, four outcomes x two feature sets, with a
+              TAG-level null and bootstrap.
+  plan_compare  Do the four outcomes agree, and what does the robust box look like on the
+              ground.
+
   all       the above in order
 
 The full 25-composite weighting gate lives in Debugs_tests/weight_simplex_screen.py,
@@ -53,8 +73,9 @@ from Core_optimisation.condition_composite import (
     quantile_prefix, read_raster, rescale_to_quantile, scheme_weight_columns,
 )
 from Core_optimisation.uncertainty_analysis import (
-    anomaly_weight, front_reference, jaccard, load_archive, load_cross, load_layers,
-    nondominated_2d, plan_masks, regret_against, DISCRIM_MIN_SPAN, _jsonable,
+    anomaly_weight, evaluate, front_reference, jaccard, load_archive, load_cross,
+    load_layers, nondominated_2d, plan_masks, regret_against, DISCRIM_MIN_SPAN,
+    ROBUST_QUANTILE, VALIDATE_RTOL_COST, _jsonable,
     OUT_DIR as UNC_DIR,
 )
 
@@ -124,6 +145,42 @@ GATE_FIXED_POINT_TOL = 1e-6
 GATE_RTOL_LAYER = 1e-5
 GATE_RTOL_SUM = 1e-6
 GATE_RTOL_BENEFIT = 1e-5
+
+# --- plan-characteristic stages -------------------------------------------
+# A covariate with fewer than this many distinct values cannot be peeled on. The budget
+# is a hard equality constraint, so n_cells takes 4 values over the whole archive; this
+# drops it (and anything else that turns out constant) by measurement rather than by
+# assumption.
+PLAN_FEATURE_MIN_DISTINCT = 5
+
+# The archive's 14591 plans are not independent draws, so the effective sample size is
+# the CLUSTER count and the null and bootstrap resample clusters rather than plans; the
+# plan-level null is reported beside the clustered one to show how much that matters
+# rather than asserting it.
+#
+# The cluster is the condition tag: 73 of them, 5 seeds and 74-432 plans each. Seeds of
+# one tag are replicates of the same formulation, which is the pooling convention the
+# rest of the analysis uses, so they belong inside one cluster and not beside it. The
+# finer campaign|tag|seed run is kept as a column but is not the unit - it splits those
+# replicates apart, and buys little: run identity explains 55.4% of max_regret variance
+# against the tag's 51.4%, so all but ~4 points of the run effect IS the tag effect.
+CLUSTER_BY = "native_tag"
+CLUSTER_LABEL = "tag"
+PLAN_NULL_PERM = 20
+PLAN_BOOTSTRAP = 100
+PLAN_SEED = 20260901
+
+LHC_SUBSAMPLE_N = 2000
+LHC_SUBSAMPLE_SEED = 20260901
+# Worst case over 1000 scenarios is one scenario; p90 is the same statement with a
+# replicate behind it. The max is recorded next to it either way.
+LHC_REGRET_PCTL = 90
+
+# Box-overlap reading aid, NOT a test. Two boxes selected independently from 14591 plans
+# at ~20% mass overlap ~0.11 by chance, so 0.30 is "clearly more than chance" and nothing
+# more; the printed Jaccard is the number to quote, and a value near the cut means the
+# answer is genuinely intermediate rather than one side of a line.
+PLAN_OVERLAP_MIN = 0.30
 
 OUT_DIR = OUTPUTS / "uncertainty" / "prim"
 FIG_DIR = FIGS_DIR / "uncertainty" / "prim"
@@ -473,13 +530,9 @@ def _select_figure(b, C, front, picks, A, shape):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
+    ensure(FIG_DIR)
 
-    n = len(picks)
-    t_cols = 4 if n > 6 else 3
-    t_rows = int(np.ceil(n / t_cols))
-    fig = plt.figure(figsize=(11 + 1.3 * max(0, t_cols - 3), 2.6 * max(t_rows, 2)))
-    gs = GridSpec(t_rows, 3 + t_cols, figure=fig, wspace=0.05, hspace=0.25)
-    ax = fig.add_subplot(gs[:, :3])
+    fig, ax = plt.subplots(figsize=(7, 5.5))
     ax.scatter(-b, C, s=3, c="0.8", label="archive")
     ax.scatter(-b[front], C[front], s=8, c="tab:blue", label="baseline front")
     ax.scatter(-b[picks], C[picks], s=90, marker="D", facecolor="none",
@@ -487,23 +540,32 @@ def _select_figure(b, C, front, picks, A, shape):
     for i, p in enumerate(picks):
         ax.annotate(str(i), (-b[p], C[p]), fontsize=8, xytext=(4, 4),
                     textcoords="offset points")
-    ax.set_xlabel("restoration benefit (higher is better)")
+    ax.set_xlabel("restoration benefit")
     ax.set_ylabel("implementation cost")
-    ax.set_title(f"Representative plans on the {BASELINE_TAG} front")
-    ax.legend(fontsize=8, loc="lower right")
+    ax.set_title(f"Representative plans on the full uncertainty front")
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "representative_plans_front.png", dpi=140)
+    plt.close(fig)
 
     # Spatial context: what "cheap" vs "expensive" looks like on the ground, cropped to
     # each plan's own footprint so a 3-patch plan and a 500-patch plan are both legible.
+    n = len(picks)
+    t_cols = 4 if n > 6 else 3
+    t_rows = int(np.ceil(n / t_cols))
+    fig = plt.figure(figsize=(2.3 * t_cols, 2.6 * t_rows))
+    gs = GridSpec(t_rows, t_cols, figure=fig, wspace=0.05, hspace=0.3)
     for i, p in enumerate(picks):
         r, c = divmod(i, t_cols)
-        tax = fig.add_subplot(gs[r, 3 + c])
+        tax = fig.add_subplot(gs[r, c])
         _plan_thumbnail(tax, A["plans"][p], shape)
         tax.set_title(f"{i}: plan {p}", fontsize=7)
+    fig.suptitle("Representative plans - spatial footprint", fontsize=10)
     fig.tight_layout()
-    ensure(FIG_DIR)
-    fig.savefig(FIG_DIR / "representative_plans.png", dpi=140)
+    fig.savefig(FIG_DIR / "representative_plans_maps.png", dpi=140)
     plt.close(fig)
-    print(f"  figure  -> {FIG_DIR / 'representative_plans.png'}")
+    print(f"  figures -> {FIG_DIR / 'representative_plans_front.png'}, "
+          f"{FIG_DIR / 'representative_plans_maps.png'}")
 
 
 # ===========================================================================
@@ -1018,10 +1080,18 @@ def _compare_figures(boxes, dims, mem, design, cols, ids):
     print(f"\n  figures -> {FIG_DIR}")
 
 
-def _fig_boxes(dims, ids, order_ids, fail_of, cols, lo, rng):
+def _fig_boxes(dims, ids, order_ids, fail_of, cols, lo, rng, fname="boxes.png",
+               title="Vulnerability boxes - constrained factors only, tightest first",
+               label_of=None):
     """One row per (plan, factor) actually constrained - unsupported factors dropped,
-    tightest constraint first within each plan, so the signal is not buried."""
+    tightest constraint first within each plan, so the signal is not buried.
+
+    `fname`/`title`/`label_of` let the plan-characteristic stages reuse this unchanged;
+    `dims.plan_id` is then a row-group code rather than a plan.
+    """
     import matplotlib.pyplot as plt
+    if label_of is None:
+        label_of = lambda pid: f"plan {pid}\n{fail_of[pid]:.0%} fail"
     rows = []
     for pid in order_ids:
         d = dims[(dims.plan_id == pid) & dims.supported].copy()
@@ -1034,7 +1104,8 @@ def _fig_boxes(dims, ids, order_ids, fail_of, cols, lo, rng):
     # only the factors that actually appear so each stays visually distinct.
     used = [f for f in cols if any(dr["dimension"] == f for _, dr in rows)]
     color_of = {f: f"C{i % 10}" for i, f in enumerate(used)}
-    fig, ax = plt.subplots(figsize=(7.5, 0.32 * n + 1.4))
+    width = 7.5 + 0.09 * max(0, max(len(f) for f in used) - 9)
+    fig, ax = plt.subplots(figsize=(width, 0.32 * n + 1.4))
     group_start = 0
     for pid in order_ids:
         n_here = sum(1 for p, _ in rows if p == pid)
@@ -1051,18 +1122,21 @@ def _fig_boxes(dims, ids, order_ids, fail_of, cols, lo, rng):
                         ((dr["hi"] - lo[c]) / rng[c], y), fontsize=7.5, xytext=(5, 0),
                         textcoords="offset points", va="center")
         y_mid = n - 1 - (group_start + (n_here - 1) / 2)
-        ax.text(-0.20, y_mid, f"plan {pid}\n{fail_of[pid]:.0%} fail", fontsize=8,
-                ha="right", va="center")
+        ax.text(-0.20, y_mid, label_of(pid), fontsize=8, ha="right", va="center")
         if group_start > 0:
             ax.axhline(y_top + 0.5, color="0.85", lw=0.8)
         group_start += n_here
     ax.set_yticks([])
-    ax.set_xlim(-0.02, 1.28)
+    # Right margin sized to the longest annotation rather than fixed: the formulation
+    # factors are ~8 characters and fit under a flat 1.28, but the plan characteristics
+    # reusing this run to 20+ and would be clipped off the axes.
+    tail = 0.022 * max(len(f"{dr['dimension']}  [100%]") for _p, dr in rows)
+    ax.set_xlim(-0.02, 1.02 + tail)
     ax.set_ylim(-0.6, n - 0.4)
     ax.set_xlabel("retained factor range (normalized); [ ] = bootstrap support")
-    ax.set_title("Vulnerability boxes - constrained factors only, tightest first")
+    ax.set_title(title)
     fig.tight_layout()
-    fig.savefig(FIG_DIR / "boxes.png", dpi=140)
+    fig.savefig(FIG_DIR / fname, dpi=140)
     plt.close(fig)
 
 
@@ -1107,52 +1181,836 @@ def _fig_scatter(dims, mem, order_ids, fail_of, n_panels=3):
     plt.close(fig)
 
 
-def _fig_heatmap(dims, ids, order_ids, fail_of, cols, lo, hi):
+def _fig_heatmap(dims, ids, order_ids, fail_of, cols, lo, hi,
+                 fname="vulnerability_heatmap.png",
+                 title="Vulnerability factors across plans", label_of=None):
     """The cross-plan result: which factors are plan-invariant vulnerabilities.
 
-    Colour = fraction of that factor's sampled range the box excludes (darker = tighter).
-    "Upper bound" alone would mislead here: some factors are cut from below (failure
-    needs a HIGH weight) and others from above (failure needs a LOW one) - w_smd is cut
-    from below while w_sbd/w_soc/q/beta are cut from above. The annotation names the
-    actual retained side; the colour is direction-agnostic so it compares fairly.
+    Colour = fraction of that factor's sampled range the box excludes (darker = tighter),
+    which is the direction-agnostic, cross-factor-comparable quantity - the raw retained
+    bound (e.g. "w_sbd < 0.09") is not comparable across factors with different ranges,
+    so it is left out of the cell rather than shown alongside the colour it can conflict
+    with; see dimension_support.csv for the raw bounds.
     """
     import matplotlib.pyplot as plt
+    if label_of is None:
+        label_of = lambda pid: f"plan {pid} ({fail_of[pid]:.0%})"
     sup = dims[dims.supported & dims.plan_id.isin(ids)]
     factors = (sup.groupby("dimension").size().sort_values(ascending=False).index.tolist())
     if not factors:
         print("  no factor is supported in any credible box - skipping the heatmap")
         return
     tight = np.full((len(order_ids), len(factors)), np.nan)
-    label = np.full((len(order_ids), len(factors)), "", dtype=object)
     for pi, pid in enumerate(order_ids):
         for fi, f in enumerate(factors):
             r = sup[(sup.plan_id == pid) & (sup.dimension == f)]
             if r.empty:
                 continue
             c = cols.index(f)
-            lo_r, hi_r = float(r.lo.iloc[0]), float(r.hi.iloc[0])
-            cut_lo, cut_hi = lo_r > lo[c] + 1e-9, hi_r < hi[c] - 1e-9
-            tight[pi, fi] = 1.0 - (hi_r - lo_r) / max(hi[c] - lo[c], 1e-9)
-            label[pi, fi] = (f"{lo_r:.2f}-{hi_r:.2f}" if cut_lo and cut_hi else
-                             f"<{hi_r:.2f}" if cut_hi else f">{lo_r:.2f}")
+            tight[pi, fi] = 1.0 - (float(r.hi.iloc[0]) - float(r.lo.iloc[0])) / \
+                max(hi[c] - lo[c], 1e-9)
 
+    # vmax is the OBSERVED max, not 1: PRIM's peel stops at PRIM_MASS_MIN (5% of the
+    # scenarios), so a box practically never excludes a whole factor's range and
+    # tightness never nears 1.0. Fixing vmax=1 would leave the colourbar's darkest third
+    # empty - every cell reads noticeably lighter than the swatch it is meant to match -
+    # so the printed bar's extremes are calibrated to what is actually on the grid.
+    vmax = float(np.nanmax(tight))
     fig, ax = plt.subplots(figsize=(1.1 * len(factors) + 2, 0.6 * len(order_ids) + 1.5))
     cmap = plt.get_cmap("Purples").copy()
     cmap.set_bad("white")
-    im = ax.imshow(np.ma.masked_invalid(tight), cmap=cmap, vmin=0, vmax=1, aspect="auto")
-    for pi in range(len(order_ids)):
-        for fi in range(len(factors)):
-            if label[pi, fi]:
-                ax.text(fi, pi, label[pi, fi], ha="center", va="center", fontsize=7.5,
-                        color="white" if tight[pi, fi] > 0.6 else "black")
+    im = ax.imshow(np.ma.masked_invalid(tight), cmap=cmap, vmin=0, vmax=vmax, aspect="auto")
     ax.set_xticks(range(len(factors)))
     ax.set_xticklabels(factors, rotation=45, ha="right")
     ax.set_yticks(range(len(order_ids)))
-    ax.set_yticklabels([f"plan {p} ({fail_of[p]:.0%})" for p in order_ids])
-    ax.set_title("Vulnerability factors across plans")
+    ax.set_yticklabels([label_of(p) for p in order_ids])
+    ax.set_title(title)
     fig.colorbar(im, ax=ax, label="fraction of sampled range excluded", shrink=0.8)
     fig.tight_layout()
-    fig.savefig(FIG_DIR / "vulnerability_heatmap.png", dpi=140)
+    fig.savefig(FIG_DIR / fname, dpi=140)
+    plt.close(fig)
+
+
+# ===========================================================================
+# stage: features - plan-level covariates
+# ===========================================================================
+# The covariate blocks. zbar_<code> is appended at build time from the indicator codes
+# actually on disk, so it is not listed here.
+SPATIAL_FEATURES = ("n_patches", "largest_patch_share", "mean_patch_size", "perim_area",
+                    "rgyr", "bbox_fill", "spillover_ratio")
+COVER_FEATURES = ("share_forest", "share_agricultural", "share_grassland")
+EXPOSURE_FEATURES = ("mean_d_baseline", "n_indicators_mean", "eff_n_indicators")
+CORE_FEATURES = SPATIAL_FEATURES + ("cost",) + COVER_FEATURES + EXPOSURE_FEATURES
+
+PLAN_FEATURES_CSV = OUT_DIR / "plan_features.csv"
+PLAN_LHC_CSV = OUT_DIR / "plan_features_lhc.csv"
+PLAN_MARGINALS_CSV = OUT_DIR / "plan_feature_marginals.csv"
+
+
+def _plan_geometry(sel, shape, masks):
+    """Spatial form of one plan: patch structure, compactness, dispersion, spillover."""
+    sel_m, nb_m = masks
+    lab, n = ndimage.label(sel_m)
+    sizes = np.bincount(lab.ravel())[1:]
+    if int(sizes.sum()) != sel.size:
+        raise SystemExit(f"patch sizes sum to {int(sizes.sum())} but the plan has "
+                         f"{sel.size} cells - the mask and the index disagree.")
+    # 4-connected boundary: every selected/unselected transition along either axis.
+    perim = float((sel_m[:, :-1] != sel_m[:, 1:]).sum() + (sel_m[:-1] != sel_m[1:]).sum())
+    r, c = np.unravel_index(sel, shape)
+    bbox = float((r.max() - r.min() + 1) * (c.max() - c.min() + 1))
+    return {
+        "n_patches": int(n),
+        "largest_patch_share": float(sizes.max()) / sel.size,
+        "mean_patch_size": float(sizes.mean()),
+        "perim_area": perim / sel.size,
+        "rgyr": float(np.sqrt(((r - r.mean()) ** 2 + (c - c.mean()) ** 2).mean())),
+        "bbox_fill": sel.size / bbox,
+        "spillover_ratio": float(nb_m.sum()) / sel.size,
+    }
+
+
+def _exposure(Zr, Pr):
+    """(zbar, eff_n_indicators, n_indicators_mean) from one plan's rows of (Z, P).
+
+    zbar is the presence-aware mean, matching composite's renormalisation: an indicator
+    absent on a cell drops out rather than counting as a zero. eff_n is exp(Shannon) over
+    the shares of mean |z|, so a plan leaning on one indicator reads near 1 and one spread
+    evenly over all of them reads near the indicator count.
+    """
+    denom = np.maximum(Pr.sum(axis=0), 1.0)
+    zbar = Zr.sum(axis=0) / denom
+    mag = np.abs(Zr).sum(axis=0) / denom
+    s = mag / max(float(mag.sum()), 1e-12)
+    s = s[s > 0]
+    eff = float(np.exp(-(s * np.log(s)).sum())) if s.size else 0.0
+    return zbar, eff, float(Pr.sum(axis=1).mean())
+
+
+def _marginals(F, feats, y="max_regret"):
+    """Spearman of each feature against the outcome, split raw / within- / between-cluster.
+
+    This IS the confound check. A feature whose association is entirely between-cluster is
+    telling you which formulation found the plan, not what the map looks like.
+    """
+    cols = list(feats) + [y]
+    g = F.groupby("cluster")
+    mu = g[cols].mean()
+    dev = F[cols] - g[cols].transform("mean")
+    return pd.DataFrame([{
+        "feature": f,
+        "spearman_raw": float(F[f].corr(F[y], method="spearman")),
+        "spearman_within_cluster": float(dev[f].corr(dev[y], method="spearman")),
+        "spearman_between_cluster": float(mu[f].corr(mu[y], method="spearman")),
+        "var_share_cluster": float(1.0 - dev[f].var() / max(float(F[f].var()), 1e-30)),
+    } for f in feats])
+
+
+def cmd_features(argv=()):
+    """Plan-level covariates for the whole archive, gated against the rasters."""
+    A = load_archive()
+    L = load_layers([BASELINE_TAG])
+    if BASELINE_TAG not in L["tags"]:
+        raise SystemExit(f"no layer shard for {BASELINE_TAG} - run "
+                         "`uncertainty_analysis extract` first.")
+    shape, radius, decay = L["shape"], int(L["radius"]), float(L["decay"])
+    d_base = np.asarray(L["d"][BASELINE_TAG], np.float64)
+    d_flat = d_base.ravel()
+    plans = [np.asarray(p, np.int64) for p in A["plans"]]
+    n_plan = len(plans)
+
+    # Indexed over the cells any plan actually selects, NOT the baseline eligible set:
+    # the drop_* constructions are eligible on ~150 fewer cells, so plans born under them
+    # select cells the baseline mask excludes and would silently lose their z-scores.
+    union = np.unique(np.concatenate(plans))
+    elig = np.asarray(L["elig"][BASELINE_TAG], bool).ravel()
+    n_outside = int((~elig[union]).sum())
+    print(f"{n_plan} plans over {union.size:,} distinct cells "
+          f"({n_outside:,} outside the {BASELINE_TAG} eligible mask)")
+
+    layers, footprints = load_indicator_stack("global")
+    Z, P, codes, eco_of_pixel, ecos = build_matrices(
+        layers, footprints, ecosystem_masks(shape), union)
+    pos = np.full(int(np.prod(shape)), -1, np.int64)
+    pos[union] = np.arange(union.size)
+    print(f"  indicators: {len(codes)} codes, ecosystems: {', '.join(ecos)}")
+
+    rows = []
+    t0 = time.perf_counter()
+    for i, sel in enumerate(plans):
+        masks = plan_masks(sel, shape, radius)
+        # evaluate() rather than a hand-rolled sum: it is the same arithmetic `cross`
+        # used, which is what makes the two gates below exact rather than approximate.
+        ben, cst = evaluate(sel, d_base, L["cost"], shape, radius, decay, masks=masks)
+        r = pos[sel]
+        zbar, eff_n, n_ind = _exposure(Z[r], P[r])
+        eco = np.bincount(eco_of_pixel[r] + 1, minlength=len(ecos) + 1)[1:] / sel.size
+        row = {"plan_id": i, **_plan_geometry(sel, shape, masks),
+               "cost": cst, "benefit_baseline": ben,
+               "mean_d_baseline": float(d_flat[sel].mean()),
+               "n_indicators_mean": n_ind, "eff_n_indicators": eff_n}
+        row.update({f"share_{e}": float(eco[k]) for k, e in enumerate(ecos)})
+        row.update({f"zbar_{c}": float(zbar[k]) for k, c in enumerate(codes)})
+        rows.append(row)
+        if (i + 1) % 2000 == 0:
+            el = time.perf_counter() - t0
+            print(f"    {i + 1}/{n_plan}  ({el:.0f}s, eta "
+                  f"{el / (i + 1) * (n_plan - i - 1):.0f}s)")
+    F = pd.DataFrame(rows)
+
+    print("\n[A] gate: recomputed cost and benefit vs what `cross` stored")
+    ps = pd.read_csv(UNC_DIR / "plan_summary.csv",
+                     usecols=["plan_id", "native_campaign", "native_tag", "native_seed",
+                              "n_cells", "cost", "max_regret", "is_robust"])
+    Bm, Cm, _OV, tags = load_cross()
+    b_ref = Bm[:, tags.index(BASELINE_TAG)]
+    c_err = float(np.max(np.abs(F["cost"].to_numpy() - Cm) / np.maximum(np.abs(Cm), 1e-30)))
+    b_err = float(np.max(np.abs(F["benefit_baseline"].to_numpy() - b_ref)
+                         / np.maximum(np.abs(b_ref), 1e-30)))
+    print(f"    cost    max rel err {c_err:.2e}  (tol {VALIDATE_RTOL_COST:.0e})")
+    print(f"    benefit max rel err {b_err:.2e}  (tol {GATE_RTOL_BENEFIT:.0e})")
+    if c_err > VALIDATE_RTOL_COST or b_err > GATE_RTOL_BENEFIT:
+        raise SystemExit("FAILED - the feature pipeline is not indexing the same plans "
+                         "`cross` scored. Nothing downstream is meaningful.")
+    share_cols = [f"share_{e}" for e in ecos]
+    worst_share = float(F[share_cols].sum(axis=1).max())
+    print(f"    land-cover shares sum to at most {worst_share:.6f}")
+    if worst_share > 1.0 + 1e-9:
+        raise SystemExit("FAILED - ecosystem shares exceed 1; the masks overlap.")
+
+    F = F.merge(ps, on="plan_id", suffixes=("", "_summary"))
+    # `run` is kept for provenance reporting; `cluster` is the inference unit.
+    F["run"] = (F["native_campaign"] + "|" + F["native_tag"] + "|"
+                + F["native_seed"].astype(str))
+    F["cluster"] = F[CLUSTER_BY].astype(str)
+    F["is_fragile"] = F["max_regret"] >= F["max_regret"].quantile(1.0 - ROBUST_QUANTILE)
+    F["within_cluster_robust"] = (
+        F["max_regret"] < F.groupby("cluster")["max_regret"].transform("median"))
+    # regret_against returns 0.0 for a plan cheaper than every reference-front point
+    # ("uncovered"), which is not robustness. Flagged here, excluded in plan_prim.
+    F["uncovered_artefact"] = F["max_regret"] == 0.0
+    n_unc = int(F["uncovered_artefact"].sum())
+    print(f"    uncovered artefact (max_regret exactly 0.0): {n_unc} plan(s)")
+
+    print("\n[B] degenerate covariates (fewer than "
+          f"{PLAN_FEATURE_MIN_DISTINCT} distinct values)")
+    cand = [c for c in CORE_FEATURES if c in F.columns] + \
+           sorted(c for c in F.columns if c.startswith("zbar_"))
+    dropped = [c for c in cand + ["n_cells"] if F[c].nunique() < PLAN_FEATURE_MIN_DISTINCT]
+    kept = [c for c in cand if c not in dropped]
+    print(f"    dropped: {', '.join(dropped) if dropped else 'none'}")
+    print(f"    kept   : {len(kept)} covariates")
+    if "n_cells" not in dropped:
+        print("    NOTE: n_cells survived the screen - the budget is not the hard "
+              "equality constraint this analysis assumes.")
+
+    print(f"\n[C] marginal association with max_regret, split by the "
+          f"{CLUSTER_LABEL} confound")
+    marg = _marginals(F, kept).sort_values("spearman_raw", key=np.abs, ascending=False)
+
+    def _var_share(col):
+        dev = F["max_regret"] - F.groupby(col)["max_regret"].transform("mean")
+        return float(1.0 - dev.var() / max(float(F["max_regret"].var()), 1e-30))
+
+    cl_share, run_share = _var_share("cluster"), _var_share("run")
+    print(f"    {'feature':<22}{'raw':>8}{'within':>8}{'between':>9}"
+          f"{'var|' + CLUSTER_LABEL:>9}")
+    for r in marg.itertuples():
+        print(f"    {r.feature:<22}{r.spearman_raw:>8.3f}"
+              f"{r.spearman_within_cluster:>8.3f}"
+              f"{r.spearman_between_cluster:>9.3f}{r.var_share_cluster:>9.3f}")
+    print(f"\n    {CLUSTER_LABEL} identity alone explains {cl_share:.1%} of max_regret "
+          f"variance over {F['cluster'].nunique()} {CLUSTER_LABEL}s - the ceiling any "
+          f"feature box works under.")
+    print(f"    (the finer campaign|tag|seed run explains {run_share:.1%} over "
+          f"{F['run'].nunique()} runs, so seed adds "
+          f"{run_share - cl_share:.1%} beyond the {CLUSTER_LABEL}.)")
+
+    ensure(OUT_DIR)
+    F.to_csv(PLAN_FEATURES_CSV, index=False)
+    marg.to_csv(PLAN_MARGINALS_CSV, index=False)
+    print(f"  -> {PLAN_FEATURES_CSV}")
+    report_update("features", {
+        "n_plans": n_plan, "n_runs": int(F["run"].nunique()),
+        "cluster_by": CLUSTER_BY, "n_clusters": int(F["cluster"].nunique()),
+        "n_union_cells": int(union.size), "n_cells_outside_baseline_elig": n_outside,
+        "cost_max_rel_err": c_err, "benefit_max_rel_err": b_err,
+        "indicator_codes": list(codes), "ecosystems": list(ecos),
+        "features_kept": kept, "features_dropped": dropped,
+        "n_uncovered_artefact": n_unc,
+        "max_regret_var_share_cluster": cl_share,
+        "max_regret_var_share_run": run_share,
+        "marginals": marg.to_dict("records"),
+        "runtime_s": float(time.perf_counter() - t0),
+    })
+
+
+# ===========================================================================
+# stage: plan_lhc - the same plans under the continuous ensemble
+# ===========================================================================
+def _load_features():
+    if not PLAN_FEATURES_CSV.exists():
+        raise FileNotFoundError(f"{PLAN_FEATURES_CSV} missing - run `features` first.")
+    return pd.read_csv(PLAN_FEATURES_CSV)
+
+
+def _stratified_subsample(F, n, seed):
+    """Plan ids spread over cost decile x native tag, so this is not just the cheap tail."""
+    rng = np.random.default_rng(seed)
+    key = pd.qcut(F["cost"], 10, labels=False, duplicates="drop").astype(str) + \
+        "|" + F["native_tag"].astype(str)
+    groups = [np.asarray(v) for v in F.groupby(key).indices.values()]
+    per = max(1, n // len(groups))
+    take = np.concatenate([rng.choice(g, min(g.size, per), replace=False)
+                           for g in groups])
+    if take.size > n:
+        take = rng.choice(take, n, replace=False)
+    elif take.size < n:
+        rest = np.setdiff1d(np.arange(len(F)), take)
+        take = np.concatenate([take, rng.choice(rest, min(n - take.size, rest.size),
+                                                replace=False)])
+    print(f"  subsample: {take.size} plans over {len(groups)} cost x tag strata")
+    return np.sort(F["plan_id"].to_numpy()[take])
+
+
+def _plan_operator(plans, pos, shape, radius):
+    """(core_idx, core_off, ring_idx, ring_off) over eligible-cell positions.
+
+    Two flat index arrays rather than a scipy sparse operator: at ~95k nonzeros per plan
+    a CSR would carry an explicit float weight per nonzero for what are only ever two
+    distinct values, which is another 1.5 GB. A cell outside the eligible set carries no
+    benefit and simply drops out, exactly as in `score`.
+    """
+    core, ring, c_off, r_off = [], [], [0], [0]
+    for sel in plans:
+        _sel_m, nb_m = plan_masks(sel, shape, radius)
+        for src, acc, off in ((sel, core, c_off),
+                              (np.flatnonzero(nb_m.ravel()), ring, r_off)):
+            p = pos[np.asarray(src, np.int64)]
+            p = p[p >= 0].astype(np.int32)
+            if p.size == 0:
+                raise SystemExit("a plan has an empty core or spillover ring - "
+                                 "np.add.reduceat cannot express an empty segment.")
+            acc.append(p)
+            off.append(off[-1] + p.size)
+    return (np.concatenate(core), np.asarray(c_off[:-1], np.int64),
+            np.concatenate(ring), np.asarray(r_off[:-1], np.int64))
+
+
+def cmd_plan_lhc(argv=()):
+    """Score a stratified plan subsample under the LHC ensemble instead of the 61 tags."""
+    F = _load_features()
+    design = pd.read_csv(OUT_DIR / "design.csv")
+    wcols = weight_columns()
+    ctx = load_context()
+    A = load_archive()
+    pids = _stratified_subsample(F, LHC_SUBSAMPLE_N, LHC_SUBSAMPLE_SEED)
+    plans = [np.asarray(A["plans"][p], np.int64) for p in pids]
+    elig_idx, shape = ctx["elig_idx"], ctx["shape"]
+    n_elig, n_plan, n_scen = elig_idx.size, len(plans), len(design)
+    budget = int(np.median([p.size for p in plans]))
+
+    pos = np.full(int(np.prod(shape)), -1, np.int64)
+    pos[elig_idx] = np.arange(n_elig)
+    t0 = time.perf_counter()
+    core, c_off, ring, r_off = _plan_operator(plans, pos, shape, ctx["radius"])
+    print(f"  operator: {core.size + ring.size:,} nonzeros "
+          f"({(core.nbytes + ring.nbytes) / 1e6:.0f} MB) in {time.perf_counter() - t0:.0f}s")
+    print(f"{n_plan} plans x {n_scen} scenarios over {n_elig:,} eligible cells "
+          f"(budget k = {budget:,})")
+
+    Bm = np.zeros((n_plan, n_scen))
+    scale = np.zeros(n_scen)
+    t0 = time.perf_counter()
+    for s in range(n_scen):
+        row = design.iloc[s]
+        d, _Wcol, _sk = scenario_layer(ctx, float(row["q"]),
+                                       row[wcols[2:]].to_numpy(float))
+        Bm[:, s] = -(np.add.reduceat(d[core], c_off)
+                     + ctx["decay"] * np.add.reduceat(d[ring], r_off))
+        scale[s] = float(np.partition(d, -budget)[-budget:].sum())
+        if (s + 1) % 100 == 0:
+            el = time.perf_counter() - t0
+            print(f"    {s + 1}/{n_scen}  ({el:.0f}s, eta "
+                  f"{el / (s + 1) * (n_scen - s - 1):.0f}s)")
+
+    # Scenario 0 is q=0 + flat weights, i.e. the baseline lens, so it must reproduce the
+    # stored global_w_flat scores - the same self-check `score` makes.
+    _B, _C, _OV, tags = load_cross()
+    b_ref = _B[pids, tags.index(BASELINE_TAG)]
+    err = float(np.max(np.abs(Bm[:, 0] - b_ref) / np.maximum(np.abs(b_ref), 1e-30)))
+    print(f"  self-check vs cross_raw {BASELINE_TAG}: {err:.2e} "
+          f"(tol {GATE_RTOL_BENEFIT:.0e})")
+    if err > GATE_RTOL_BENEFIT:
+        raise SystemExit("Self-check FAILED - scenario 0 is not the baseline lens.")
+
+    # Two regret conventions, because they are NOT interchangeable once cost is a
+    # covariate rather than a fixed budget:
+    #   scale-normalised  1 - benefit / top-k achievable, exactly `fail`'s definition.
+    #                     It does not control for cost, so an expensive plan that buys
+    #                     more benefit scores well and cost reads -0.44 against it -
+    #                     the opposite sign to the discrete set.
+    #   cost-matched      against each scenario's own front over the scored plans, the
+    #                     convention `classify` uses for the 61 tags. This is the one
+    #                     the plan-characteristic boxes are fitted on, so the two
+    #                     uncertainty sets are compared on the same footing.
+    regret = np.clip(1.0 - (-Bm) / scale[None, :], 0.0, 1.0)
+    cost = F.set_index("plan_id").loc[pids, "cost"].to_numpy(float)
+    reg_cm = np.zeros_like(regret)
+    n_unc = 0
+    for s in range(n_scen):
+        reg_cm[:, s], _rb, unc = regret_against(front_reference(Bm[:, s], cost),
+                                                Bm[:, s], cost)
+        n_unc += int(unc.sum())
+    print(f"  cost-matched: {n_unc} plan-scenario cells uncovered (cheaper than every "
+          f"front point, scored 0.0) of {n_plan * n_scen:,}")
+
+    out = pd.DataFrame({
+        "plan_id": pids,
+        "lhc_regret_cm_p90": np.percentile(reg_cm, LHC_REGRET_PCTL, axis=1),
+        "lhc_regret_cm_max": reg_cm.max(axis=1),
+        "lhc_regret_p90": np.percentile(regret, LHC_REGRET_PCTL, axis=1),
+        "lhc_regret_max": regret.max(axis=1),
+        "lhc_regret_median": np.median(regret, axis=1),
+    })
+    mr = F.set_index("plan_id").loc[pids, "max_regret"].to_numpy()
+    rho = {c: float(pd.Series(out[c].to_numpy()).corr(pd.Series(mr), method="spearman"))
+           for c in ("lhc_regret_cm_p90", "lhc_regret_p90")}
+    print(f"  vs the discrete-set max_regret: cost-matched Spearman "
+          f"{rho['lhc_regret_cm_p90']:.3f}, scale-normalised "
+          f"{rho['lhc_regret_p90']:.3f}")
+    print("  " + ("the two uncertainty sets rank plans alike"
+                  if rho["lhc_regret_cm_p90"] > 0.7 else
+                  "the two uncertainty sets DISAGREE on the ranking even once cost is "
+                  "matched - the sampled space is not the 61 corners"))
+
+    ensure(OUT_DIR)
+    np.savez_compressed(OUT_DIR / "plan_lhc_scores.npz", B=Bm, scale=scale,
+                        regret=regret, regret_cost_matched=reg_cm, plan_id=pids)
+    out.to_csv(PLAN_LHC_CSV, index=False)
+    print(f"  -> {PLAN_LHC_CSV}")
+    report_update("plan_lhc", {
+        "n_plans": n_plan, "n_scenarios": n_scen, "subsample_seed": LHC_SUBSAMPLE_SEED,
+        "regret_pctl": LHC_REGRET_PCTL, "selfcheck_max_rel_err": err,
+        "spearman_vs_discrete_max_regret": rho,
+        "n_uncovered_cells": n_unc,
+        "regret_cm_p90_median": float(np.median(out["lhc_regret_cm_p90"])),
+        "regret_cm_p90_min": float(out["lhc_regret_cm_p90"].min()),
+        "regret_cm_p90_max": float(out["lhc_regret_cm_p90"].max()),
+        "regret_p90_median": float(np.median(out["lhc_regret_p90"])),
+        "runtime_s": float(time.perf_counter() - t0),
+    })
+
+
+# ===========================================================================
+# stage: plan_prim - PRIM over plan characteristics
+# ===========================================================================
+def _cluster_groups(clusters):
+    """Row indices of each cluster, in a fixed order."""
+    return [np.flatnonzero(clusters == c) for c in pd.unique(clusters)]
+
+
+def _mem_key(outcome):
+    """npz-safe name for an outcome: a `/` becomes a directory entry inside the zip."""
+    return outcome.replace("/", "__")
+
+
+def null_lift_clustered(X, y, groups, rng, n_perm=PLAN_NULL_PERM):
+    """Density lift PRIM reaches once the cluster/feature link is broken.
+
+    The plan-level null of `null_lift` treats 14591 plans as independent when they come
+    from 73 condition tags, so it sets a bar far below what clustered data produces by
+    chance. Here the cluster list is shuffled and each cluster's plans are relabelled
+    from the label pool of the cluster it was mapped to, which preserves plans-per-
+    cluster and the within-cluster label mix while destroying the association a box
+    would claim.
+    """
+    lifts = []
+    for _ in range(n_perm):
+        order = rng.permutation(len(groups))
+        yp = np.empty_like(y)
+        for j, g in enumerate(groups):
+            pool = y[groups[order[j]]]
+            yp[g] = pool[rng.integers(0, pool.size, g.size)]
+        if yp.sum() == 0 or yp.sum() == yp.size:
+            continue
+        idx, _l, _c, _t = _fit(X, yp)
+        lifts.append(float(yp[idx].mean() / max(yp.mean(), 1e-12)))
+    if not lifts:
+        return np.nan, np.nan
+    return float(np.percentile(lifts, 95)), float(np.median(lifts))
+
+
+def boot_freq_clustered(X, y, groups, full, n_cols, rng, n_boot=PLAN_BOOTSTRAP):
+    """Frequency a dimension is restricted AND supported under a CLUSTER-level resample.
+
+    Resampling plans would resample the same condition tag ~200 times over and report
+    near-certainty for whatever that tag happens to look like; resampling tags is the
+    honest unit.
+    """
+    counts = np.zeros(n_cols)
+    done = 0
+    for _ in range(n_boot):
+        take = np.concatenate([groups[p] for p in
+                               rng.integers(0, len(groups), len(groups))])
+        Xb, yb = X[take], y[take]
+        if yb.sum() < 2 or yb.sum() == yb.size:
+            continue
+        bi, blims, _bc, _bt = _fit(Xb, yb)
+        bdims = _restricted_dims(blims, full)
+        bp = quasi_p(Xb, yb, bi, blims, bdims)
+        for d in bdims:
+            if bp[d] <= PRIM_PVALUE_MAX:
+                counts[d] += 1
+        done += 1
+    return counts / max(done, 1)
+
+
+def _box_provenance(F, idx, top=5):
+    """Which clusters and native tags a box is drawn from - the artefact check."""
+    sub = F.iloc[idx]
+    arch = F["native_tag"].value_counts(normalize=True)
+    box = sub["native_tag"].value_counts(normalize=True)
+    return {
+        "n_clusters_in_box": int(sub["cluster"].nunique()),
+        "n_clusters_total": int(F["cluster"].nunique()),
+        "n_runs_in_box": int(sub["run"].nunique()),
+        "top_tag_share": float(box.iloc[0]) if len(box) else 0.0,
+        "top_tags": [{"native_tag": str(t), "share_box": float(s),
+                      "share_archive": float(arch[t]),
+                      "enrichment": float(s / arch[t]) if arch[t] else np.nan}
+                     for t, s in box.head(top).items()],
+    }
+
+
+def plan_feature_sets(F):
+    """(core, full) covariate lists after re-applying the degenerate-value screen."""
+    cand = [c for c in CORE_FEATURES if c in F.columns]
+    zb = sorted(c for c in F.columns if c.startswith("zbar_"))
+    core = [c for c in cand if F[c].nunique() >= PLAN_FEATURE_MIN_DISTINCT]
+    extra = [c for c in zb if F[c].nunique() >= PLAN_FEATURE_MIN_DISTINCT]
+    return core, core + extra
+
+
+def plan_outcomes(F, lhc):
+    """(id, y, row mask, question) for each outcome a box is fitted on."""
+    ok = ~F["uncovered_artefact"].to_numpy()
+    out = [
+        ("robust", F["is_robust"].to_numpy(bool), ok,
+         "which plans stay good under every variant"),
+        ("fragile", F["is_fragile"].to_numpy(bool), ok,
+         "which plans break - the classic PRIM direction"),
+        ("within_cluster", F["within_cluster_robust"].to_numpy(bool), ok,
+         "given the formulation that found it, which map shape survives"),
+    ]
+    if lhc is not None:
+        # The cost-matched column: the discrete outcomes above are cost-matched too, so
+        # a Jaccard between their boxes compares uncertainty sets rather than conventions.
+        col = ("lhc_regret_cm_p90" if "lhc_regret_cm_p90" in lhc.columns
+               else "lhc_regret_p90")
+        j = F["plan_id"].map({int(p): v for p, v in
+                              zip(lhc["plan_id"], lhc[col])}).to_numpy(float)
+        has = np.isfinite(j) & ok
+        thr = float(np.quantile(j[has], 1.0 - ROBUST_QUANTILE))
+        y = np.zeros(len(F), bool)
+        y[has] = j[has] >= thr
+        out.append(("lhc", y, has,
+                    "fragile under the continuous ensemble, not the 61 corners"))
+    return out
+
+
+def cmd_plan_prim(argv=()):
+    """PRIM over plan characteristics: four outcomes x two feature sets, run-clustered."""
+    F = _load_features()
+    lhc = pd.read_csv(PLAN_LHC_CSV) if PLAN_LHC_CSV.exists() else None
+    if lhc is None:
+        print(f"  ({PLAN_LHC_CSV.name} absent - skipping the `lhc` outcome)")
+    core_cols, full_cols = plan_feature_sets(F)
+    clusters = F["cluster"].to_numpy()
+    rng = np.random.default_rng(PLAN_SEED)
+
+    print(f"  {len(F)} plans, {F['cluster'].nunique()} {CLUSTER_LABEL}s "
+          f"(clustering on {CLUSTER_BY}). Feature sets: core {len(core_cols)}, "
+          f"full {len(full_cols)}.")
+    print(f"  lift = box density / base rate. A box must clear the {CLUSTER_LABEL.upper()}"
+          "-level null; the plan-level\n  null is printed beside it to show what ignoring "
+          "the clustering would have claimed.\n")
+
+    box_rows, dim_rows, traj_rows, membership, prov = [], [], [], {}, {}
+    for set_name, cols in (("core", core_cols), ("full", full_cols)):
+        for out_name, y_all, mask, question in plan_outcomes(F, lhc):
+            key = f"{set_name}/{out_name}"
+            sub = np.flatnonzero(mask)
+            X = F[cols].to_numpy(float)[sub]
+            y = np.asarray(y_all[sub], float)
+            if y.sum() == 0 or y.sum() == y.size:
+                print(f"  {key:<20} degenerate ({y.mean():.0%}) - no box")
+                continue
+            full = np.column_stack([X.min(axis=0), X.max(axis=0)])
+            groups = _cluster_groups(clusters[sub])
+            idx, lims, chosen, traj = _fit(X, y)
+            dims = _restricted_dims(lims, full)
+            pvals = quasi_p(X, y, idx, lims, dims)
+            lift = float(y[idx].mean() / y.mean())
+            null95, null50 = null_lift_clustered(X, y, groups, rng)
+            plain95, _p50 = null_lift(X, y, rng)
+            credible = bool(lift > null95)
+            membership[_mem_key(key)] = sub[idx]
+            prov[key] = _box_provenance(F.iloc[sub].reset_index(drop=True), idx)
+            print(f"  {key:<22} base {y.mean():>5.1%}  density {y[idx].mean():.2f}  "
+                  f"cov {y[idx].sum() / y.sum():.2f}  mass {idx.size / len(X):.2f}  "
+                  f"lift {lift:.1f}x vs {CLUSTER_LABEL}-null {null95:.1f}x (plan-null "
+                  f"{plain95:.1f}x)  {'CREDIBLE' if credible else 'NOT ABOVE NULL'}")
+            print(f"       {prov[key]['n_clusters_in_box']} of "
+                  f"{prov[key]['n_clusters_total']} {CLUSTER_LABEL}s represented; "
+                  f"top native_tag {prov[key]['top_tag_share']:.0%} of the box")
+
+            freq = (boot_freq_clustered(X, y, groups, full, len(cols), rng)
+                    if credible else np.full(len(cols), np.nan))
+            for d in dims:
+                dim_rows.append({"outcome": key, "feature_set": set_name,
+                                 "dimension": cols[d], "lo": lims[d, 0],
+                                 "hi": lims[d, 1], "quasi_p": pvals[d],
+                                 "supported": pvals[d] <= PRIM_PVALUE_MAX,
+                                 "boot_freq": float(freq[d])})
+            for t in traj:
+                traj_rows.append({"outcome": key, "step": t["step"], "mass": t["mass"],
+                                  "density": t["density"], "coverage": t["coverage"],
+                                  "selected": t["step"] == chosen["step"]})
+            box_rows.append({
+                "outcome": key, "feature_set": set_name, "outcome_id": out_name,
+                "question": question, "n_rows": int(len(X)), "n_clusters": len(groups),
+                "base_rate": float(y.mean()), "mass": idx.size / len(X),
+                "density": float(y[idx].mean()),
+                "coverage": float(y[idx].sum() / y.sum()), "lift": lift,
+                "null_lift_p95": null95, "null_lift_median": null50,
+                "plain_null_lift_p95": plain95, "credible": credible,
+                "n_restricted": len(dims),
+                "n_clusters_in_box": prov[key]["n_clusters_in_box"],
+                "n_runs_in_box": prov[key]["n_runs_in_box"],
+                "top_tag_share": prov[key]["top_tag_share"],
+                "restricted": ";".join(
+                    f"{cols[d]}=[{lims[d, 0]:.4g},{lims[d, 1]:.4g}]" for d in dims),
+            })
+            sup = [cols[d] for d in dims if pvals[d] <= PRIM_PVALUE_MAX]
+            print(f"       supported: {', '.join(sup) if sup else 'none'}\n")
+
+    ensure(OUT_DIR)
+    pd.DataFrame(box_rows).to_csv(OUT_DIR / "plan_boxes.csv", index=False)
+    pd.DataFrame(dim_rows).to_csv(OUT_DIR / "plan_dimension_support.csv", index=False)
+    pd.DataFrame(traj_rows).to_csv(OUT_DIR / "plan_peel_trajectory.csv", index=False)
+    np.savez_compressed(OUT_DIR / "plan_box_membership.npz", **membership)
+    n_cred = sum(1 for r in box_rows if r["credible"])
+    print(f"  {n_cred} of {len(box_rows)} boxes clear the {CLUSTER_LABEL}-level null.")
+    print(f"  -> {OUT_DIR / 'plan_boxes.csv'}")
+    report_update("plan_prim", {
+        "cluster_by": CLUSTER_BY, "n_clusters": int(F["cluster"].nunique()),
+        "core_features": core_cols, "full_features": full_cols,
+        "n_boxes": len(box_rows), "n_credible": n_cred,
+        "null_permutations": PLAN_NULL_PERM, "bootstrap": PLAN_BOOTSTRAP,
+        "boxes": box_rows, "dimensions": dim_rows, "provenance": prov,
+    })
+
+
+# ===========================================================================
+# stage: plan_compare
+# ===========================================================================
+def cmd_plan_compare(argv=()):
+    """Do the four outcomes describe the same plans, and what does the box look like?"""
+    boxes = pd.read_csv(OUT_DIR / "plan_boxes.csv")
+    dims = pd.read_csv(OUT_DIR / "plan_dimension_support.csv")
+    mem = dict(np.load(OUT_DIR / "plan_box_membership.npz", allow_pickle=True))
+    F = _load_features()
+    lhc = pd.read_csv(PLAN_LHC_CSV) if PLAN_LHC_CSV.exists() else None
+
+    dropped = list(boxes.loc[~boxes.credible, "outcome"])
+    ids = list(boxes.loc[boxes.credible, "outcome"])
+    if dropped:
+        print(f"  excluded, box does not clear the {CLUSTER_LABEL}-level null: {dropped}")
+    if len(ids) < 2:
+        raise SystemExit("fewer than two credible boxes - nothing to compare")
+
+    # Populations are a property of the outcome, not the feature set, and are rebuilt
+    # rather than stored: `lhc` is fitted on the 2000-plan subsample and the rest on all
+    # 14591, so every cross-outcome comparison has to be restricted to the rows BOTH
+    # boxes could have selected.
+    pops = {}
+    for s in ("core", "full"):
+        for oid, _y, m, _q in plan_outcomes(F, lhc):
+            pops[f"{s}/{oid}"] = np.flatnonzero(m)
+
+    def overlap(a, b):
+        """(Jaccard, containment, chance containment) on the shared population."""
+        common = np.intersect1d(pops[a], pops[b])
+        A = np.intersect1d(mem[_mem_key(a)], common)
+        B = np.intersect1d(mem[_mem_key(b)], common)
+        inter = np.intersect1d(A, B).size
+        small, big = (A, B) if A.size <= B.size else (B, A)
+        return (jaccard(A, B),
+                inter / max(small.size, 1),
+                big.size / max(common.size, 1))
+
+    print("\n  pairwise overlap of the in-box PLAN sets, on each pair's shared population")
+    M = np.ones((len(ids), len(ids)))
+    for a in range(len(ids)):
+        for b_ in range(a + 1, len(ids)):
+            M[a, b_] = M[b_, a] = overlap(ids[a], ids[b_])[0]
+    w = max(len(i) for i in ids) + 2
+    print(" " * w + "".join(f"{i:>22}" for i in ids))
+    for a, i in enumerate(ids):
+        print(f"{i:<{w}}" + "".join(f"{M[a, b_]:>22.2f}" for b_ in range(len(ids))))
+
+    # Jaccard is capped by the mass gap between two boxes - a 13%-mass box nested inside
+    # a 40%-mass one reads 0.33 at PERFECT agreement - so the verdicts below are read off
+    # CONTAINMENT (what share of the smaller box the larger one holds) against the
+    # containment a box of that size would get by chance, which is the larger box's own
+    # mass. PLAN_OVERLAP_MIN still applies to the Jaccard where the masses are alike.
+    print("\n  the two comparisons that matter, read off containment vs chance")
+    verdicts = {}
+    for s in ("core", "full"):
+        for a, b, high, low in (
+                ("robust", "within_cluster",
+                 f"the archive-wide box survives with the {CLUSTER_LABEL} effect "
+                 "removed, so it is a map-shape result",
+                 "the archive-wide box is largely carried by provenance - state the "
+                 "plan-shape result as the within_cluster one"),
+                ("fragile", "lhc",
+                 "the 61 discrete corners stand in for the sampled space",
+                 "the discrete corners and the sampled ensemble pick out different "
+                 "fragile plans")):
+            ka, kb = f"{s}/{a}", f"{s}/{b}"
+            if ka not in ids or kb not in ids:
+                continue
+            j, cont, chance = overlap(ka, kb)
+            verdicts[f"{s}: {a} vs {b}"] = {"jaccard": j, "containment": cont,
+                                            "chance_containment": chance}
+            print(f"    [{s}] {a} vs {b}: Jaccard {j:.2f}, containment {cont:.2f} "
+                  f"vs {chance:.2f} by chance ({cont / max(chance, 1e-9):.1f}x) -> "
+                  + (high if cont > 2 * chance else low))
+
+    print("\n  supported features, by outcome (bootstrap support in brackets)")
+    bind = []
+    for oid in ids:
+        sub = dims[(dims.outcome == oid) & dims.supported].sort_values(
+            "boot_freq", ascending=False)
+        print(f"    {oid:<20} " + ("  ".join(
+            f"{r.dimension}[{r.boot_freq:.2f}]" for r in sub.itertuples())
+            or "none supported"))
+        bind.append({"outcome": oid, "features": list(sub["dimension"]),
+                     "boot_freq": [float(v) for v in sub["boot_freq"]]})
+
+    _plan_compare_figures(boxes, dims, mem, F, ids)
+    report_update("plan_compare", {
+        "credible": ids, "excluded": dropped,
+        "overlap_matrix": M.tolist(), "overlap_labels": ids,
+        "verdicts": verdicts, "binding_features": bind,
+    })
+
+
+def _plan_compare_figures(boxes, dims, mem, F, ids):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    ensure(FIG_DIR)
+
+    # _fig_boxes/_fig_heatmap group on a `plan_id` column; here the group is an outcome,
+    # so the names are carried through their label_of hook rather than in the codes.
+    code = {o: i for i, o in enumerate(ids)}
+    d = dims[dims.outcome.isin(ids)].copy()
+    d["plan_id"] = d["outcome"].map(code)
+    base = dict(zip(boxes.outcome, boxes.base_rate))
+    order = list(boxes[boxes.credible].sort_values("lift", ascending=False)["outcome"])
+    order_codes = [code[o] for o in order]
+    name = {v: k for k, v in code.items()}
+    fail_of = {code[o]: base[o] for o in ids}
+
+    # Bounds are normalised against the ARCHIVE-wide feature range so the outcomes are
+    # on one scale; the `lhc` box was peeled inside its subsample's own range, which the
+    # stratified draw keeps close to it but does not make identical.
+    cols = sorted(set(dims["dimension"]))
+    lo = F[cols].min().to_numpy()
+    hi = F[cols].max().to_numpy()
+    rng = np.where(hi > lo, hi - lo, 1.0)
+    _fig_boxes(d, order_codes, order_codes, fail_of, cols, lo, rng,
+               fname="plan_boxes.png",
+               title="Robustness boxes over plan characteristics",
+               label_of=lambda c: f"{name[c]}\n{fail_of[c]:.0%} base")
+    _fig_heatmap(d, order_codes, order_codes, fail_of, cols, lo, hi,
+                 fname="plan_feature_heatmap.png",
+                 title="Which plan characteristics bind, across outcomes",
+                 label_of=lambda c: f"{name[c]} ({fail_of[c]:.0%})")
+
+    # The marginal decomposition next to the box: a bar whose raw and between-cluster
+    # heights match and whose within-cluster height is ~0 is a provenance effect.
+    marg = pd.read_csv(PLAN_MARGINALS_CSV).sort_values(
+        "spearman_raw", key=np.abs, ascending=False)
+    y = np.arange(len(marg))
+    fig, ax = plt.subplots(figsize=(7, 0.34 * len(marg) + 1.6))
+    for off, col, lab, c in (
+            (-0.27, "spearman_raw", "raw", "tab:blue"),
+            (0.0, "spearman_within_cluster", f"within {CLUSTER_LABEL}", "tab:green"),
+            (0.27, "spearman_between_cluster", f"between {CLUSTER_LABEL}", "tab:orange")):
+        ax.barh(y + off, marg[col], height=0.26, color=c, label=lab)
+    ax.set_yticks(y)
+    ax.set_yticklabels(marg["feature"], fontsize=8)
+    ax.invert_yaxis()
+    ax.axvline(0, color="0.4", lw=0.8)
+    ax.set_xlabel("Spearman with max_regret")
+    ax.set_title(f"Feature association, split by the {CLUSTER_LABEL} confound")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "plan_feature_marginals.png", dpi=140)
+    plt.close(fig)
+
+    _fig_box_maps(mem, F, ids)
+    print(f"\n  figures -> {FIG_DIR}")
+
+
+def _selection_frequency(plans, idx, n_cells, chunk=500):
+    """Per-cell selection frequency, accumulated in chunks.
+
+    uncertainty_analysis._frequency concatenates every plan first, which is 2.4 GB for
+    the out-of-box complement here (14k plans x 22k cells); the counts are the same.
+    """
+    counts = np.zeros(n_cells, np.int64)
+    for s in range(0, len(idx), chunk):
+        block = np.concatenate([plans[i] for i in idx[s:s + chunk]]).astype(np.int64)
+        counts += np.bincount(block, minlength=n_cells)
+    return counts.astype(float) / max(len(idx), 1)
+
+
+def _fig_box_maps(mem, F, ids):
+    """What the box looks like on the ground: in-box vs out-of-box selection frequency."""
+    import matplotlib.pyplot as plt
+    A = load_archive()
+    L = load_layers([BASELINE_TAG])
+    shape = L["shape"]
+    n_cells = int(np.prod(shape))
+    pick = [o for o in ids if o.endswith("/robust")] or ids[:1]
+    oid = pick[0]
+    inbox = F["plan_id"].to_numpy()[mem[_mem_key(oid)]]
+    outbox = np.setdiff1d(F["plan_id"].to_numpy(), inbox)
+    f_in = _selection_frequency(A["plans"], inbox, n_cells).reshape(shape)
+    f_out = _selection_frequency(A["plans"], outbox, n_cells).reshape(shape)
+
+    # The frequency panels keep an absolute 0-1 scale - that is the quantity. The
+    # difference panel is scaled to its own observed extreme instead: fixing it at +/-1
+    # leaves the colourbar's outer half empty and the real gap reads as no gap at all.
+    dif = f_in - f_out
+    dlim = float(np.abs(dif).max())
+    fig, axs = plt.subplots(1, 3, figsize=(13, 4.4))
+    for ax, img, ttl, cm, lim in (
+            (axs[0], f_in, f"in box ({inbox.size} plans)", "Greens", (0, 1)),
+            (axs[1], f_out, f"outside ({outbox.size} plans)", "Greens", (0, 1)),
+            (axs[2], dif, f"difference (+/-{dlim:.2f})", "RdBu_r", (-dlim, dlim))):
+        im = ax.imshow(img, cmap=cm, vmin=lim[0], vmax=lim[1], interpolation="nearest")
+        ax.set_title(ttl, fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, shrink=0.75)
+    fig.suptitle(f"Selection frequency, {oid} box", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "plan_box_maps.png", dpi=140)
     plt.close(fig)
 
 
@@ -1161,7 +2019,8 @@ def _fig_heatmap(dims, ids, order_ids, fail_of, cols, lo, hi):
 # ===========================================================================
 STAGES = {"gate": cmd_gate, "select": cmd_select, "design": cmd_design,
           "score": cmd_score, "fail": cmd_fail, "prim": cmd_prim,
-          "compare": cmd_compare}
+          "compare": cmd_compare, "features": cmd_features, "plan_lhc": cmd_plan_lhc,
+          "plan_prim": cmd_plan_prim, "plan_compare": cmd_plan_compare}
 
 
 def cmd_all(argv=()):
