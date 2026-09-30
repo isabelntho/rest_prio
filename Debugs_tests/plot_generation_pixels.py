@@ -9,7 +9,7 @@
 #
 # Two X_history shapes are handled:
 #   - sparse:  n_gens == len(GENERATIONS) -> the run used
-#              snapshot_generations={1, 11, 26, 51, 101, 151} (resto_anom.py),
+#              snapshot_generations={1, 11, 26, 51, 101, 151} (optimization_engine.py),
 #              so each row already IS one of GENERATIONS, in order.
 #   - dense:   n_gens > len(GENERATIONS)  -> every generation was snapshotted,
 #              so row index == generation number (0-indexed).

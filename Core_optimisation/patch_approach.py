@@ -13,7 +13,7 @@ OVERVIEW
 - Benefits: Smaller decision space, faster optimization for large areas
 - Patches defined on fixed non-overlapping grid
 
-USAGE IN resto_anom.py
+USAGE IN optimization_engine.py
 ----------------------
 Simply set use_patch_approach=True in run_single_scenario_optimization():
    
@@ -43,7 +43,7 @@ PATCH STRUCTURE
 
 IMPLEMENTATION
 --------------
-The PatchRestorationProblem class (in resto_anom.py):
+The PatchRestorationProblem class (in optimization_engine.py):
   - Inherits from RestorationProblem
   - Converts patch decisions -> pixel decisions internally
   - Evaluates using existing pixel-level objective functions

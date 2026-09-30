@@ -3,7 +3,7 @@
 The NSGA-II front for ["restoration_benefit", "cost"] has never been bounded. That
 formulation is exactly linearisable: anomaly_improvement_weight depends only on the
 BASELINE anomaly, so each pixel's direct gain is a constant, and spillover is a coverage
-effect (a cell gains once however many restored neighbours it has, resto_anom.py:398-420).
+effect (a cell gains once however many restored neighbours it has, optimization_engine.py:398-420).
 So the problem is an integer linear program.
 
 This solves it with HiGHS (via scipy.optimize.milp) under an epsilon-constraint sweep on
@@ -43,7 +43,7 @@ from Core_optimisation.patch_approach import (
     create_patch_mappings,
     convert_patch_decisions_to_pixels,
 )
-from Core_optimisation.resto_anom import RestorationProblem, anomaly_improvement_weight
+from Core_optimisation.optimization_engine import RestorationProblem, anomaly_improvement_weight
 from Core_optimisation.regret_common import write_report
 from Core_optimisation.uncertainty_analysis import (
     effect_params_of,

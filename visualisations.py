@@ -1498,7 +1498,7 @@ def plot_parallel_coordinates(pkl_path, save_path=None, figsize=(12, 7), alpha_b
     n_dominated = n_solutions - n_nondominated
 
     # Get objective names
-    from Core_optimisation.resto_anom import RestorationProblem
+    from Core_optimisation.optimization_engine import RestorationProblem
     problem = RestorationProblem(results['initial_conditions'], results['scenario_params'])
     
     # Clean up names for display

@@ -77,7 +77,7 @@ class _Stub:
 
 
 def _build_region_scores(ic):
-    from Core_optimisation.resto_anom import build_repair_scores
+    from Core_optimisation.optimization_engine import build_repair_scores
     scores = np.asarray(build_repair_scores(ic, INITPOP_PARAMS), dtype=np.float64)
     cost2d = ic.get("implementation_cost")
     rmask = ic.get("restoration_eligible_mask")
@@ -87,7 +87,7 @@ def _build_region_scores(ic):
             def _z(a):
                 sd = a.std()
                 return (a - a.mean()) / sd if sd > 0 else np.zeros_like(a)
-            scores = _z(scores) - _z(cpix)   # same blend resto_anom uses for 'scored'
+            scores = _z(scores) - _z(cpix)   # same blend optimization_engine uses for 'scored'
     return scores
 
 
@@ -103,7 +103,7 @@ def cmd_initpop():
     n_var = n_rest + n_conv
     max_action = int(INITPOP_PARAMS["max_restoration_fraction"] * n_rest)
 
-    # match resto_anom's min-patch seed cap so the initial regions are >= S on average
+    # match optimization_engine's min-patch seed cap so the initial regions are >= S on average
     region_seeds = min(int(INITPOP_PARAMS["region_seeds"]), max(1, max_action // S))
     region_seeds_min = min(int(INITPOP_PARAMS["region_seeds_min"]), region_seeds)
 
@@ -160,7 +160,7 @@ def _share_tag(share):
 
 
 def _initsens_run_sweep(ic, pop_size, n_generations, shares, seeds, smoke):
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     n_runs = len(shares) * len(seeds)
     done = ok = 0
     t0 = time.perf_counter()
@@ -255,7 +255,7 @@ def _neut_newest_per_seed(bias, seeds):
 
 
 def _neut_run_sweep(ic, pop_size, n_generations, seeds, smoke):
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     n_runs = len(NEUT_BIASES) * len(seeds)
     done = ok = 0
     t0 = time.perf_counter()

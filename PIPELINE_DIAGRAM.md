@@ -1,6 +1,6 @@
-# Pipeline Diagrams — `resto_anom.py` Internals
+# Pipeline Diagrams — `optimization_engine.py` Internals
 
-Three diagrams documenting how data flows through `resto_anom.py`: the overall module
+Three diagrams documenting how data flows through `optimization_engine.py`: the overall module
 pipeline, the per-solution array transformations inside `_evaluate()` / `restoration_effect()`,
 and the NSGA-III generational loop.
 

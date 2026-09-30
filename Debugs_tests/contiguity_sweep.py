@@ -54,7 +54,7 @@ from _common import (
     REPO_ROOT, RESULTS_DIR, DIAG_DIR, load_ic, use_agg, newest_xhist, render_coverage_gif,
 )
 import numpy as np
-from Core_optimisation.resto_anom import run_optimization_instance
+from Core_optimisation.optimization_engine import run_optimization_instance
 from Core_optimisation.spatial_operations import _label_components, build_restoration_neighbor_table
 
 

@@ -13,7 +13,7 @@ Where the three axes included in the uncertainty analysis currently change what 
 what counts as a successful plan, and it is a distinct source of formulation uncertainty:
 the same ecological aim can be written as accumulating improvement, as bringing area into
 good condition, or as closing a gap. Three forms are implemented (`rp_formulation` in
-`resto_anom.py`), all measured on the combined per-pixel condition score and all against
+`optimization_engine.py`), all measured on the combined per-pixel condition score and all against
 the same reference level `rp_threshold`, which is zero by default and so is the benchmark
 condition itself:
 

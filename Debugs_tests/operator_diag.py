@@ -87,7 +87,7 @@ def _sweep_spread_row(ps, obj_names, gen_idx):
 def cmd_sweep():
     use_agg()
     import matplotlib.pyplot as plt
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
 
     os.makedirs(DIAG_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -206,10 +206,10 @@ def _instr_jaccard(A, B):
 
 
 def _make_logging_hux():
-    """Build the LoggingHUX class lazily (needs pymoo + resto_anom imported)."""
+    """Build the LoggingHUX class lazily (needs pymoo + optimization_engine imported)."""
     from pymoo.operators.crossover.hux import HUX
     from scipy import ndimage
-    from Core_optimisation.resto_anom import _build_operators
+    from Core_optimisation.optimization_engine import _build_operators
 
     class LoggingHUX(HUX):
         """HUX that observes parent/child overlap + contiguity each generation."""
@@ -296,8 +296,8 @@ def _make_logging_hux():
 
 
 def cmd_instrument():
-    import Core_optimisation.resto_anom as ra
-    from Core_optimisation.resto_anom import run_optimization_instance
+    import Core_optimisation.optimization_engine as ra
+    from Core_optimisation.optimization_engine import run_optimization_instance
 
     LoggingHUX = _make_logging_hux()
     LoggingHUX.LOG = []
@@ -407,7 +407,7 @@ def _front_analyse(res):
 
 
 def cmd_front_check():
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     print("=== REGION FRONT CHECK ===")
     print(f"{FRONT_N_GENERATIONS} gens x {FRONT_N_PARTITIONS} partitions  seed={FRONT_SEED}\n")
     ic_base = load_ic(OBJECTIVES_3)
@@ -452,7 +452,7 @@ REGEV_PARAMS = {
 
 def cmd_region_evolve(arg):
     import glob
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     n_gen = int(arg) if (arg and arg != "run") else 30
     print(f"=== region_evolve spread test ({n_gen} gens, seed {REGEV_SEED}) ===")
     ic = load_ic(["restoration_potential", "spatial_clustering", "cost"])

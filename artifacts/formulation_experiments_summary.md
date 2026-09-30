@@ -196,7 +196,7 @@ Core_optimisation/spatial_operations.py (+654 lines). New region operators and h
 - RegionEvolveMutation - relocate / spawn / delete / grow / shrink whole regions.
 - RegionSwapCrossover - recombine whole parent regions (replaces HUX for this mode).
 
-Core_optimisation/resto_anom.py (+129 lines). Wiring:
+Core_optimisation/optimization_engine.py (+129 lines). Wiring:
 - Import the new operators.
 - _build_operators: new `sampling_strategy` branch ('region_grow' / 'region_evolve');
   scored growth blends standardised score minus standardised per-pixel cost; now returns

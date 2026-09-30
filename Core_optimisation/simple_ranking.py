@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .patch_approach import create_patch_mappings
-from .resto_anom import RestorationProblem
+from .optimization_engine import RestorationProblem
 from .uncertainty_analysis import build_variant_layer, effect_params_of, nondominated_2d
 
 N_LAMBDA = 15   # 0, 13 log-spaced in [1e-2, 1e2], and inf (pure cheapest-first)

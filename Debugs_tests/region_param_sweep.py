@@ -2,7 +2,7 @@
 
 The five region knobs (region_seeds, region_seeds_min, region_growth_bias,
 region_mutation_edits, region_random_share) were set by hand and never validated. They are
-all consumed in one place, _build_operators (Core_optimisation/resto_anom.py:1719-1783),
+all consumed in one place, _build_operators (Core_optimisation/optimization_engine.py:1719-1783),
 and feed RegionGrowingSampling / RegionGrowingMutation. Three of them (seeds, seeds_min,
 random_share) affect ONLY the initial population; growth_bias affects sampling, mutation
 and the repair; mutation_edits affects only mutation.
@@ -11,7 +11,7 @@ This is a ONE-AT-A-TIME sweep: a baseline arm holding the production values from
 run_custom_nsga2.py, plus one arm per alternative level of one knob.
 
 There is also a `regionswap` control arm. region_grow leaves crossover=None, so
-_build_algorithm falls back to pixel-level HUX (resto_anom.py:1865-1866), which shatters
+_build_algorithm falls back to pixel-level HUX (optimization_engine.py:1865-1866), which shatters
 the contiguous regions the sampler builds: plans seeded with 25 vs 500 regions both
 collapse to ~2900 components within a couple of generations. That would make the three
 initial-population-only knobs look inert for a reason unrelated to those knobs. The arm
@@ -55,10 +55,10 @@ Subcommands (pixi run python Debugs_tests/region_param_sweep.py <cmd>):
              what separates a real spatial shift from seed noise.
 
 Fixed across all arms so the knobs are isolated:
-  - sampling_strategy="region_grow" (under region_evolve, resto_anom.py:1753-1757 hardcodes
+  - sampling_strategy="region_grow" (under region_evolve, optimization_engine.py:1753-1757 hardcodes
     growth_bias='neutral' on the sampler and never passes random_share, so two of the five
     knobs would be inert).
-  - warm_seeding=False: resto_anom.py:2235-2246 wraps the sampler in WarmStartSampling,
+  - warm_seeding=False: optimization_engine.py:2235-2246 wraps the sampler in WarmStartSampling,
     which would overwrite part of the initial population and dilute exactly the three
     sampling-only knobs. run_custom_nsga2.py already runs with WARM_SEEDING=False.
   - hv_patience = n_generations + 1, i.e. HV early stopping OFF, so every arm gets an equal
@@ -85,7 +85,7 @@ from _common import (
     REPO_ROOT, RESULTS_DIR, DIAG_DIR, load_ic, use_agg, spread_metrics,
 )
 import numpy as np
-from Core_optimisation.resto_anom import run_optimization_instance
+from Core_optimisation.optimization_engine import run_optimization_instance
 from Core_optimisation.spatial_operations import _label_components, build_restoration_neighbor_table
 
 
@@ -258,7 +258,7 @@ def _preflight(ic, arms_to_run=None):
     """Print the arm table and verify nothing silently rewrites an arm's parameters.
 
     Two ways an arm can end up running something other than its label says:
-      1. resto_anom.py:1729-1734 caps region_seeds at max_action_pixels // min_patch_size
+      1. optimization_engine.py:1729-1734 caps region_seeds at max_action_pixels // min_patch_size
          when min_patch_size > 1, and clamps region_seeds_min to match.
       2. spatial_operations.py:990 clamps the per-individual seed count to
          s_lo = max(1, min(region_seeds_min, region_seeds)), so region_seeds_min > seeds
@@ -266,7 +266,7 @@ def _preflight(ic, arms_to_run=None):
     Both are cheap to check here and expensive to discover after the full sweep.
     """
     n_rest = int(ic["n_restoration_pixels"])
-    budget = int(BASE_PARAMS["max_restoration_fraction"] * n_rest)   # resto_anom.py:626
+    budget = int(BASE_PARAMS["max_restoration_fraction"] * n_rest)   # optimization_engine.py:626
     S = int(BASE_PARAMS["min_patch_size"])
     cap = max(1, budget // S) if S > 1 else None
 

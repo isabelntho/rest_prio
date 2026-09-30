@@ -123,7 +123,7 @@ def make_toy_landscape(H=GRID_H, W=GRID_W):
     Potential and cost are smooth but only PARTLY overlapping, so the blended
     score has genuine trade-off structure rather than a single optimum. The
     blend z(potential) - z(cost) mirrors the real region_scores construction in
-    resto_anom.py.
+    optimization_engine.py.
     """
     rr, cc = np.mgrid[0:H, 0:W].astype(float)
 

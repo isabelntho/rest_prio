@@ -5,7 +5,7 @@
 #   run_custom_nsga2.py   : the run configuration of the reported baseline
 #                           (OBJECTIVES, custom_scenario_params, POLICY_VARIANTS,
 #                            top-level consts, condition-grid tag list)
-#   resto_anom.py         : effect-model constants (effect_params dict; scale/gamma in
+#   optimization_engine.py         : effect-model constants (effect_params dict; scale/gamma in
 #                           anomaly_improvement_weight) and operator defaults applied
 #                           when a run script leaves a knob unset
 #   spatial_operations.py : region-operator internals that are not run-configurable
@@ -72,7 +72,7 @@ def _parse_config(*relparts):
 _obj, _cp, _pol, _c, _tags = _parse_config("Core_optimisation", RUN_SCRIPT)
 
 # --- Effect-model constants and operator defaults from the engine ------------
-_ra = ast.parse(_load_source("Core_optimisation", "resto_anom.py"))
+_ra = ast.parse(_load_source("Core_optimisation", "optimization_engine.py"))
 _effect, _weight_scale, _gamma = {}, 1.0, 3.0
 for _node in ast.walk(_ra):
     if isinstance(_node, ast.Assign):

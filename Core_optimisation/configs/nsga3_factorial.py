@@ -84,12 +84,12 @@ custom_scenario_params = {
     "burden_sharing": "no",
     # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
     # rp_threshold is the "good state" cutoff / reference level for the latter two.
-    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (resto_anom.py).
+    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (optimization_engine.py).
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
     # spatial_clustering metric (only used when that objective is in OBJECTIVES):
     # "adjacency" (default) / "components" / "inter_patch_adjacency" (needs patch approach).
-    # See RestorationProblem.__init__ (resto_anom.py) for what each measures.
+    # See RestorationProblem.__init__ (optimization_engine.py) for what each measures.
     "clustering_metric": "adjacency",
 }
 

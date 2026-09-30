@@ -33,7 +33,7 @@ import sys
 import time
 
 from .data_loader import load_initial_conditions
-from .resto_anom import run_optimization_instance
+from .optimization_engine import run_optimization_instance
 
 
 def _invoke(ic, scenario_params, run_label, run_config, seed, cfg):

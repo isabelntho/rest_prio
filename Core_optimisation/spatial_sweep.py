@@ -44,7 +44,7 @@ from scipy import ndimage
 from .data_loader import load_initial_conditions
 from .grid_parallel import _invoke
 from .paths import OUTPUTS
-from .resto_anom import RestorationProblem, initialize_patch_approach
+from .optimization_engine import RestorationProblem, initialize_patch_approach
 from .run import _build_run_config, _grid_cfg, _load_preset, _resolve_runs
 
 PRESET = "nsga2_2obj"

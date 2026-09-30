@@ -24,7 +24,7 @@ from _common import REPO_ROOT  # noqa: F401  (puts the repo root on sys.path)
 
 from Core_optimisation.data_loader import load_initial_conditions
 from Core_optimisation.patch_approach import create_patch_mappings, convert_patch_decisions_to_pixels
-from Core_optimisation.resto_anom import RestorationProblem, restoration_effect
+from Core_optimisation.optimization_engine import RestorationProblem, restoration_effect
 from Core_optimisation.uncertainty_analysis import effect_params_of, plan_masks
 from Core_optimisation.exact_front import (
     build_coefficients, build_coverage, benefit_from_matrix, OBJECTIVE_NAMES)

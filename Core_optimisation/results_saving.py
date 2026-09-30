@@ -833,7 +833,7 @@ def save_results_with_reports(problem_or_results, res=None, initial_conditions=N
     return {
         'pickle_file': pickle_path,
         'summary_file': summary_path,
-        'results_df': None # This was added in resto_anom, so we keep it for compatibility
+        'results_df': None # This was added in optimization_engine, so we keep it for compatibility
     }
 
 def save_parameter_summary(output_dir=str(OUTPUTS), n_samples_per_param=3, random_seed=42, verbose=True):
@@ -846,7 +846,7 @@ def save_parameter_summary(output_dir=str(OUTPUTS), n_samples_per_param=3, rando
         random_seed: Random seed used for sampling
         verbose: Print save status
     """
-    from .resto_anom import define_scenario_parameters, sample_scenario_parameters
+    from .optimization_engine import define_scenario_parameters, sample_scenario_parameters
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     

@@ -52,7 +52,7 @@ THRESH = 0.5
 # snapshot  (was snapshot_run_S2.py)
 # ===========================================================================
 def cmd_snapshot():
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     seed = 606
     run_label = f"snap_S2_scored_seed_{seed}"
     ic = load_ic(["restoration_benefit", "cost"])
@@ -166,7 +166,7 @@ def _plot_curves(curves):
 
 
 def _sweep_run():
-    from Core_optimisation.resto_anom import run_optimization_instance
+    from Core_optimisation.optimization_engine import run_optimization_instance
     os.makedirs(OUT_DIR, exist_ok=True)
     ic = load_ic(["restoration_benefit", "cost"])
     rest_idx = np.asarray(ic["restoration_eligible_indices"])

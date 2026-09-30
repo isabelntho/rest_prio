@@ -34,7 +34,7 @@ Full input inventory is in `provenance_manifest.json`.
 ## Objectives (selectable subset per run)
 
 All objectives are minimised (improvements are sign-flipped). A run selects a subset from the
-set below. The code (`../Core_optimisation/resto_anom.py`, `RestorationProblem.__init__`)
+set below. The code (`../Core_optimisation/optimization_engine.py`, `RestorationProblem.__init__`)
 currently exposes up to ten objectives; not all are equally mature.
 
 Production (used in current run matrices):

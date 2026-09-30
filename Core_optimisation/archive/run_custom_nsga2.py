@@ -25,7 +25,7 @@ import os
 import time
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from ..resto_anom import run_optimization_instance, main
+from ..optimization_engine import run_optimization_instance, main
 from ..data_loader import load_initial_conditions
 from ..grid_parallel import run_tag, run_factorial_cell, run_custom_seed
 from ..logger_setup import setup_logger
@@ -159,7 +159,7 @@ custom_scenario_params = {
     "burden_sharing": "no",
     # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
     # Inert here since restoration_potential is not in OBJECTIVES above; see
-    # RestorationProblem.__init__ (resto_anom.py) for what each level means.
+    # RestorationProblem.__init__ (optimization_engine.py) for what each level means.
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
     # Pixel-mode sampling strategy for the 2-objective potential-vs-cost run:
@@ -227,7 +227,7 @@ BENCHMARK_SCENARIOS = ["upper_q75_all"]
 # = 25 runs.
 #
 # FACTORIAL_FORMS is deliberately ONE level. rp_formulation is read only inside the
-# restoration_potential objective (resto_anom.py), and OBJECTIVES above is
+# restoration_potential objective (optimization_engine.py), and OBJECTIVES above is
 # ["restoration_benefit", "cost"] - so every form level would produce an IDENTICAL
 # run and merely triple the grid. Restore ["sum", "threshold", "shortfall"] only if
 # restoration_potential is put back into OBJECTIVES.

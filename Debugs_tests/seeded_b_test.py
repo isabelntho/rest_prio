@@ -9,7 +9,7 @@ discovering it (or something better) from scratch?
 B's 15 ranking plans (outputs/spatial_sweep/runs/B_base-2x2_seed101/simple_ranking/plans.npz,
 already computed, deterministic, and confirmed identical across B's 4 seeds - see the sweep
 qmd's discussion) are converted from pixel-index selections to patch-level decision vectors and
-injected via RestorationProblem's extra_seed_X hook (resto_anom.py::run_optimization_instance),
+injected via RestorationProblem's extra_seed_X hook (optimization_engine.py::run_optimization_instance),
 exploiting the confirmed property that every ranking-front pixel selection is a union of WHOLE
 2x2 tiles - re-verified here rather than assumed, so a stale plans.npz fails loudly.
 
@@ -35,7 +35,7 @@ from _common import REPO_ROOT  # noqa: F401 - import puts REPO_ROOT on sys.path 
 
 from Core_optimisation.data_loader import load_initial_conditions
 from Core_optimisation.paths import OUTPUTS
-from Core_optimisation.resto_anom import RestorationProblem, initialize_patch_approach, run_optimization_instance
+from Core_optimisation.optimization_engine import RestorationProblem, initialize_patch_approach, run_optimization_instance
 from Core_optimisation.spatial_sweep import SETTINGS
 
 B = next(s for s in SETTINGS if s["id"] == "B")

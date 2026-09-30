@@ -5,7 +5,7 @@ import pandas as pd
 from collections import Counter
 
 # Import HVCallback to enable pickle loading
-from Core_optimisation.resto_anom import HVCallback
+from Core_optimisation.optimization_engine import HVCallback
 from Core_optimisation.paths import FIGS_DIR
 
 from visualisations import (

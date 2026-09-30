@@ -8,7 +8,7 @@ import cProfile
 import pstats
 import io
 import time
-from .resto_anom import run_optimization_instance, main
+from .optimization_engine import run_optimization_instance, main
 from .data_loader import load_initial_conditions
 from .logger_setup import setup_logger
 from .paths import LOGS_DIR, R_INPUTS_DIR
@@ -73,7 +73,7 @@ N_PARTITIONS = 12#for 3 objectives 12 # for 4 objectives 6
 # In PATCH mode this flag gates exactly one thing: whether PatchRepair receives the
 # per-objective score rows, i.e. whether repair is direction-aware. It adds no warm
 # seeds - PatchAwareSampling seeds one greedy extreme per scored objective regardless.
-# (In pixel mode it still controls warm-start seeding, see resto_anom.py:2182.)
+# (In pixel mode it still controls warm-start seeding, see optimization_engine.py:2182.)
 WARM_SEEDING = True
 # Expected number of bitflips per individual per generation (k in prob_var = k / n_var).
 # None keeps the historical default of 200. Increase for more exploration, decrease to
@@ -126,17 +126,17 @@ custom_scenario_params = {
     "burden_sharing": "no",
     # restoration_potential formulation: "sum" (default) / "threshold" / "shortfall".
     # rp_threshold is the "good state" cutoff / reference level for the latter two.
-    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (resto_anom.py).
+    # Full semantics: RestorationProblem.__init__ and .evaluate_raw_objectives (optimization_engine.py).
     "rp_formulation": "sum",
     "rp_threshold": 0.0,
     # spatial_clustering metric (only used when that objective is in OBJECTIVES):
     # "adjacency" (default) / "components" / "inter_patch_adjacency" (needs patch approach).
-    # See RestorationProblem.__init__ (resto_anom.py) for what each measures.
+    # See RestorationProblem.__init__ (optimization_engine.py) for what each measures.
     "clustering_metric": "inter_patch_adjacency",
     # Pixel-mode sampling strategy (ignored when USE_PATCH_APPROACH=True):
     # "scattered" (default, scattered plans) / "region_grow" (contiguous regions) /
     # "region_evolve" (regions that relocate/spawn/recombine as wholes, avoiding one
-    # basin). See _build_operators (resto_anom.py) for the operator wiring.
+    # basin). See _build_operators (optimization_engine.py) for the operator wiring.
     "sampling_strategy": "scattered",
     # Minimum-patch-size constraint (price-of-contiguity). Every 4-connected component
     # of selected pixels must be >= min_patch_size pixels, enforced by MinPatchSizeRepair

@@ -622,7 +622,7 @@ def load_initial_conditions(workspace_dir, objectives=None, region='Bern', ecosy
     # This dict is the canonical objective catalogue: the only valid OBJECTIVES
     # names, and what each one means to the optimiser. A value of None means
     # "computed", not "no data" - see the per-key notes below and
-    # RestorationProblem.evaluate_raw_objectives (resto_anom.py) for the formulas.
+    # RestorationProblem.evaluate_raw_objectives (optimization_engine.py) for the formulas.
     all_objectives = {
         # minimise abiotic condition anomaly over restoration-eligible pixels
         'abiotic': str(DATA_DIR / anomaly_dir / f'abiotic_{condition_scenario}.tif'),

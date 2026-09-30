@@ -32,7 +32,7 @@ except Exception:
 import numpy as np
 
 from Core_optimisation.data_loader import load_initial_conditions
-from Core_optimisation.resto_anom import RestorationProblem
+from Core_optimisation.optimization_engine import RestorationProblem
 
 # --- standard locations -----------------------------------------------------
 RESULTS_DIR = os.path.join(REPO_ROOT, "outputs", "results_files")

@@ -21,7 +21,7 @@ When pixel `i` is restored, its anomaly changes by
 |---|---|---|---|
 | Effect magnitude (abiotic) | `abiotic_effect = 0.01` | Placeholder scale for improvement per restored pixel | low |
 | Effect magnitude (biotic) | `biotic_effect = 0.01` | Same as abiotic; no basis to differentiate yet | low |
-| Weight shape - saturation | `sigma` (`anomaly_weight_scale`): 1.0 in the effect model, 0.5 in repair scoring | Spreads score over a broad range of degradation without flattening. NOTE: two code paths disagree - `restoration_effect()` defaults `anomaly_weight_scale` to 1.0 (`resto_anom.py`), while `build_repair_scores()` defaults to 0.5. No run script sets the key, so the effect model uses 1.0 and the repair scores use 0.5. The 0.5-everywhere intent (2026-04-08) is not fully wired. | low |
+| Weight shape - saturation | `sigma` (`anomaly_weight_scale`): 1.0 in the effect model, 0.5 in repair scoring | Spreads score over a broad range of degradation without flattening. NOTE: two code paths disagree - `restoration_effect()` defaults `anomaly_weight_scale` to 1.0 (`optimization_engine.py`), while `build_repair_scores()` defaults to 0.5. No run script sets the key, so the effect model uses 1.0 and the repair scores use 0.5. The 0.5-everywhere intent (2026-04-08) is not fully wired. | low |
 | Weight shape - exponent | `gamma = 3` | Concentrates improvement on more-degraded pixels | low |
 | Improvement is degradation-weighted | `w(a)` form above | More-degraded pixels benefit more; undegraded pixels do not improve | structural |
 | Neighbour spillover radius | `neighbour_radius = 3` pixels | Restoration benefits nearby pixels | low |
@@ -47,7 +47,7 @@ When pixel `i` is restored, its anomaly changes by
 | Assumption | Current value | Rationale | Confidence |
 |---|---|---|---|
 | Restoration budget | `max_restoration_fraction = 0.05` (5% of eligible pixels) | Policy-scale placeholder; swept in policy_grid (0.05 baseline / 0.10 / 0.20) | low |
-| Budget tolerance window | `pixel_tolerance = 0.05` (+/-5%) for patch mode; constraint-evaluation window is `pixel_tolerance * 1.5` = +/-7.5% (`resto_anom.py`). Planning-unit runs use 0.20. | Allows discretisation slack at patch/unit granularity | medium |
+| Budget tolerance window | `pixel_tolerance = 0.05` (+/-5%) for patch mode; constraint-evaluation window is `pixel_tolerance * 1.5` = +/-7.5% (`optimization_engine.py`). Planning-unit runs use 0.20. | Allows discretisation slack at patch/unit granularity | medium |
 | Repair stochasticity | top-k shortlist + softmax (`temperature`, `top_k`) | Preserves population diversity vs greedy repair; note tighter enforcement (10%) was used 2026-04-08 to make the Pareto front reflect genuine trade-offs, later relaxed with higher temperature/top_k | medium |
 | Patch aggregation | 2x2 pixels (`patch_size = 2`) | Shrinks decision space; objectives still evaluated per pixel | medium |
 | Planning-unit mode | grid blocks or admin polygons | Coarser decisions while preserving pixel-level objective accuracy | medium |

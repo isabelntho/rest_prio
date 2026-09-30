@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from _common import load_ic
-from Core_optimisation.resto_anom import run_optimization_instance
+from Core_optimisation.optimization_engine import run_optimization_instance
 from Core_optimisation.spatial_operations import (
     MinPatchSizeRepair, _label_components, build_restoration_neighbor_table,
     grow_region_plan,

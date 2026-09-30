@@ -40,7 +40,7 @@ from _common import (
     REPO_ROOT, RESULTS_DIR, BASE, POP_SIZE, N_GENERATIONS, RANDOM_SEEDS,
     load_ic, make_problem, cluster_metrics, use_agg,
 )
-from Core_optimisation.resto_anom import RestorationProblem, run_optimization_instance
+from Core_optimisation.optimization_engine import RestorationProblem, run_optimization_instance
 from Core_optimisation.spatial_operations import build_restoration_neighbor_table, grow_region_plan
 
 

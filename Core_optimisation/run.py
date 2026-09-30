@@ -13,7 +13,7 @@ Run from the project root as a module so the package-relative imports and the
     python -m Core_optimisation.run --list
 
 Scenario modes: custom | condition_grid | policy_grid | factorial. The legacy
-"all" mode (resto_anom.main(scenario="all")) is deliberately NOT supported here:
+"all" mode (optimization_engine.main(scenario="all")) is deliberately NOT supported here:
 it suppresses per-run saving and never passes r_export_parent, so it writes
 nothing to outputs/r_inputs/ - the only tree produce_figures.R and the paper2
 qmds read - and its combined-pickle format has readers only in
@@ -39,7 +39,7 @@ from .data_loader import load_initial_conditions
 from .grid_parallel import run_custom_seed, run_factorial_cell, run_tag
 from .logger_setup import setup_logger
 from .paths import DATA_DIR, LOGS_DIR, R_INPUTS_DIR
-from .resto_anom import run_optimization_instance
+from .optimization_engine import run_optimization_instance
 
 GRID_MODES = ("condition_grid", "policy_grid", "factorial")
 

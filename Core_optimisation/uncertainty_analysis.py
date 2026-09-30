@@ -17,7 +17,7 @@ benchmark is, and which plans stay good no matter which of these choices you bel
 Doing that needs an evaluator decoupled from the search, so a plan found under variant A
 can be scored against variant B's condition rasters. Three facts make it cheap and exact:
 
-  1. Benefit is exactly decomposable (resto_anom.restoration_effect):
+  1. Benefit is exactly decomposable (optimization_engine.restoration_effect):
          benefit(S) = sum_{c in S} d[c] + decay * sum_{c in dilate(S)\\S} d[c]
          d[c]       = ab_eff*w(ab0[c]) + bi_eff*w(bi0[c]), zeroed outside the eligible mask
      so a variant is fully summarised by ONE raster d_v, and the dilation depends only on
@@ -338,7 +338,7 @@ VALIDATE_TAG_PATTERNS = (r"^global_drop_", r"^upper_q\d+_drop_", r"^upper_q\d+_a
                          r"^zones_")
 # Relative tolerance for benefit against the engine. The floor is set by the ENGINE, not
 # by this module: restoration_effect writes the improved anomaly back into a float32
-# raster (`updated_values[action_mask] = baseline + improvement`, resto_anom.py:462), so
+# raster (`updated_values[action_mask] = baseline + improvement`, optimization_engine.py:462), so
 # each cell's improvement is stored with ~1e-7 relative precision and a 21855-cell sum
 # lands ~2e-6 away from an exact float64 accumulation. Measured across sampled plans of
 # global_drop_can: 1.7e-6 to 2.1e-6, and identical whether the cached d_v is float32 or
@@ -656,7 +656,7 @@ def _obj_indices(names):
 # the standalone evaluator: (selection, variant layers) -> (benefit, cost)
 # ===========================================================================
 def effect_params_of(scenario_params, allow_spillover_to_restored=False):
-    """Mirror RestorationProblem.__init__ (resto_anom.py:541-551) exactly.
+    """Mirror RestorationProblem.__init__ (optimization_engine.py:541-551) exactly.
 
     anomaly_weight_shape / _scale are deliberately absent: restoration_effect reads them
     off effect_params, which __init__ never populates, so they are always the defaults.
@@ -681,7 +681,7 @@ def effect_params_of(scenario_params, allow_spillover_to_restored=False):
 
 
 def anomaly_weight(anomaly_values, shape="exponential", scale=1.0):
-    """Copy of resto_anom.anomaly_improvement_weight, kept local so the fast path has no
+    """Copy of optimization_engine.anomaly_improvement_weight, kept local so the fast path has no
     hidden dependency on the search engine. `layers` asserts the two agree."""
     neg_mask = anomaly_values < 0
     abs_anomaly = np.abs(anomaly_values)
@@ -700,7 +700,7 @@ def build_variant_layer(abiotic0, biotic0, eligible_mask, eff):
     """Per-cell direct benefit raster d_v, zero outside the variant's eligible mask.
 
     Zeroing outside the mask reproduces the engine's
-    `np.where(restoration_eligible_mask, updated, original)` clip (resto_anom.py:492) for
+    `np.where(restoration_eligible_mask, updated, original)` clip (optimization_engine.py:492) for
     both the direct term and the spillover term, so a plan gets no credit for cells this
     variant considers ineligible.
     """
@@ -714,7 +714,7 @@ _KERNELS = {}
 
 
 def disc_kernel(radius):
-    """The engine's spillover kernel (resto_anom.py:467-469): x^2 + y^2 <= r^2."""
+    """The engine's spillover kernel (optimization_engine.py:467-469): x^2 + y^2 <= r^2."""
     if radius not in _KERNELS:
         y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
         _KERNELS[radius] = (x * x + y * y) <= radius * radius
@@ -1324,7 +1324,7 @@ def _stratified_validation_tags(tags):
 
 def cmd_layers(argv=()):
     """Validate the fast evaluator against the real engine. Aborts on disagreement."""
-    from Core_optimisation.resto_anom import (
+    from Core_optimisation.optimization_engine import (
         RestorationProblem, anomaly_improvement_weight,
     )
 
@@ -1338,7 +1338,7 @@ def cmd_layers(argv=()):
     probe = np.linspace(-4, 4, 401)
     err = np.max(np.abs(anomaly_weight(probe) - anomaly_improvement_weight(probe)))
     print(f"\n[1] anomaly weight vs engine          max abs err = {err:.3e}")
-    assert err == 0.0, "local anomaly_weight has drifted from resto_anom's version"
+    assert err == 0.0, "local anomaly_weight has drifted from optimization_engine's version"
 
     # -- 2. degenerate inputs ----------------------------------------------
     tag0 = L["tags"][0]
