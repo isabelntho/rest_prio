@@ -82,7 +82,16 @@ Stages (pixi run python -m Core_optimisation.uncertainty_analysis <stage>):
             diagnostic) plus freq_full / freq_robust / delta_frequency GeoTIFFs, which are
             what the manuscript figure is redrawn from.
 
-  all       extract -> layers -> cross -> discrim -> noise -> interact -> classify -> maps.
+  variantmaps  One representative plan per variant, not the pooled front. Reduces each
+            native variant to the single plan its own search liked best (lowest
+            cost-matched regret against that variant's own front, tie broken toward the
+            median-cost plan), then: the full pairwise Jaccard matrix of the per-variant
+            cores (variant_jaccard_matrix.csv, grouped by formulation axis) and the
+            selection frequency across those 73 plans (freq_variants.tif + its eligible-
+            footprint CSV). Reads `cross`; independent of `classify`/`maps`.
+
+  all       extract -> layers -> cross -> discrim -> noise -> interact -> classify ->
+            maps -> variantmaps.
 
 Every stage also merges the headline numbers it prints into outputs/uncertainty/report.json
 (see `report_update`), each under its own key. That file is the manuscript's data source -
@@ -646,12 +655,21 @@ def _obj_indices(names):
 # ===========================================================================
 # the standalone evaluator: (selection, variant layers) -> (benefit, cost)
 # ===========================================================================
-def effect_params_of(scenario_params):
+def effect_params_of(scenario_params, allow_spillover_to_restored=False):
     """Mirror RestorationProblem.__init__ (resto_anom.py:541-551) exactly.
 
     anomaly_weight_shape / _scale are deliberately absent: restoration_effect reads them
     off effect_params, which __init__ never populates, so they are always the defaults.
+
+    The standalone evaluator below models spillover onto UN-restored cells only. A run made
+    with spillover_to_restored=True would be silently mis-scored by it, so that is refused
+    unless the caller only uses the direct (per-cell) term, which the flag does not change.
     """
+    if scenario_params.get("spillover_to_restored", False) and not allow_spillover_to_restored:
+        raise ValueError(
+            "scenario_params has spillover_to_restored=True, which the standalone evaluator "
+            "(evaluate / plan_masks / the exact_front ILP) does not model. Score these plans "
+            "with RestorationProblem.evaluate_raw_objectives instead.")
     return {
         "abiotic_effect": float(scenario_params.get("abiotic_effect", 0.01)),
         "biotic_effect": float(scenario_params.get("biotic_effect", 0.01)),
@@ -2585,11 +2603,250 @@ def cmd_maps(argv=()):
 
 
 # ===========================================================================
+# stage: variantmaps (one representative plan per variant)
+# ===========================================================================
+# `maps` pools the WHOLE archive - every non-dominated plan of every seed of every
+# variant, ~14.6k plans - so its frequency surface is weighted by how many plans
+# each stretch of the front contributes. This stage instead reduces each native
+# variant to ONE plan and works with those 73: one decision per formulation choice,
+# which is the object a reader who asks "does the indicator set change the plan?"
+# actually pictures.
+#
+#   representative plan   per native variant, the plan with the lowest cost-matched
+#                         benefit regret against that variant's OWN pooled front.
+#                         The front spans ~1% of the cost axis (the budget is a
+#                         pixel-count equality), so most of its plans tie at regret
+#                         0; the tie is broken toward the plan whose cost is nearest
+#                         the variant's own median - the centre of the front, not
+#                         either extreme. zones_* have no runs of their own, so they
+#                         contribute no representative plan (73 of 85 variants).
+#
+# Products (the manuscript redraws both from these, as it does for `maps`):
+#   variant_jaccard_matrix.csv   full 73x73 pairwise Jaccard of the per-variant
+#                                CORES (>= CORE_FREQ of that variant's pooled plans,
+#                                seeds pooled - the same unit `noise` compares one
+#                                axis at a time, here for every pair). Carries a
+#                                block label/order per tag so the heatmap can be
+#                                grouped by formulation axis.
+#   variant_jaccard_summary.csv  per-variant mean/median/min/max off-diagonal.
+#   freq_variants.tif            per-cell selection frequency across the 73
+#                                representative plans, plus the eligible-footprint
+#                                CSV it is redrawn from.
+def _variant_block(tag):
+    """(order, label): the formulation-axis group a variant tag sits in, for the
+    heatmap's row/column order and its block separators. Reference first, then one
+    group per axis. First rule that matches wins."""
+    if tag == "global_all":            return 0, "Reference"
+    if tag.startswith("global_drop_"): return 1, "Construction (leave-one-out)"
+    if tag.endswith("_all"):           return 2, "Scaling"
+    if tag.startswith("global_w_d"):   return 5, "Weighting (sampled)"
+    if tag.startswith("global_w_"):    return 4, "Weighting (structured)"
+    return 3, "Scaling x construction"
+
+
+def _representative_plans(A, B, C, tags):
+    """{tag: global plan id} - each native variant's own-front-best plan.
+
+    Lowest cost-matched regret against the variant's own pooled front; ties (most of
+    the front, since it spans ~1% of the cost axis) broken toward the median-cost plan.
+    """
+    at = A["tag"]
+    col = {t: j for j, t in enumerate(tags)}
+    out = {}
+    for t in sorted(set(at.tolist())):
+        j = col[t]
+        m = np.flatnonzero(at == t)
+        reg, _, _ = regret_against(front_reference(B[m, j], C[m]), B[m, j], C[m])
+        order = np.lexsort((m, np.abs(C[m] - np.median(C[m])), reg))
+        out[t] = int(m[order[0]])
+    return out
+
+
+def cmd_variantmaps(argv=()):
+    """One representative plan per variant: pairwise core Jaccard + selection frequency.
+
+    See the block comment above. `maps` works on the whole pooled archive; this works
+    on the 73 native variants reduced to one plan each. Reads `cross`.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from visualisations import crop_to_eligible
+
+    A, L = load_archive(), load_layers()
+    B, C, _OV, tags = load_cross()
+    shape = L["shape"]
+    n_cells = int(np.prod(shape))
+    tag_axes = tag_axes_table()
+
+    rep = _representative_plans(A, B, C, tags)
+    rep_tags = sorted(rep, key=lambda t: (_variant_block(t)[0], t))
+    rep_ids = [rep[t] for t in rep_tags]
+    col = {t: j for j, t in enumerate(tags)}
+    print(f"Representative plan per variant: {len(rep_tags)} native variants of "
+          f"{len(tags)} layers (zones_* have no runs of their own).")
+    print(f"  representative-plan cost: min {C[rep_ids].min():.0f}  "
+          f"median {np.median(C[rep_ids]):.0f}  max {C[rep_ids].max():.0f}")
+
+    # -- eligible footprint: union over variants, as in `maps` ----------------
+    elig = np.zeros(n_cells, bool)
+    for t in L["tags"]:
+        elig |= L["elig"][t].ravel()
+    elig_idx = np.flatnonzero(elig)
+
+    # -- selection frequency across the representative plans -----------------
+    freq = _frequency(A["plans"], rep_ids, n_cells)
+    f_elig = freq[elig_idx]
+    qs = [50, 75, 90, 99, 99.9, 100]
+    print("  selection frequency over the eligible footprint: "
+          + "  ".join(f"p{q:g}={np.percentile(f_elig, q):.3f}" for q in qs))
+    for thr in (0.5, 0.75, 0.9):
+        print(f"    cells at freq >= {thr:.2f}: {int((freq >= thr).sum()):>7}")
+
+    ensure(OUT_DIR)
+    rr, cc = np.unravel_index(elig_idx, shape)
+    pd.DataFrame({"row": rr, "col": cc, "flat_index": elig_idx,
+                  "freq_variants": freq[elig_idx]}).to_csv(
+        OUT_DIR / "selection_frequency_variants.csv", index=False)
+
+    rep_rows = []
+    for t in rep_tags:
+        i, j = rep[t], col[t]
+        o, lab = _variant_block(t)
+        rep_rows.append({"variant": t, "campaign": A["campaign"][i],
+                         "axes_departed": _axes_departed(t, tag_axes),
+                         "block": lab, "plot_order": o,
+                         "plan_id": i, "native_seed": int(A["seed"][i]),
+                         "n_cells": int(A["plans"][i].size),
+                         "cost": float(C[i]), "benefit_own": float(B[i, j])})
+    pd.DataFrame(rep_rows).to_csv(OUT_DIR / "variant_representative_plans.csv", index=False)
+
+    # -- full pairwise Jaccard of the per-variant cores (seeds pooled) -------
+    cores_tag = _cores(A, shape, by="tag")
+    core_of = {}
+    for (camp_name, t), idx in cores_tag.items():
+        if t in core_of:
+            raise ExtractMismatch(f"tag {t!r} appears in more than one campaign - the "
+                                  "Jaccard matrix keys on tag alone.")
+        core_of[t] = idx
+    order_tags = [t for t in rep_tags if t in core_of]
+    n = len(order_tags)
+    blk = {t: _variant_block(t) for t in order_tags}
+    Jm = np.ones((n, n))
+    for a in range(n):
+        for b in range(a + 1, n):
+            Jm[a, b] = Jm[b, a] = jaccard(core_of[order_tags[a]], core_of[order_tags[b]])
+
+    jrows = [{"tag_a": order_tags[a], "tag_b": order_tags[b],
+              "block_a": blk[order_tags[a]][1], "block_b": blk[order_tags[b]][1],
+              "order_a": blk[order_tags[a]][0], "order_b": blk[order_tags[b]][0],
+              "core_a": int(core_of[order_tags[a]].size),
+              "core_b": int(core_of[order_tags[b]].size),
+              "jaccard": float(Jm[a, b])}
+             for a in range(n) for b in range(n)]
+    pd.DataFrame(jrows).to_csv(OUT_DIR / "variant_jaccard_matrix.csv", index=False)
+
+    summ = []
+    for a in range(n):
+        others = np.delete(Jm[a], a)
+        summ.append({"variant": order_tags[a], "block": blk[order_tags[a]][1],
+                     "mean_jaccard": float(others.mean()),
+                     "median_jaccard": float(np.median(others)),
+                     "min_jaccard": float(others.min()),
+                     "max_jaccard": float(others.max())})
+    pd.DataFrame(summ).to_csv(OUT_DIR / "variant_jaccard_summary.csv", index=False)
+
+    iu = np.triu_indices(n, 1)
+    tri = Jm[iu]
+    ob = np.array([blk[t][0] for t in order_tags])
+    same = (ob[iu[0]] == ob[iu[1]])
+    within, cross = tri[same], tri[~same]
+    print(f"\n  pairwise core Jaccard ({n} variants, {tri.size} pairs): "
+          f"median {np.median(tri):.3f}, mean {tri.mean():.3f}, "
+          f"range {tri.min():.3f}-{tri.max():.3f}")
+    print(f"    within formulation-axis block: median {np.median(within):.3f} "
+          f"(n={within.size})")
+    print(f"    across blocks:                 median {np.median(cross):.3f} "
+          f"(n={cross.size})")
+
+    # -- GeoTIFF, for QGIS overlay and the manuscript figure ----------------
+    tif_path = ""
+    try:
+        import rasterio
+        from rasterio.transform import Affine
+        m = np.full(n_cells, np.nan, dtype=np.float32)
+        m[elig_idx] = freq[elig_idx]
+        tif_path = str(OUT_DIR / "freq_variants.tif")
+        with rasterio.open(tif_path, "w", driver="GTiff", height=shape[0],
+                           width=shape[1], count=1, dtype="float32",
+                           crs=L["crs"] or None,
+                           transform=Affine(*list(L["transform"])[:6]),
+                           nodata=np.nan) as dst:
+            dst.write(m.reshape(shape), 1)
+        print(f"  -> {tif_path}")
+    except Exception as e:  # noqa: BLE001 - the CSV is the deliverable
+        print(f"  (GeoTIFF skipped: {e!r})")
+
+    # -- analyst-facing PNG: the heatmap and the frequency map together -----
+    ensure(FIG_DIR)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.4))
+    im = axes[0].imshow(Jm, cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
+    bounds = np.flatnonzero(np.diff(ob)) + 1
+    for bnd in bounds:
+        axes[0].axhline(bnd - 0.5, color="white", lw=1.1)
+        axes[0].axvline(bnd - 0.5, color="white", lw=1.1)
+    axes[0].set_title(f"pairwise core Jaccard ({n} variants, grouped by axis)", fontsize=10)
+    axes[0].set_xticks([]); axes[0].set_yticks([])
+    fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.03, label="Jaccard")
+
+    mm = np.full(n_cells, np.nan)
+    mm[elig_idx] = freq[elig_idx]
+    img = crop_to_eligible(mm.reshape(shape), elig_idx, shape)
+    h = axes[1].imshow(img, cmap="YlOrRd", vmin=0, vmax=float(np.nanmax(img)),
+                       interpolation="nearest")
+    axes[1].set_title(f"selection frequency, {len(rep_ids)} representative plans",
+                      fontsize=10)
+    axes[1].set_xticks([]); axes[1].set_yticks([])
+    fig.colorbar(h, ax=axes[1], fraction=0.046, pad=0.03, label="selection frequency")
+    fig.suptitle("Per-variant plans: agreement and where they concentrate", y=0.98)
+    out_png = FIG_DIR / "variant_maps.png"
+    fig.savefig(out_png, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  -> {out_png}")
+    print(f"  -> {OUT_DIR / 'variant_jaccard_matrix.csv'}")
+    print(f"  -> {OUT_DIR / 'selection_frequency_variants.csv'}")
+
+    block_counts = {}
+    for t in order_tags:
+        block_counts[blk[t][1]] = block_counts.get(blk[t][1], 0) + 1
+    report_update("variantmaps", {
+        "core_freq": CORE_FREQ,
+        "n_variants_native": n, "n_variant_layers": len(tags),
+        "n_representative_plans": len(rep_ids),
+        "rep_cost_median": float(np.median(C[rep_ids])),
+        "rep_cost_min": float(C[rep_ids].min()), "rep_cost_max": float(C[rep_ids].max()),
+        "blocks": block_counts,
+        "freq_percentiles_eligible": {f"p{q:g}": float(np.percentile(f_elig, q))
+                                      for q in qs},
+        "cells_by_freq_threshold": {f"{thr:.2f}": int((freq >= thr).sum())
+                                    for thr in (0.5, 0.75, 0.9)},
+        "n_eligible_cells": int(elig_idx.size),
+        "pairwise_jaccard": {
+            "median": float(np.median(tri)), "mean": float(tri.mean()),
+            "min": float(tri.min()), "max": float(tri.max()), "n_pairs": int(tri.size),
+            "within_block_median": float(np.median(within)),
+            "cross_block_median": float(np.median(cross))},
+        "figure_png": str(out_png),
+        "rasters": {"freq_variants.tif": tif_path},
+    })
+
+
+# ===========================================================================
 # dispatch
 # ===========================================================================
 def cmd_all(argv=()):
     for name in ("extract", "layers", "cross", "discrim", "noise", "interact",
-                 "classify", "maps"):
+                 "classify", "maps", "variantmaps"):
         print(f"\n{'=' * 74}\n== {name}\n{'=' * 74}")
         COMMANDS[name](argv)
 
@@ -2597,7 +2854,8 @@ def cmd_all(argv=()):
 COMMANDS = {
     "extract": cmd_extract, "layers": cmd_layers, "cross": cmd_cross,
     "discrim": cmd_discrim, "noise": cmd_noise, "interact": cmd_interact,
-    "classify": cmd_classify, "maps": cmd_maps, "all": cmd_all,
+    "classify": cmd_classify, "maps": cmd_maps, "variantmaps": cmd_variantmaps,
+    "all": cmd_all,
 }
 
 
